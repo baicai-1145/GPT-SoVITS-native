@@ -264,15 +264,16 @@ bool ChineseG2p::run(const std::string& utf8Text, G2pResult* out) const {
         jb_.lcut(segUtf8, &toks);
         std::vector<SegToken> cut;
         for (auto& t : toks) cut.push_back({dec(t.word), t.flag});
-        sandhi.preMergeForModify(&cut, resolver_);
+        sandhi.preMergeForModify(&cut, resolver());
 
         for (auto& tok : cut) {
             if (tok.flag == "eng") continue;
             std::vector<std::string> initials, finals;
-            getInitialsFinals(resolver_, tok.word.data(), tok.word.size(),
+            getInitialsFinals(resolver(), tok.word.data(), tok.word.size(),
                               &initials, &finals);
             bool ok = true;
-            sandhi.modifiedTone(tok.word, tok.flag, resolver_, &finals, &ok);
+            sandhi.modifiedTone(tok.word, tok.flag, resolver(), &finals,
+                                &ok);
             if (!ok) {
                 out->error = "modified_tone raise on '" + enc(tok.word) + "'";
                 return false;  // python would raise

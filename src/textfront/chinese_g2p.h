@@ -26,6 +26,15 @@ public:
     bool load(const std::string& triePath, const std::string& pinyinPath,
               std::string* err);
 
+    // Injection seam for B6's G2PW converter: overrides the default
+    // pypinyin readings for resolve()/getInitialsFinals()/isNumeric().
+    // Pass nullptr to restore the built-in PypinyinResolver. The pointed
+    // object must outlive this instance.
+    void setResolver(const PinyinResolver* r) { external_ = r; }
+    const PinyinResolver& resolver() const {
+        return external_ ? *external_ : resolver_;
+    }
+
     // Full pipeline for one input text (UTF-8).
     bool run(const std::string& utf8Text, G2pResult* out) const;
 
@@ -35,6 +44,7 @@ public:
 private:
     JiebaSegmenter jb_;
     PypinyinResolver resolver_;
+    const PinyinResolver* external_ = nullptr;  // B6 injection seam
     TextNormalizer tn_;
     bool loaded_ = false;
 };

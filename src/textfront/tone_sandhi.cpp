@@ -80,7 +80,7 @@ bool inCharClass(std::u32string_view set, char32_t c) {
 }
 
 // lazy_pinyin(word, FINALS_TONE3, neutral_tone_with_five=True)
-void finalsTone3List(const PypinyinResolver& resolver, const char32_t* word,
+void finalsTone3List(const PinyinResolver& resolver, const char32_t* word,
                      size_t len, std::vector<std::string>* out) {
     std::vector<PinyinSyl> syls;
     resolver.resolve(word, len, &syls);
@@ -178,7 +178,7 @@ void mergeReduplication(std::vector<SegToken>* seg) {
 // shared body of _merge_continuous_three_tones (mode2=false) and
 // _merge_continuous_three_tones_2 (mode2=true); false = python raised.
 bool mergeContinuousThreeTones(std::vector<SegToken>* seg,
-                               const PypinyinResolver& resolver, bool mode2) {
+                               const PinyinResolver& resolver, bool mode2) {
     const size_t n = seg->size();
     std::vector<std::vector<std::string>> fl(n);
     for (size_t i = 0; i < n; ++i) {
@@ -251,7 +251,7 @@ bool mergeContinuousThreeTones(std::vector<SegToken>* seg,
 // ---------------------------------------------------------------------------
 
 void ToneSandhi::preMergeForModify(std::vector<SegToken>* seg,
-                                   const PypinyinResolver& resolver) const {
+                                   const PinyinResolver& resolver) const {
     mergeBu(seg);
     if (!mergeYi(seg)) fprintf(stderr, "_merge_yi failed\n");
     mergeReduplication(seg);
@@ -334,7 +334,7 @@ bool splitWord(const JiebaSegmenter* jb, const std::u32string& word,
 }  // namespace
 
 void ToneSandhi::modifiedTone(const std::u32string& word, std::string_view pos,
-                              const PypinyinResolver& resolver,
+                              const PinyinResolver& resolver,
                               std::vector<std::string>* finals,
                               bool* ok) const {
     *ok = true;

@@ -50,6 +50,15 @@ public:
     virtual ~PinyinResolver() = default;
     virtual void resolve(const char32_t* word, size_t len,
                          std::vector<PinyinSyl>* syllables) const = 0;
+
+    // chr(cp).isnumeric() equivalent (python str.isnumeric), consumed by
+    // ToneSandhi's yi/bu rules. Default covers ASCII digits; the pypinyin
+    // implementation overrides with the exported BMP table. After
+    // normalization all numerals are Han characters, so subclasses that
+    // only handle Han readings can keep the default.
+    virtual bool isNumeric(uint32_t cp) const {
+        return cp >= U'0' && cp <= U'9';
+    }
 };
 
 class PypinyinResolver : public PinyinResolver {
@@ -74,7 +83,7 @@ public:
     uint32_t t2s(uint32_t cp) const;
 
     // chr(cp).isnumeric() equivalent over the exported BMP table.
-    bool isNumeric(uint32_t cp) const;
+    bool isNumeric(uint32_t cp) const override;
 
 private:
     struct Impl;
