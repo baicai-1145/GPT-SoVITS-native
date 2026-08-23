@@ -38,6 +38,7 @@
 
 | ID | 任务 | 依赖 | 所有者 | 状态 | 备注 |
 |---|---|---|---|---|---|
+| B9 | M3: TextFrontend 运行时编排(分句+组装) | B5,B7 | exec-txt | DONE | task/B5 | pairs parity 61/65; 真实口径=prompt_ids++分段ids(短句补。), phone_units假设证伪 |
 | C1 | HuBERT/SV 编码器 + 参考缓存 | A4 | 未分配 | TODO | 对 refs bundle |
 | C2 | CLI 全链路串接 | 全 B+C1 | 决策者 | TODO | |
 | D1 | bench harness(powermetrics/吃满率采样) | C2 | 未分配 | TODO | |
