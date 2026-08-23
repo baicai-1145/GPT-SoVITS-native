@@ -7,3 +7,6 @@ build/
 __pycache__/
 *.pyc
 .DS_Store
+
+# 生成的二进制词典(由 tools/export_jieba_trie.py 再生)
+src/textfront/data/*.bin

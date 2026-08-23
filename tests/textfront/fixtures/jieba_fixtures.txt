@@ -1,0 +1,2169 @@
+GSVFIX01
+S	0000_golden	你好，世界。
+W	你好	l
+W	，	x
+W	世界	n
+W	。	x
+
+S	0001_golden	今天天气真不错，我们去公园散步吧。
+W	今天天气	i
+W	真不错	i
+W	，	x
+W	我们	r
+W	去	v
+W	公园	n
+W	散步	n
+W	吧	y
+W	。	x
+
+S	0002_golden	重庆的火锅店终于开张了。
+W	重庆	ns
+W	的	uj
+W	火锅店	n
+W	终于	d
+W	开张	v
+W	了	ul
+W	。	x
+
+S	0003_golden	2024年10月1日，我在成都买了3.5斤樱桃。
+W	2024	m
+W	年	m
+W	10	m
+W	月	m
+W	1	m
+W	日	m
+W	，	x
+W	我	r
+W	在	p
+W	成都	ns
+W	买	v
+W	了	ul
+W	3.5	m
+W	斤	m
+W	樱桃	n
+W	。	x
+
+S	0004_golden	The quick brown fox jumps over the lazy dog.
+W	The	eng
+W	 	x
+W	quick	eng
+W	 	x
+W	brown	eng
+W	 	x
+W	fox	eng
+W	 	x
+W	jumps	eng
+W	 	x
+W	over	eng
+W	 	x
+W	the	eng
+W	 	x
+W	lazy	eng
+W	 	x
+W	dog	eng
+W	.	m
+
+S	0005_golden	他长大以后想当一名宇航员。
+W	他	r
+W	长大	ns
+W	以后	f
+W	想	v
+W	当	p
+W	一名	m
+W	宇航员	n
+W	。	x
+
+S	0006_golden	这是一段比较长的测试文本，用来验证模型在处理多分句、含逗号顿号问号等标点时的表现是否稳定可靠？
+W	这	r
+W	是	v
+W	一段	m
+W	比较	d
+W	长	a
+W	的	uj
+W	测试	vn
+W	文本	n
+W	，	x
+W	用来	v
+W	验证	v
+W	模型	n
+W	在	p
+W	处理	v
+W	多	m
+W	分句	m
+W	、	x
+W	含	v
+W	逗号	n
+W	顿号	n
+W	问号	n
+W	等	u
+W	标点	n
+W	时	ng
+W	的	uj
+W	表现	v
+W	是否	v
+W	稳定	a
+W	可靠	v
+W	？	x
+
+S	0007_golden	人工智能正在改变世界。
+W	人工智能	n
+W	正在	t
+W	改变	v
+W	世界	n
+W	。	x
+
+S	0008_golden	银行旁边的河水平静地流着。
+W	银行	n
+W	旁边	f
+W	的	uj
+W	河水	ns
+W	平静	a
+W	地	uv
+W	流	v
+W	着	uz
+W	。	x
+
+S	0009_golden	GPT-SoVITS 是一个开源的语音合成项目。
+W	GPT	eng
+W	-	x
+W	SoVITS	eng
+W	 	x
+W	是	v
+W	一个	m
+W	开源	n
+W	的	uj
+W	语音	n
+W	合成	v
+W	项目	n
+W	。	x
+
+S	0010_golden	原来你也玩原神。
+W	原来	d
+W	你	r
+W	也	d
+W	玩	v
+W	原神	n
+W	。	x
+
+S	0011_pure_zh	今天星期三。
+W	今天	t
+W	星期三	t
+W	。	x
+
+S	0012_pure_zh	明天可能会下雨。
+W	明天	t
+W	可能	v
+W	会	v
+W	下雨	v
+W	。	x
+
+S	0013_pure_zh	他正在图书馆看书。
+W	他	r
+W	正在	t
+W	图书馆	n
+W	看书	v
+W	。	x
+
+S	0014_pure_zh	这家餐厅的菜味道不错，服务也很好。
+W	这家	r
+W	餐厅	n
+W	的	uj
+W	菜	n
+W	味道	n
+W	不错	a
+W	，	x
+W	服务	vn
+W	也	d
+W	很	d
+W	好	a
+W	。	x
+
+S	0015_pure_zh	春天来了，花都开了。
+W	春天	t
+W	来	v
+W	了	ul
+W	，	x
+W	花都	ns
+W	开	v
+W	了	ul
+W	。	x
+
+S	0016_pure_zh	小明每天早上六点起床跑步。
+W	小明	nr
+W	每天	r
+W	早上	t
+W	六点	m
+W	起床	v
+W	跑步	n
+W	。	x
+
+S	0017_pure_zh	中国的首都是北京。
+W	中国	ns
+W	的	uj
+W	首都	d
+W	是	v
+W	北京	ns
+W	。	x
+
+S	0018_pure_zh	长江是中国最长的河流。
+W	长江	ns
+W	是	v
+W	中国	ns
+W	最长	a
+W	的	uj
+W	河流	n
+W	。	x
+
+S	0019_pure_zh	这本书讲的是中国古代历史。
+W	这	r
+W	本书	r
+W	讲	v
+W	的	uj
+W	是	v
+W	中国	ns
+W	古代	t
+W	历史	n
+W	。	x
+
+S	0020_pure_zh	医生建议他多休息，少熬夜。
+W	医生	n
+W	建议	n
+W	他	r
+W	多	m
+W	休息	v
+W	，	x
+W	少	a
+W	熬夜	v
+W	。	x
+
+S	0021_pure_zh	孩子们在操场上踢足球。
+W	孩子	n
+W	们	k
+W	在	p
+W	操场上	v
+W	踢足球	n
+W	。	x
+
+S	0022_pure_zh	妈妈做红烧肉特别好吃。
+W	妈妈	n
+W	做	v
+W	红烧肉	n
+W	特别	d
+W	好吃	v
+W	。	x
+
+S	0023_pure_zh	火车马上就要进站了。
+W	火车	n
+W	马上	d
+W	就要	d
+W	进站	n
+W	了	ul
+W	。	x
+
+S	0024_pure_zh	会议改到下午三点召开。
+W	会议	n
+W	改	v
+W	到	v
+W	下午	t
+W	三点	m
+W	召开	v
+W	。	x
+
+S	0025_pure_zh	快递员把包裹放在了门口。
+W	快递	v
+W	员	q
+W	把	p
+W	包裹	v
+W	放在	v
+W	了	ul
+W	门口	s
+W	。	x
+
+S	0026_pure_zh	这幅画的色彩非常鲜艳。
+W	这	r
+W	幅画	n
+W	的	uj
+W	色彩	n
+W	非常	d
+W	鲜艳	a
+W	。	x
+
+S	0027_pure_zh	爷爷喜欢在公园里下象棋。
+W	爷爷	n
+W	喜欢	v
+W	在	p
+W	公园	n
+W	里	f
+W	下象棋	n
+W	。	x
+
+S	0028_pure_zh	天气预报说周末有台风。
+W	天气预报	n
+W	说	v
+W	周末	t
+W	有	v
+W	台风	ns
+W	。	x
+
+S	0029_pure_zh	她穿了一件红色的连衣裙。
+W	她	r
+W	穿	v
+W	了	ul
+W	一件	m
+W	红色	n
+W	的	uj
+W	连衣裙	nr
+W	。	x
+
+S	0030_pure_zh	电脑突然死机了，文件还没保存。
+W	电脑	n
+W	突然	ad
+W	死机	n
+W	了	ul
+W	，	x
+W	文件	n
+W	还	d
+W	没	v
+W	保存	v
+W	。	x
+
+S	0031_pure_zh	老师表扬了全班同学。
+W	老师	n
+W	表扬	v
+W	了	ul
+W	全班同学	nt
+W	。	x
+
+S	0032_pure_zh	小区门口新开了一家超市。
+W	小区	n
+W	门口	s
+W	新	a
+W	开	v
+W	了	ul
+W	一家	m
+W	超市	v
+W	。	x
+
+S	0033_pure_zh	这道数学题太难了，我不会做。
+W	这	r
+W	道	q
+W	数学题	n
+W	太	d
+W	难	a
+W	了	ul
+W	，	x
+W	我	r
+W	不会	v
+W	做	v
+W	。	x
+
+S	0034_pure_zh	大熊猫是中国的国宝。
+W	大熊猫	n
+W	是	v
+W	中国	ns
+W	的	uj
+W	国宝	nz
+W	。	x
+
+S	0035_pure_zh	高铁从上海到北京只要四个半小时。
+W	高铁	n
+W	从	p
+W	上海	ns
+W	到	v
+W	北京	ns
+W	只要	c
+W	四个	m
+W	半小时	b
+W	。	x
+
+S	0036_pure_zh	他把钥匙忘在办公室了。
+W	他	r
+W	把	p
+W	钥匙	n
+W	忘	v
+W	在	p
+W	办公室	n
+W	了	ul
+W	。	x
+
+S	0037_pure_zh	夜空中的星星一闪一闪的。
+W	夜空	n
+W	中	f
+W	的	uj
+W	星星	nz
+W	一闪一闪	l
+W	的	uj
+W	。	x
+
+S	0038_pure_zh	这个手机电池不太耐用。
+W	这个	r
+W	手机电池	n
+W	不	d
+W	太	d
+W	耐用	a
+W	。	x
+
+S	0039_pure_zh	奶奶种的西瓜又大又甜。
+W	奶奶	n
+W	种	m
+W	的	uj
+W	西瓜	ns
+W	又	d
+W	大	a
+W	又	d
+W	甜	a
+W	。	x
+
+S	0040_pure_zh	图书馆借书要按时归还。
+W	图书馆	n
+W	借书	n
+W	要	v
+W	按时	d
+W	归还	v
+W	。	x
+
+S	0041_pure_zh	运动员们正在进行赛前热身。
+W	运动员	n
+W	们	k
+W	正在	t
+W	进行	v
+W	赛前	t
+W	热身	n
+W	。	x
+
+S	0042_pure_zh	博物馆里陈列着许多文物。
+W	博物馆	n
+W	里	f
+W	陈列	nr
+W	着	uz
+W	许多	m
+W	文物	n
+W	。	x
+
+S	0043_pure_zh	弟弟的梦想是当一名飞行员。
+W	弟弟	n
+W	的	uj
+W	梦想	n
+W	是	v
+W	当	p
+W	一名	m
+W	飞行员	n
+W	。	x
+
+S	0044_pure_zh	厨房里飘来阵阵香味。
+W	厨房	n
+W	里	f
+W	飘来	v
+W	阵阵	q
+W	香味	n
+W	。	x
+
+S	0045_pure_zh	公司年会定在下个月举行。
+W	公司	n
+W	年	m
+W	会定	n
+W	在	p
+W	下个月	t
+W	举行	v
+W	。	x
+
+S	0046_pure_zh	海水退潮后露出大片沙滩。
+W	海水	n
+W	退潮	v
+W	后	f
+W	露出	v
+W	大片	n
+W	沙滩	nr
+W	。	x
+
+S	0047_pure_zh	他修好了那台旧收音机。
+W	他	r
+W	修好	v
+W	了	ul
+W	那	r
+W	台	q
+W	旧	a
+W	收音机	n
+W	。	x
+
+S	0048_pure_zh	山上的寺庙有一百多年历史。
+W	山上	s
+W	的	uj
+W	寺庙	n
+W	有	v
+W	一百多年	m
+W	历史	n
+W	。	x
+
+S	0049_pure_zh	候车室里人山人海。
+W	候车室	n
+W	里	f
+W	人山人海	ns
+W	。	x
+
+S	0050_pure_zh	这批货物明天早上装船。
+W	这	r
+W	批	q
+W	货物	n
+W	明天	t
+W	早上	t
+W	装船	n
+W	。	x
+
+S	0051_pure_zh	导演正在给演员讲戏。
+W	导演	v
+W	正在	t
+W	给	p
+W	演员	n
+W	讲戏	n
+W	。	x
+
+S	0052_pure_zh	果园里的苹果熟透了。
+W	果园	n
+W	里	f
+W	的	uj
+W	苹果	n
+W	熟透	v
+W	了	ul
+W	。	x
+
+S	0053_pure_zh	地震预警系统发挥了作用。
+W	地震	n
+W	预警系统	n
+W	发挥	v
+W	了	ul
+W	作用	v
+W	。	x
+
+S	0054_pure_zh	邻居家的猫又跑丢了。
+W	邻居家	n
+W	的	uj
+W	猫	n
+W	又	d
+W	跑	v
+W	丢	v
+W	了	ul
+W	。	x
+
+S	0055_pure_zh	快递柜满了只能放门口。
+W	快递	v
+W	柜	ng
+W	满	a
+W	了	ul
+W	只能	v
+W	放	v
+W	门口	s
+W	。	x
+
+S	0056_pure_zh	新来的同事很热心。
+W	新来	v
+W	的	uj
+W	同事	n
+W	很	zg
+W	热心	n
+W	。	x
+
+S	0057_pure_zh	电梯里的广告太多了。
+W	电梯	n
+W	里	f
+W	的	uj
+W	广告	n
+W	太	d
+W	多	m
+W	了	ul
+W	。	x
+
+S	0058_numbers	我的电话号码是13812345678。
+W	我	r
+W	的	uj
+W	电话号码	n
+W	是	v
+W	13812345678	m
+W	。	x
+
+S	0059_numbers	这次考试他得了98.5分。
+W	这次	r
+W	考试	vn
+W	他	r
+W	得	ud
+W	了	ul
+W	98.5	m
+W	分	v
+W	。	x
+
+S	0060_numbers	会议室能容纳120个人。
+W	会议室	n
+W	能	v
+W	容纳	nr
+W	120	m
+W	个人	n
+W	。	x
+
+S	0061_numbers	房价每平方米50000元。
+W	房价	n
+W	每平方米	l
+W	50000	m
+W	元	m
+W	。	x
+
+S	0062_numbers	飞机于13时25分起飞。
+W	飞机	n
+W	于	p
+W	13	m
+W	时	n
+W	25	m
+W	分	v
+W	起飞	v
+W	。	x
+
+S	0063_numbers	他身高一米八五，体重75公斤。
+W	他	r
+W	身高	v
+W	一米	m
+W	八五	m
+W	，	x
+W	体重	n
+W	75	m
+W	公斤	q
+W	。	x
+
+S	0064_numbers	银行利率下调了0.25个百分点。
+W	银行利率	n
+W	下调	v
+W	了	ul
+W	0.25	m
+W	个	m
+W	百分点	m
+W	。	x
+
+S	0065_numbers	项目预算总计1000万元人民币。
+W	项目	n
+W	预算	v
+W	总计	n
+W	1000	m
+W	万元	m
+W	人民币	n
+W	。	x
+
+S	0066_numbers	第29届奥运会于2008年举办。
+W	第	m
+W	29	m
+W	届	m
+W	奥运会	j
+W	于	p
+W	2008	m
+W	年	m
+W	举办	v
+W	。	x
+
+S	0067_numbers	保质期还剩6个月零8天。
+W	保质期	n
+W	还	d
+W	剩	v
+W	6	m
+W	个	m
+W	月	m
+W	零	m
+W	8	m
+W	天	n
+W	。	x
+
+S	0068_numbers	车速限制每小时60公里。
+W	车速	n
+W	限制	v
+W	每	zg
+W	小时	n
+W	60	m
+W	公里	q
+W	。	x
+
+S	0069_numbers	文件大小是2.5GB。
+W	文件大小	l
+W	是	v
+W	2.5	m
+W	GB	eng
+W	。	x
+
+S	0070_numbers	气温降到了零下10度。
+W	气温	n
+W	降到	v
+W	了	ul
+W	零下	m
+W	10	m
+W	度	q
+W	。	x
+
+S	0071_numbers	订单编号20240931001已发货。
+W	订单	n
+W	编号	n
+W	20240931001	m
+W	已	d
+W	发货	n
+W	。	x
+
+S	0072_numbers	折扣力度是七五折。
+W	折扣	v
+W	力度	n
+W	是	v
+W	七五折	m
+W	。	x
+
+S	0073_numbers	存款利息按3.25%计算。
+W	存款	n
+W	利息	n
+W	按	p
+W	3.25	m
+W	%	x
+W	计算	v
+W	。	x
+
+S	0074_numbers	增长率达到15.8%。
+W	增长率	n
+W	达到	v
+W	15.8	m
+W	%	x
+W	。	x
+
+S	0075_numbers	浓度是0.9%的氯化钠溶液。
+W	浓度	n
+W	是	v
+W	0.9	m
+W	%	x
+W	的	uj
+W	氯化钠	nz
+W	溶液	n
+W	。	x
+
+S	0076_numbers	他买了5斤苹果、3斤橘子和2斤香蕉。
+W	他	r
+W	买	v
+W	了	ul
+W	5	m
+W	斤	m
+W	苹果	n
+W	、	x
+W	3	m
+W	斤	m
+W	橘子	n
+W	和	c
+W	2	m
+W	斤	m
+W	香蕉	n
+W	。	x
+
+S	0077_numbers	1949年10月1日新中国成立。
+W	1949	m
+W	年	m
+W	10	m
+W	月	m
+W	1	m
+W	日	m
+W	新	a
+W	中国	ns
+W	成立	v
+W	。	x
+
+S	0078_numbers	圆周率约等于3.14159。
+W	圆周率	n
+W	约等于	v
+W	3.14159	m
+W	。	x
+
+S	0079_numbers	比赛最终比分是3比2。
+W	比赛	vn
+W	最终	d
+W	比分	d
+W	是	v
+W	3	m
+W	比	p
+W	2	m
+W	。	x
+
+S	0080_numbers	这栋楼有33层，高108米。
+W	这栋	r
+W	楼	n
+W	有	v
+W	33	m
+W	层	q
+W	，	x
+W	高	a
+W	108	m
+W	米	m
+W	。	x
+
+S	0081_numbers	二维码扫描成功率超过99.9%。
+W	二维码	n
+W	扫描	v
+W	成功率	n
+W	超过	v
+W	99.9	m
+W	%	x
+W	。	x
+
+S	0082_numbers	他的车牌号是京A12345。
+W	他	r
+W	的	uj
+W	车牌号	n
+W	是	v
+W	京	j
+W	A12345	eng
+W	。	x
+
+S	0083_numbers	航班CA1856延误两小时。
+W	航班	n
+W	CA1856	eng
+W	延误	v
+W	两	m
+W	小时	n
+W	。	x
+
+S	0084_numbers	经纬度为北纬39.9度、东经116.4度。
+W	经纬度	n
+W	为	p
+W	北纬	b
+W	39.9	m
+W	度	q
+W	、	x
+W	东经	n
+W	116.4	m
+W	度	q
+W	。	x
+
+S	0085_english	我喜欢用Python写脚本，也用C++写性能关键的代码。
+W	我	r
+W	喜欢	v
+W	用	p
+W	Python	eng
+W	写	v
+W	脚本	n
+W	，	x
+W	也	d
+W	用	p
+W	C++	nz
+W	写	v
+W	性能	n
+W	关键	n
+W	的	uj
+W	代码	n
+W	。	x
+
+S	0086_english	请把文件保存为PDF格式发给我。
+W	请	v
+W	把	p
+W	文件	n
+W	保存	v
+W	为	p
+W	PDF	eng
+W	格式	n
+W	发给	vn
+W	我	r
+W	。	x
+
+S	0087_english	他的邮箱是test_user@example.com。
+W	他	r
+W	的	uj
+W	邮箱	n
+W	是	v
+W	test	eng
+W	_	x
+W	user	eng
+W	@	x
+W	example	eng
+W	.	m
+W	com	eng
+W	。	x
+
+S	0088_english	iPhone 15 Pro Max售价999美元。
+W	iPhone	eng
+W	 	x
+W	15	m
+W	 	x
+W	Pro	eng
+W	 	x
+W	Max	eng
+W	售价	n
+W	999	m
+W	美元	q
+W	。	x
+
+S	0089_english	WiFi密码是abcd1234。
+W	WiFi	eng
+W	密码	n
+W	是	v
+W	abcd1234	eng
+W	。	x
+
+S	0090_english	AI技术正在快速发展。
+W	AI	eng
+W	技术	n
+W	正在	t
+W	快速	d
+W	发展	vn
+W	。	x
+
+S	0091_english	这个API支持JSON和XML格式。
+W	这个	r
+W	API	eng
+W	支持	v
+W	JSON	eng
+W	和	c
+W	XML	eng
+W	格式	n
+W	。	x
+
+S	0092_english	CPU温度达到了85度。
+W	CPU	eng
+W	温度	n
+W	达到	v
+W	了	ul
+W	85	m
+W	度	q
+W	。	x
+
+S	0093_english	Hello World！你好世界！
+W	Hello	eng
+W	 	x
+W	World	eng
+W	！	x
+W	你好	l
+W	世界	n
+W	！	x
+
+S	0094_english	登录https://example.com查看详情。
+W	登录	v
+W	https	eng
+W	:	x
+W	/	x
+W	/	x
+W	example	eng
+W	.	m
+W	com	eng
+W	查看	v
+W	详情	a
+W	。	x
+
+S	0095_english	DNA检测报告显示一切正常。
+W	DNA	eng
+W	检测	vn
+W	报告	n
+W	显示	v
+W	一切正常	i
+W	。	x
+
+S	0096_english	KPI考核标准已经更新了。
+W	KPI	eng
+W	考核	vn
+W	标准	n
+W	已经	d
+W	更新	d
+W	了	ul
+W	。	x
+
+S	0097_english	用SSH连接到服务器192.168.1.100。
+W	用	p
+W	SSH	eng
+W	连接	v
+W	到	v
+W	服务器	n
+W	192.168.1.100	m
+W	。	x
+
+S	0098_english	GDP同比增长5.2%。
+W	GDP	eng
+W	同比	j
+W	增长	v
+W	5.2	m
+W	%	x
+W	。	x
+
+S	0099_english	App Store上有几百万个应用。
+W	App	eng
+W	 	x
+W	Store	eng
+W	上有	v
+W	几百万个	m
+W	应用	v
+W	。	x
+
+S	0100_english	USB接口松动了，接触不良。
+W	USB	eng
+W	接口	v
+W	松动	a
+W	了	ul
+W	，	x
+W	接触不良	i
+W	。	x
+
+S	0101_fullwidth	你好！很高兴见到你？
+W	你好	l
+W	！	x
+W	很	zg
+W	高兴	b
+W	见到	v
+W	你	r
+W	？	x
+
+S	0102_fullwidth	《红楼梦》是四大名著之一。
+W	《	x
+W	红楼梦	nz
+W	》	x
+W	是	v
+W	四大名著	i
+W	之一	r
+W	。	x
+
+S	0103_fullwidth	他说：「今天天气真好。」
+W	他	r
+W	说	v
+W	：	x
+W	「	x
+W	今天天气	i
+W	真	d
+W	好	a
+W	。	x
+W	」	x
+
+S	0104_fullwidth	（括号里的内容仅供参考。）
+W	（	x
+W	括号	n
+W	里	f
+W	的	uj
+W	内容	n
+W	仅供参考	l
+W	。	x
+W	）	x
+
+S	0105_fullwidth	第一、准备工作；第二、制定计划；第三、执行。
+W	第一	m
+W	、	x
+W	准备	v
+W	工作	vn
+W	；	x
+W	第二	m
+W	、	x
+W	制定	v
+W	计划	n
+W	；	x
+W	第三	m
+W	、	x
+W	执行	v
+W	。	x
+
+S	0106_fullwidth	哇～这里的风景太美了！
+W	哇	y
+W	～	x
+W	这里	r
+W	的	uj
+W	风景	n
+W	太美	a
+W	了	ul
+W	！	x
+
+S	0107_fullwidth	……我不知道该说什么好。
+W	…	x
+W	…	x
+W	我	r
+W	不	d
+W	知道	v
+W	该	r
+W	说	v
+W	什么	r
+W	好	a
+W	。	x
+
+S	0108_fullwidth	甲——乙——丙——丁。
+W	甲	n
+W	—	x
+W	—	x
+W	乙	n
+W	—	x
+W	—	x
+W	丙	n
+W	—	x
+W	—	x
+W	丁	nr
+W	。	x
+
+S	0109_fullwidth	【重要通知】明日停水检修。
+W	【	x
+W	重要	a
+W	通知	v
+W	】	x
+W	明日	t
+W	停水	v
+W	检修	vn
+W	。	x
+
+S	0110_fullwidth	数字１２３４５和全角ＡＢＣ。
+W	数字	n
+W	１	x
+W	２	x
+W	３	x
+W	４	x
+W	５	x
+W	和	c
+W	全角	n
+W	Ａ	x
+W	Ｂ	x
+W	Ｃ	x
+W	。	x
+
+S	0111_fullwidth	疑问句：这是真的吗？？？
+W	疑问句	i
+W	：	x
+W	这	r
+W	是	v
+W	真的	d
+W	吗	y
+W	？	x
+W	？	x
+W	？	x
+
+S	0112_fullwidth	感叹！！太厉害了！！！
+W	感叹	v
+W	！	x
+W	！	x
+W	太	d
+W	厉害	a
+W	了	ul
+W	！	x
+W	！	x
+W	！	x
+
+S	0113_fullwidth	书名号《三体》、引号“人工智能”、顿号、逗号。
+W	书名号	n
+W	《	x
+W	三体	n
+W	》	x
+W	、	x
+W	引号	n
+W	“	x
+W	人工智能	n
+W	”	x
+W	、	x
+W	顿号	n
+W	、	x
+W	逗号	n
+W	。	x
+
+S	0114_fullwidth	波浪线～和破折号——还有省略号……。
+W	波浪	nz
+W	线	n
+W	～	x
+W	和	c
+W	破折号	n
+W	—	x
+W	—	x
+W	还有	v
+W	省略号	n
+W	…	x
+W	…	x
+W	。	x
+
+S	0115_fullwidth	中文分号；英文分号;混合使用。
+W	中文	nz
+W	分	v
+W	号	m
+W	；	x
+W	英文	nz
+W	分	v
+W	号	m
+W	;	x
+W	混合	vn
+W	使用	v
+W	。	x
+
+S	0116_fullwidth	全角冒号：半角冒号:对比。
+W	全角	n
+W	冒号	n
+W	：	x
+W	半角	m
+W	冒号	n
+W	:	x
+W	对比	v
+W	。	x
+
+S	0117_fullwidth	「直接引语」与『嵌套引语』的区别。
+W	「	x
+W	直接	ad
+W	引语	v
+W	」	x
+W	与	p
+W	『	x
+W	嵌套	nz
+W	引语	v
+W	』	x
+W	的	uj
+W	区别	n
+W	。	x
+
+S	0118_fullwidth	百分号％是全角的，%是半角的。
+W	百分号	m
+W	％	x
+W	是	v
+W	全角	n
+W	的	uj
+W	，	x
+W	%	x
+W	是	v
+W	半角	m
+W	的	uj
+W	。	x
+
+S	0119_fullwidth	加减乘除：＋－×÷。
+W	加减乘除	i
+W	：	x
+W	＋	x
+W	－	x
+W	×	x
+W	÷	x
+W	。	x
+
+S	0120_fullwidth	箭头符号→←↑↓表示方向。
+W	箭头	n
+W	符号	n
+W	→	x
+W	←	x
+W	↑	x
+W	↓	x
+W	表示	v
+W	方向	n
+W	。	x
+
+S	0121_long	人工智能技术在过去几年里取得了令人瞩目的进展，特别是在自然语言处理、计算机视觉和语音识别等领域，各种大规模预训练模型的出现极大地推动了相关产业的发展，同时也引发了人们对于数据隐私、算法偏见和技术伦理等问题的广泛讨论，如何在推动技术进步的同时确保其安全可靠地服务于人类社会，已经成为整个行业必须认真思考的重要课题。
+W	人工智能	n
+W	技术	n
+W	在	p
+W	过去	t
+W	几年	m
+W	里	f
+W	取得	v
+W	了	ul
+W	令人瞩目	i
+W	的	uj
+W	进展	vn
+W	，	x
+W	特别	d
+W	是	v
+W	在	p
+W	自然语言	l
+W	处理	v
+W	、	x
+W	计算机	n
+W	视觉	n
+W	和	c
+W	语音	n
+W	识别	v
+W	等	u
+W	领域	n
+W	，	x
+W	各种	r
+W	大规模	b
+W	预	v
+W	训练	vn
+W	模型	n
+W	的	uj
+W	出现	v
+W	极大	a
+W	地	uv
+W	推动	v
+W	了	ul
+W	相关	v
+W	产业	n
+W	的	uj
+W	发展	vn
+W	，	x
+W	同时	c
+W	也	d
+W	引发	v
+W	了	ul
+W	人们	n
+W	对于	p
+W	数据	n
+W	隐私	b
+W	、	x
+W	算法	n
+W	偏见	v
+W	和	c
+W	技术	n
+W	伦理	ns
+W	等	u
+W	问题	n
+W	的	uj
+W	广泛	a
+W	讨论	v
+W	，	x
+W	如何	r
+W	在	p
+W	推动	v
+W	技术	n
+W	进步	d
+W	的	uj
+W	同时	c
+W	确保	v
+W	其	r
+W	安全可靠	i
+W	地	uv
+W	服务	vn
+W	于	p
+W	人类	n
+W	社会	n
+W	，	x
+W	已经	d
+W	成为	v
+W	整个	b
+W	行业	n
+W	必须	d
+W	认真思考	n
+W	的	uj
+W	重要	a
+W	课题	n
+W	。	x
+
+S	0122_long	中国的饮食文化源远流长，八大菜系各具特色：川菜麻辣鲜香，粤菜清淡鲜美，鲁菜醇厚浓郁，苏菜精细雅致，浙菜清爽细腻，闽菜清鲜和醇，湘菜香辣酸辣，徽菜重油重色，每一種菜系背后都蕴含着当地的历史传统与风土人情，无论是街边小摊还是高档餐厅，都能让人感受到中华美食的博大精深与无穷魅力，这也正是中国文化的独特之处。
+W	中国	ns
+W	的	uj
+W	饮食文化	l
+W	源远流长	i
+W	，	x
+W	八大菜系	n
+W	各具特色	l
+W	：	x
+W	川菜	n
+W	麻辣	z
+W	鲜香	nr
+W	，	x
+W	粤菜	n
+W	清淡	a
+W	鲜美	a
+W	，	x
+W	鲁菜	nr
+W	醇厚	a
+W	浓郁	a
+W	，	x
+W	苏菜	n
+W	精细	a
+W	雅致	a
+W	，	x
+W	浙	j
+W	菜	n
+W	清爽	a
+W	细腻	a
+W	，	x
+W	闽菜	n
+W	清鲜	a
+W	和	c
+W	醇	ag
+W	，	x
+W	湘菜	n
+W	香辣	z
+W	酸辣	z
+W	，	x
+W	徽菜	n
+W	重油	n
+W	重色	n
+W	，	x
+W	每	r
+W	一種	m
+W	菜系	n
+W	背后	f
+W	都	d
+W	蕴含着	n
+W	当地	s
+W	的	uj
+W	历史	n
+W	传统	n
+W	与	p
+W	风土人情	i
+W	，	x
+W	无论是	c
+W	街边	s
+W	小摊	n
+W	还是	c
+W	高档	b
+W	餐厅	n
+W	，	x
+W	都	d
+W	能	v
+W	让	v
+W	人	n
+W	感受	v
+W	到	v
+W	中华美食	n
+W	的	uj
+W	博大精深	nr
+W	与	p
+W	无穷	d
+W	魅力	n
+W	，	x
+W	这	r
+W	也	d
+W	正是	d
+W	中国	ns
+W	文化	n
+W	的	uj
+W	独特	a
+W	之	u
+W	处	n
+W	。	x
+
+S	0123_long	小明放学回到家，放下书包就迫不及待地打开电视，因为他最喜欢的动画片马上就要开始了，可是妈妈却让他先完成作业再玩，小明虽然有些不情愿，但还是乖乖地坐到书桌前，认认真真地写起了作业，等到全部做完的时候，动画片已经播完了，不过妈妈答应他周末带他去游乐园玩一整天，这让小明的心情一下子又好了起来。
+W	小明	nr
+W	放学	n
+W	回到	v
+W	家	q
+W	，	x
+W	放下	v
+W	书包	n
+W	就	d
+W	迫不及待	i
+W	地	uv
+W	打开	v
+W	电视	n
+W	，	x
+W	因为	c
+W	他	r
+W	最	d
+W	喜欢	v
+W	的	uj
+W	动画片	n
+W	马上	d
+W	就要	d
+W	开始	v
+W	了	ul
+W	，	x
+W	可是	c
+W	妈妈	n
+W	却	d
+W	让	v
+W	他	r
+W	先	d
+W	完成	v
+W	作业	n
+W	再	d
+W	玩	v
+W	，	x
+W	小明	nr
+W	虽然	c
+W	有些	r
+W	不	d
+W	情愿	n
+W	，	x
+W	但	c
+W	还是	c
+W	乖乖	d
+W	地	uv
+W	坐到	v
+W	书桌	n
+W	前	f
+W	，	x
+W	认认真真	z
+W	地	uv
+W	写起	v
+W	了	ul
+W	作业	n
+W	，	x
+W	等到	v
+W	全部	n
+W	做完	v
+W	的	uj
+W	时候	n
+W	，	x
+W	动画片	n
+W	已经	d
+W	播完	v
+W	了	ul
+W	，	x
+W	不过	c
+W	妈妈	n
+W	答应	v
+W	他	r
+W	周末	t
+W	带	v
+W	他	r
+W	去	v
+W	游乐园	n
+W	玩	v
+W	一整天	m
+W	，	x
+W	这	r
+W	让	v
+W	小明	nr
+W	的	uj
+W	心情	n
+W	一下子	m
+W	又	d
+W	好	a
+W	了	ul
+W	起来	v
+W	。	x
+
+S	0124_long	这座城市的交通网络四通八达，地铁线路纵横交错，公交车穿梭于大街小巷，共享单车解决了最后一公里的出行难题，网约车提供了更加个性化的选择，随着智慧城市建设的不断推进，交通信号灯变得更加智能，道路通行效率显著提升，市民出行的体验越来越好，城市也变得越来越宜居。
+W	这	r
+W	座	q
+W	城市	ns
+W	的	uj
+W	交通网络	n
+W	四通八达	i
+W	，	x
+W	地铁	n
+W	线路	n
+W	纵横交错	i
+W	，	x
+W	公交车	n
+W	穿梭	v
+W	于	p
+W	大街小巷	i
+W	，	x
+W	共享	v
+W	单车	n
+W	解决	v
+W	了	ul
+W	最后	f
+W	一	m
+W	公里	q
+W	的	uj
+W	出行	v
+W	难题	n
+W	，	x
+W	网约	n
+W	车	n
+W	提供	v
+W	了	ul
+W	更加	d
+W	个性化	n
+W	的	uj
+W	选择	v
+W	，	x
+W	随着	p
+W	智慧	nr
+W	城市	ns
+W	建设	vn
+W	的	uj
+W	不断	d
+W	推进	v
+W	，	x
+W	交通	n
+W	信号灯	n
+W	变得	v
+W	更加	d
+W	智能	n
+W	，	x
+W	道路	n
+W	通行	j
+W	效率	n
+W	显著	a
+W	提升	v
+W	，	x
+W	市民	n
+W	出行	v
+W	的	uj
+W	体验	n
+W	越来越	d
+W	好	a
+W	，	x
+W	城市	ns
+W	也	d
+W	变得	v
+W	越来越	d
+W	宜居	ns
+W	。	x
+
+S	0125_hmm	张伟和李娜都是北京人。
+W	张伟	nr
+W	和	c
+W	李娜	nr
+W	都	d
+W	是	v
+W	北京	ns
+W	人	n
+W	。	x
+
+S	0126_hmm	刘德华在台北举办了演唱会。
+W	刘德华	nr
+W	在	p
+W	台北	ns
+W	举办	v
+W	了	ul
+W	演唱会	n
+W	。	x
+
+S	0127_hmm	诸葛亮是三国时期蜀汉的丞相。
+W	诸葛亮	nr
+W	是	v
+W	三国	ns
+W	时期	n
+W	蜀汉	ns
+W	的	uj
+W	丞相	n
+W	。	x
+
+S	0128_hmm	乌鲁木齐是新疆的首府。
+W	乌鲁木齐	ns
+W	是	v
+W	新疆	ns
+W	的	uj
+W	首府	n
+W	。	x
+
+S	0129_hmm	呼和浩特位于内蒙古自治区。
+W	呼和浩特	ns
+W	位于	v
+W	内蒙古自治区	ns
+W	。	x
+
+S	0130_hmm	马尔代夫是著名的旅游胜地。
+W	马尔代夫	nrt
+W	是	v
+W	著名	a
+W	的	uj
+W	旅游胜地	n
+W	。	x
+
+S	0131_hmm	秦始皇统一了六国。
+W	秦始皇	nr
+W	统一	vn
+W	了	ul
+W	六国	ns
+W	。	x
+
+S	0132_hmm	李白和杜甫是唐代著名诗人。
+W	李白	nr
+W	和	c
+W	杜甫	nr
+W	是	v
+W	唐代	t
+W	著名诗人	n
+W	。	x
+
+S	0133_hmm	马云创立了阿里巴巴集团。
+W	马云	nr
+W	创立	v
+W	了	ul
+W	阿里巴巴	nrt
+W	集团	n
+W	。	x
+
+S	0134_hmm	清华大学的校园很漂亮。
+W	清华大学	nt
+W	的	uj
+W	校园	n
+W	很漂亮	n
+W	。	x
+
+S	0135_hmm	长江三峡水利枢纽工程宏伟壮观。
+W	长江三峡水利枢纽工程	nz
+W	宏伟	a
+W	壮观	a
+W	。	x
+
+S	0136_hmm	喜马拉雅山脉是世界屋脊。
+W	喜马拉雅山脉	ns
+W	是	v
+W	世界屋脊	n
+W	。	x
+
+S	0137_hmm	布达拉宫矗立在拉萨河边。
+W	布达拉宫	ns
+W	矗立	v
+W	在	p
+W	拉萨河	ns
+W	边	d
+W	。	x
+
+S	0138_hmm	成吉思汗建立了蒙古帝国。
+W	成吉思汗	nr
+W	建立	v
+W	了	ul
+W	蒙古	ns
+W	帝国	n
+W	。	x
+
+S	0139_hmm	莎士比亚写了《哈姆雷特》。
+W	莎士比亚	ns
+W	写	v
+W	了	ul
+W	《	x
+W	哈姆雷特	nrt
+W	》	x
+W	。	x
+
+S	0140_hmm	爱因斯坦提出了相对论。
+W	爱因斯坦	nrt
+W	提出	v
+W	了	ul
+W	相对论	l
+W	。	x
+
+S	0141_hmm	螭吻和饕餮都是上古神兽。
+W	螭	g
+W	吻	v
+W	和	c
+W	饕餮	n
+W	都	d
+W	是	v
+W	上古	ns
+W	神兽	n
+W	。	x
+
+S	0142_hmm	貔貅有招财纳福的寓意。
+W	貔貅	n
+W	有	v
+W	招财	v
+W	纳福	nz
+W	的	uj
+W	寓意	n
+W	。	x
+
+S	0143_hmm	耄耋之年的老人依然精神矍铄。
+W	耄耋之年	i
+W	的	uj
+W	老人	n
+W	依然	d
+W	精神	n
+W	矍铄	a
+W	。	x
+
+S	0144_hmm	魑魅魍魉泛指各种鬼怪。
+W	魑魅魍魉	i
+W	泛指	j
+W	各种	r
+W	鬼怪	n
+W	。	x
+
+S	0145_hmm	彳亍不前的行人。
+W	彳亍	n
+W	不前	t
+W	的	uj
+W	行人	n
+W	。	x
+
+S	0146_hmm	孑孓在水里游动。
+W	孑孓	n
+W	在	p
+W	水里游	nr
+W	动	v
+W	。	x
+
+S	0147_hmm	囹圄之中仍不忘初衷。
+W	囹圄	n
+W	之中	r
+W	仍	d
+W	不	d
+W	忘	v
+W	初衷	d
+W	。	x
+
+S	0148_hmm	龌龊的行为令人不齿。
+W	龌龊	a
+W	的	uj
+W	行为	v
+W	令人	nrt
+W	不齿	n
+W	。	x
+
+S	0149_hmm	犹豫不决会错失良机。
+W	犹豫不决	i
+W	会	v
+W	错失良机	i
+W	。	x
+
+S	0150_hmm	忐忑不安的心情。
+W	忐忑不安	i
+W	的	uj
+W	心情	n
+W	。	x
+
+S	0151_hmm	尴尬的气氛弥漫开来。
+W	尴尬	a
+W	的	uj
+W	气氛	n
+W	弥漫	v
+W	开来	v
+W	。	x
+
+S	0152_hmm	唠叨是爱的另一种表达。
+W	唠叨	z
+W	是	v
+W	爱	v
+W	的	uj
+W	另	c
+W	一种	m
+W	表达	v
+W	。	x
+
+S	0153_hmm	葡萄美酒夜光杯。
+W	葡萄	n
+W	美酒	n
+W	夜光杯	n
+W	。	x
+
+S	0154_hmm	琉璃瓦在阳光下闪闪发光。
+W	琉璃瓦	ns
+W	在	p
+W	阳光	nr
+W	下	f
+W	闪闪发光	n
+W	。	x
+
+S	0155_hmm	咖啡厅里放着爵士乐。
+W	咖啡厅	n
+W	里	f
+W	放	v
+W	着	uz
+W	爵士乐	n
+W	。	x
+
+S	0156_hmm	沙发上的抱枕很柔软。
+W	沙发	nz
+W	上	f
+W	的	uj
+W	抱	v
+W	枕	v
+W	很	d
+W	柔软	a
+W	。	x
+
+S	0157_hmm	幽默感是社交的润滑剂。
+W	幽默感	n
+W	是	v
+W	社交	n
+W	的	uj
+W	润滑剂	nz
+W	。	x
+
+S	0158_hmm	逻辑思维需要刻意练习。
+W	逻辑思维	l
+W	需要	v
+W	刻意	v
+W	练习	v
+W	。	x
+
+S	0159_hmm	模特走了猫步。
+W	模特	a
+W	走	v
+W	了	ul
+W	猫步	n
+W	。	x
+
+S	0160_hmm	沙龙聚会持续到深夜。
+W	沙龙	nr
+W	聚会	n
+W	持续	vd
+W	到	v
+W	深夜	t
+W	。	x
+
+S	0161_hmm	敦煌壁画色彩斑斓。
+W	敦煌	ns
+W	壁画	n
+W	色彩斑斓	i
+W	。	x
+
+S	0162_hmm	泉州是宋元时期的东方大港。
+W	泉州	ns
+W	是	v
+W	宋元	nr
+W	时期	n
+W	的	uj
+W	东方	s
+W	大港	ns
+W	。	x
+
+S	0163_hmm	景德镇瓷器享誉世界。
+W	景德镇	nr
+W	瓷器	n
+W	享誉	v
+W	世界	n
+W	。	x
+
+S	0164_hmm	茅台酒产于贵州仁怀。
+W	茅台酒	n
+W	产于	v
+W	贵州	ns
+W	仁怀	nr
+W	。	x
+
+S	0165_hmm	普洱茶越陈越香。
+W	普洱茶	n
+W	越	d
+W	陈越香	nr
+W	。	x
+
+S	0166_hmm	苏州园林精巧雅致。
+W	苏州园林	ns
+W	精巧	a
+W	雅致	a
+W	。	x
+
+S	0167_hmm	鼓浪屿的小巷幽深静谧。
+W	鼓浪屿	n
+W	的	uj
+W	小巷	n
+W	幽深	a
+W	静谧	nr
+W	。	x
+
+S	0168_whitespace	hello world
+W	hello	eng
+W	 	x
+W	world	eng
+
+S	0169_whitespace	a b c d
+W	a	x
+W	 	x
+W	b	x
+W	 	x
+W	c	x
+W	 	x
+W	d	x
+
+S	0170_whitespace	行一分\n行二分
+W	行	zg
+W	一分	m
+W	\n	x
+W	行	zg
+W	二分	m
+
+S	0171_whitespace	tab\t分隔符
+W	tab	eng
+W	\t	x
+W	分隔符	n
+
+S	0172_whitespace	回车符\r\n换行测试
+W	回车符	n
+W	\r\n	x
+W	换行	v
+W	测试	vn
+
+S	0173_whitespace	全角空格　测试
+W	全角	n
+W	空格	n
+W	　	x
+W	测试	vn
+
+S	0174_whitespace	不间断空格 测试
+W	不间断	l
+W	空格	n
+W	 	x
+W	测试	vn
+
+S	0175_whitespace	前导空格   前导
+W	前导	n
+W	空格	n
+W	 	x
+W	 	x
+W	 	x
+W	前导	n
+
+S	0176_whitespace	尾随空格   
+W	尾随	v
+W	空格	n
+W	 	x
+W	 	x
+W	 	x
+
+S	0177_whitespace	多个   连续   空格
+W	多个	m
+W	 	x
+W	 	x
+W	 	x
+W	连续	a
+W	 	x
+W	 	x
+W	 	x
+W	空格	n
+
+S	0178_whitespace	混合 \t 空白\n字符 测试
+W	混合	vn
+W	 	x
+W	\t	x
+W	 	x
+W	空白	n
+W	\n	x
+W	字符	n
+W	 	x
+W	测试	vn
+
+S	0179_whitespace	x
+W	x	x
+
+S	0180_tricky	
+
+S	0181_tricky	。
+W	。	x
+
+S	0182_tricky	！
+W	！	x
+
+S	0183_tricky	，。？！；：、
+W	，	x
+W	。	x
+W	？	x
+W	！	x
+W	；	x
+W	：	x
+W	、	x
+
+S	0184_tricky	的的的的
+W	的	uj
+W	的的	u
+W	的	uj
+
+S	0185_tricky	了了了了了
+W	了了	v
+W	了了	v
+W	了	ul
+
+S	0186_tricky	A+B=C&D.e_f
+W	A	eng
+W	+	x
+W	B	eng
+W	=	x
+W	C	eng
+W	&	x
+W	D	eng
+W	.	m
+W	e	eng
+W	_	x
+W	f	eng
+
+S	0187_tricky	IPv6地址是2001:db8::1
+W	IPv6	eng
+W	地址	n
+W	是	v
+W	2001	m
+W	:	x
+W	db8	eng
+W	:	x
+W	:	x
+W	1	x
+
+S	0188_tricky	😀表情符号测试🎉
+W	😀	x
+W	表情符号	n
+W	测试	vn
+W	🎉	x
+
+S	0189_tricky	中文English日本語にほんご한국어
+W	中文	nz
+W	English	eng
+W	日本	ns
+W	語	x
+W	に	x
+W	ほ	x
+W	ん	x
+W	ご	x
+W	한	x
+W	국	x
+W	어	x
+
+S	0190_tricky	@#$%^&*()
+W	@	x
+W	#	x
+W	$	x
+W	%	x
+W	^	x
+W	&	x
+W	*	x
+W	(	x
+W	)	x
+
+S	0191_tricky	～～～～
+W	～	x
+W	～	x
+W	～	x
+W	～	x
+
+S	0192_tricky	。。。。。。
+W	。	x
+W	。	x
+W	。	x
+W	。	x
+W	。	x
+W	。	x
+
+S	0193_tricky	！！！！
+W	！	x
+W	！	x
+W	！	x
+W	！	x
+
+S	0194_tricky	e
+W	e	x
+
+S	0195_tricky	E
+W	E	x
+
+S	0196_tricky	3
+W	3	x
+
+S	0197_tricky	.
+W	.	x
+
+S	0198_tricky	_
+W	_	x
+
+S	0199_tricky	#标签 @提及 http://t.cn/abc
+W	#	x
+W	标签	n
+W	 	x
+W	@	x
+W	提及	v
+W	 	x
+W	http	eng
+W	:	x
+W	/	x
+W	/	x
+W	t	eng
+W	.	m
+W	cn	eng
+W	/	x
+W	abc	eng
+
+S	0200_tricky	第1章 第2节 第3部分
+W	第	m
+W	1	m
+W	章	nr
+W	 	x
+W	第	m
+W	2	m
+W	节	t
+W	 	x
+W	第	m
+W	3	m
+W	部分	n
+
+S	0201_tricky	v2ProPlus模型包含enc_p、flow、dec三个模块。
+W	v2ProPlus	eng
+W	模型	n
+W	包含	v
+W	enc	eng
+W	_	x
+W	p	eng
+W	、	x
+W	flow	eng
+W	、	x
+W	dec	eng
+W	三个	m
+W	模块	n
+W	。	x
+
+S	0202_tricky	①②③④⑤序号字符。
+W	①	x
+W	②	x
+W	③	x
+W	④	x
+W	⑤	x
+W	序号	n
+W	字符	n
+W	。	x
+
+S	0203_tricky	℃温度符号和℉。
+W	℃	x
+W	温度	n
+W	符号	n
+W	和	c
+W	℉	x
+W	。	x
+
