@@ -26,6 +26,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 namespace gsv::ar {
@@ -71,6 +72,17 @@ class T2SEngine {
   static constexpr size_t kMaxDecodeSteps = 1500; // MAX_AR_DECODE_STEPS
                                                   // (early_stop_num=50*57=2850>1500, 不激活)
 
+  // M1-fp16: 第二步开关(默认全关, 保持 fp32 步数值路径不变)。
+  //   kv   : KV cache 以 fp16 位型存储(写入舍入), 读出升位 fp32 计算
+  //   gemv : decode 全部 GEMV 走 kern::gemv_f16x_fmlal(激活先舍入 fp16,
+  //          FMLAL fp16×fp16→fp32 无中间舍入累加)
+  struct Fp16Options {
+    bool kv = false;
+    bool gemv = false;
+  };
+  void set_fp16(const Fp16Options& o);
+  const Fp16Options& fp16() const { return fp16_; }
+
   // 从 .gsv 加载全部权重; 维度取自 config JSON(版本锁纪律, 不硬编码形状)。
   explicit T2SEngine(const rt::GsvFile& f);
   const T2SDims& dims() const { return dims_; }
@@ -88,18 +100,35 @@ class T2SEngine {
 
   // ---- 单层前向原语(公开供单测做 prefill/decode 一致性对拍) ----
   // KV cache 布局(自定, 见 README 注释): 每层两个独立缓冲 kcache/vcache,
-  // 行主 token-major: cache[tok*D + head*HD + e], HD=D/heads。fp32 存储。
+  // 行主 token-major: cache[tok*D + head*HD + e], HD=D/heads。
+  // fp32 模式存 float; fp16.kv 模式存 uint16_t(f16 位型), 接口指针仍按
+  // 实际启用的缓冲传入(见 set_fp16/generate 的分派)。
   //
   // prefill: x[S,D] 就地更新为层输出; 该层 k/v 追加写入 cache 第 pos..pos+S-1 槽。
   // causal_prefix>0 时前 causal_prefix 个 query 只允许看见同数量的 key(文本前缀段),
   // 其余 query 标准因果 —— 等价 torch xy_attn_mask [文本行只见文本; 音频行因果]。
   void block_prefill(size_t l, float* x, size_t S, size_t pos,
-                     size_t causal_prefix, float* kcache, float* vcache);
+                     size_t causal_prefix, float* kcache, float* vcache) {
+    if (fp16_.kv)
+      throw std::runtime_error(
+          "fp16.kv 模式下请走 generate() 内部路径(缓冲类型不同)");
+    block_prefill_impl<false>(l, x, S, pos, causal_prefix, kcache, nullptr,
+                              vcache, nullptr);
+  }
   // decode: x[D] 单 token, 位置 pos(k/v 写第 pos 槽), 可见 key 数 len(含自身)。
+  // 注: fp16.gemv 开关只影响 generate() 内部路径; 本公开入口保持 fp32 权重路径
+  // (DenseF16 升位 sgemm), 供单测做两路一致性对拍。
   void block_decode(size_t l, float* x, size_t pos, size_t len,
-                    float* kcache, float* vcache);
+                    float* kcache, float* vcache) {
+    if (fp16_.kv)
+      throw std::runtime_error(
+          "fp16.kv 模式下请走 generate() 内部路径(缓冲类型不同)");
+    block_decode_impl<false, false>(l, x, pos, len, kcache, nullptr, vcache,
+                                    nullptr);
+  }
 
-  // logits 投影(无 bias): y[vocab] = W·x
+  // logits 投影(无 bias): y[vocab] = W·x —— 固定 fp32 路径(DenseF16 升位 sgemm)。
+  // generate() 内部走 predict_layer_fp() 以尊重 fp16.gemv 开关。
   void predict_layer(const float* x, float* y) { wp_.forward(x, 1, y); }
 
   // 贪心采样(就地施压 repetition penalty —— golden 捕获口径为惩罚后状态, 见实现注释)。
@@ -117,9 +146,28 @@ class T2SEngine {
     accel::DenseF16 wqkv, wout, w1, w2;
     std::vector<float> bqkv, bout, b1, b2;
     std::vector<float> n1g, n1b, n2g, n2b;
+    // M1-fp16: 原始 f16 位型副本(fp16 直读 GEMV 路径用; 与升位缓冲并存)
+    std::vector<uint16_t> wqkv16, wout16, w116, w216;
   };
 
   const rt::TensorView& need(const rt::GsvFile& f, const char* name) const;
+
+  // 模板实现(KV16: KV cache fp16 位型存储; GEMV16: FMLAL 直读 GEMV)。
+  // 未启用模式的缓冲指针传 nullptr。
+  template <bool KV16>
+  void block_prefill_impl(size_t l, float* x, size_t S, size_t pos,
+                          size_t causal_prefix, float* kf32, uint16_t* k16,
+                          float* vf32, uint16_t* v16);
+  template <bool KV16, bool GEMV16>
+  void block_decode_impl(size_t l, float* x, size_t pos, size_t len,
+                         float* kf32, uint16_t* k16, float* vf32,
+                         uint16_t* v16);
+
+  // generate() 内部使用的 logits 投影(尊重 fp16.gemv)
+  void predict_layer_fp(const float* x, float* y);
+  // 激活舍入到 fp16 后走 FMLAL GEMV(y = W16·xh)
+  void gemv_fmlal(const std::vector<uint16_t>& w16, const float* x, size_t out,
+                  size_t in, float* y);
 
   T2SDims dims_{};
   std::vector<Layer> layers_;
@@ -128,10 +176,18 @@ class T2SEngine {
   std::vector<float> bert_b_;
   float alpha_text_ = 1.f, alpha_audio_ = 1.f;
   accel::DenseF16 bert_proj_, wp_;
+  std::vector<uint16_t> wp16_;  // ar_predict_layer 原始 f16 位型
+
+  // M1-fp16 状态与 scratch
+  Fp16Options fp16_{};
+  std::vector<uint16_t> xh_, ffh_;          // 激活 fp16 化暂存([D]/[FF])
+  std::vector<std::vector<uint16_t>> kc16_, vc16_;  // KV cache fp16 位型 [cap*D]
+  std::vector<float> kvrow_;                // KV fp16 读出升位行暂存([D])
 
   // scratch(generate 内复用)
-  std::vector<std::vector<float>> kc_, vc_; // 每层 KV cache [cap*D]
+  std::vector<std::vector<float>> kc_, vc_; // 每层 KV cache [cap*D] (fp32 模式)
   size_t cap_ = 0;
+  bool kv_mode_active_ = false;  // 当前缓冲所属模式(fp32/fp16 切换时重建)
   std::vector<float> xy_, qkv_, attn_, tmp_, ff_, pe_;
   std::vector<float> scores_, probs_, logits_;
   std::vector<uint32_t> pen_mark_;             // 惩罚去重标记(与 pen_stamp_ 配合)

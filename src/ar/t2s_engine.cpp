@@ -8,6 +8,8 @@
 //   - 无 RoPE(T2S 用正弦位置编码加在输入上, 与 kern 的 rope 无关)
 #include "ar/t2s_engine.hpp"
 
+#include "kern/gemv_fmlal.hpp"
+
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -67,7 +69,13 @@ T2SEngine::T2SEngine(const GsvFile& f) {
 
   bert_b_ = vec_of("bert_proj.bias");
   bert_proj_ = dense16("bert_proj.weight", D, dims_.bert_dim);
-  wp_ = dense16("ar_predict_layer.weight", dims_.vocab, D);
+  {
+    const TensorView& t = need(f, "ar_predict_layer.weight");
+    if (t.numel() != dims_.vocab * D || !t.has_f16())
+      throw std::runtime_error("ar_predict_layer 形状/f16 段不符");
+    wp_ = DenseF16(t.data_f16_raw(), dims_.vocab, D);
+    wp16_.assign(t.data_f16_raw(), t.data_f16_raw() + t.numel());
+  }
   alpha_text_ = need(f, "ar_text_position.alpha").data_f32()[0];
   alpha_audio_ = need(f, "ar_audio_position.alpha").data_f32()[0];
 
@@ -76,13 +84,22 @@ T2SEngine::T2SEngine(const GsvFile& f) {
     Layer& L = layers_[l];
     const std::string p = "h.layers." + std::to_string(l) + ".";
     const std::string ps = p + "self_attn.";
-    L.wqkv = dense16((ps + "in_proj_weight").c_str(), 3 * D, D);
+    auto dense16r = [&](const char* name, size_t rows, size_t cols,
+                        std::vector<uint16_t>* raw) {
+      const TensorView& t = need(f, name);
+      if (t.numel() != rows * cols || !t.has_f16())
+        throw std::runtime_error(std::string(name) + ": 形状/f16 段不符");
+      if (raw)
+        raw->assign(t.data_f16_raw(), t.data_f16_raw() + t.numel());
+      return DenseF16(t.data_f16_raw(), rows, cols);
+    };
+    L.wqkv = dense16r((ps + "in_proj_weight").c_str(), 3 * D, D, &L.wqkv16);
     L.bqkv = vec_of((ps + "in_proj_bias").c_str());
-    L.wout = dense16((ps + "out_proj.weight").c_str(), D, D);
+    L.wout = dense16r((ps + "out_proj.weight").c_str(), D, D, &L.wout16);
     L.bout = vec_of((ps + "out_proj.bias").c_str());
-    L.w1 = dense16((p + "linear1.weight").c_str(), dims_.ffn, D);
+    L.w1 = dense16r((p + "linear1.weight").c_str(), dims_.ffn, D, &L.w116);
     L.b1 = vec_of((p + "linear1.bias").c_str());
-    L.w2 = dense16((p + "linear2.weight").c_str(), D, dims_.ffn);
+    L.w2 = dense16r((p + "linear2.weight").c_str(), D, dims_.ffn, &L.w216);
     L.b2 = vec_of((p + "linear2.bias").c_str());
     L.n1g = vec_of((p + "norm1.weight").c_str());
     L.n1b = vec_of((p + "norm1.bias").c_str());
@@ -95,6 +112,25 @@ const TensorView& T2SEngine::need(const GsvFile& f, const char* name) const {
   const auto* t = f.tensor(name);
   if (!t) throw std::runtime_error(std::string("缺张量: ") + name);
   return *t;
+}
+
+// ---- M1-fp16 开关与直读路径 ----
+void T2SEngine::set_fp16(const Fp16Options& o) { fp16_ = o; }
+
+// y[out] = W16·xh: 激活舍入到 fp16 后走 FMLAL 扩展精度累加 GEMV。
+// xh_ 复用为暂存(调用方串行使用, 无重入)。
+void T2SEngine::gemv_fmlal(const std::vector<uint16_t>& w16, const float* x,
+                           size_t out, size_t in, float* y) {
+  xh_.resize(in);
+  kern::f32_to_f16(x, xh_.data(), in);
+  kern::gemv_f16x_fmlal(w16.data(), xh_.data(), y, out, in);
+}
+
+void T2SEngine::predict_layer_fp(const float* x, float* y) {
+  if (fp16_.gemv)
+    gemv_fmlal(wp16_, x, dims_.vocab, dims_.d_model, y);
+  else
+    wp_.forward(x, 1, y);
 }
 
 // SinePositionalEmbedding.extend_pe 单行同构:
@@ -111,14 +147,17 @@ void T2SEngine::pe_row(float* pe, size_t pos) {
 }
 
 // ---- prefill 单层: 与 T2SBlock.process_prompt 同构(post-LN) ----
-void T2SEngine::block_prefill(size_t l, float* x, size_t S, size_t pos,
-                              size_t text_len, float* kcache, float* vcache) {
+// KV16: k/v 以 fp16 位型写入 cache, 注意力读出升位 fp32 计算(存储舍入一次)。
+template <bool KV16>
+void T2SEngine::block_prefill_impl(size_t l, float* x, size_t S, size_t pos,
+                                   size_t text_len, float* kf32, uint16_t* k16,
+                                   float* vf32, uint16_t* v16) {
   const size_t D = dims_.d_model, H = dims_.n_heads, HD = D / H;
   const size_t FF = dims_.ffn;
   Layer& L = layers_[l];
   const float scale = 1.0f / std::sqrt(static_cast<float>(HD));
 
-  // fused QKV: qkv[S,3D] = x·Wqkvᵀ+b
+  // fused QKV: qkv[S,3D] = x·Wqkvᵀ+b (prefill 大矩阵乘固定 Accelerate sgemm)
   qkv_.resize(S * 3 * D);
   L.wqkv.forward(x, S, qkv_.data());
   for (size_t i = 0; i < S; ++i)
@@ -127,16 +166,25 @@ void T2SEngine::block_prefill(size_t l, float* x, size_t S, size_t pos,
   // k/v 写 cache 第 pos..pos+S-1 槽(token-major 行主, 头内连续 —— 与 qkv 行布局一致,
   // 直接按行拷贝 [token, D] 中 k 段/D 段)
   for (size_t t = 0; t < S; ++t) {
-    std::memcpy(kcache + (pos + t) * D, qkv_.data() + t * 3 * D + D, D * sizeof(float));
-    std::memcpy(vcache + (pos + t) * D, qkv_.data() + t * 3 * D + 2 * D, D * sizeof(float));
+    const float* krow = qkv_.data() + t * 3 * D + D;
+    const float* vrow = qkv_.data() + t * 3 * D + 2 * D;
+    if constexpr (KV16) {
+      kern::f32_to_f16(krow, k16 + (pos + t) * D, D);
+      kern::f32_to_f16(vrow, v16 + (pos + t) * D, D);
+    } else {
+      std::memcpy(kf32 + (pos + t) * D, krow, D * sizeof(float));
+      std::memcpy(vf32 + (pos + t) * D, vrow, D * sizeof(float));
+    }
   }
 
   // SDPA: 掩码 allowed(q,k) = k<text_len || k<=q —— 文本块双向互见(text_len>0 时
   // 对 q<text_len 自动覆盖全部文本 key), 音频行因果。text_len==0 ⇒ 纯因果。
   // torch 侧为全行 softmax(-inf 掩蔽); 此处紧致遍历 allowed 集, 数学等价。
+  // KV16 读出: 每 key 行先升位到 kvrow_(fp32), 计算全 fp32。
   scores_.resize(S);
   probs_.resize(S);
   attn_.assign(S * D, 0.f);
+  if constexpr (KV16) kvrow_.resize(D);
   for (size_t h = 0; h < H; ++h) {
     for (size_t q = 0; q < S; ++q) {
       const float* qv = qkv_.data() + q * 3 * D + h * HD;
@@ -144,7 +192,13 @@ void T2SEngine::block_prefill(size_t l, float* x, size_t S, size_t pos,
       size_t n = 0;
       for (size_t k = 0; k < n_max; ++k) {
         if (!(k < text_len || k <= q)) continue;
-        const float* kv = kcache + (pos + k) * D + h * HD;
+        const float* kv;
+        if constexpr (KV16) {
+          accel::f16_to_f32(k16 + (pos + k) * D + h * HD, kvrow_.data(), HD);
+          kv = kvrow_.data();
+        } else {
+          kv = kf32 + (pos + k) * D + h * HD;
+        }
         float dot = 0.f;
         for (size_t e = 0; e < HD; ++e) dot += qv[e] * kv[e];
         scores_[n++] = dot * scale;
@@ -155,7 +209,13 @@ void T2SEngine::block_prefill(size_t l, float* x, size_t S, size_t pos,
       for (size_t k = 0; k < n_max; ++k) {
         if (!(k < text_len || k <= q)) continue;
         const float p = probs_[idx++];
-        const float* vv = vcache + (pos + k) * D + h * HD;
+        const float* vv;
+        if constexpr (KV16) {
+          accel::f16_to_f32(v16 + (pos + k) * D + h * HD, kvrow_.data(), HD);
+          vv = kvrow_.data();
+        } else {
+          vv = vf32 + (pos + k) * D + h * HD;
+        }
         for (size_t e = 0; e < HD; ++e) ov[e] += p * vv[e];
       }
     }
@@ -179,13 +239,16 @@ void T2SEngine::block_prefill(size_t l, float* x, size_t S, size_t pos,
   for (size_t t = 0; t < S; ++t)
     gsv::kern::layernorm(x + t * D, L.n2g.data(), L.n2b.data(), x + t * D, D,
                          dims_.ln_eps);
-}
+}  // block_prefill_impl<KV16>
 
 // ---- decode 单层: 与 T2SBlock.decode_next_token 同构 ----
 // KV cache 布局: token-major 行主 cache[tok*D + head*HD + e](见头文件),
 // 每 token 写一行, 注意力对 [0,len) 全可见(decode 阶段无掩码)。
-void T2SEngine::block_decode(size_t l, float* x, size_t pos, size_t len,
-                             float* kcache, float* vcache) {
+// KV16: 存储 fp16/读出计算 fp32; GEMV16: 全部权重 GEMV 走 FMLAL 直读。
+template <bool KV16, bool GEMV16>
+void T2SEngine::block_decode_impl(size_t l, float* x, size_t pos, size_t len,
+                                  float* kf32, uint16_t* k16, float* vf32,
+                                  uint16_t* v16) {
   const size_t D = dims_.d_model, H = dims_.n_heads, HD = D / H;
   Layer& L = layers_[l];
   const float scale = 1.0f / std::sqrt(static_cast<float>(HD));
@@ -193,20 +256,35 @@ void T2SEngine::block_decode(size_t l, float* x, size_t pos, size_t len,
   // fused QKV 单行 GEMV: qkv[3D]
   dec_qkv_.resize(3 * D);
   float* qkv = dec_qkv_.data();
-  L.wqkv.forward(x, 1, qkv);
+  if constexpr (GEMV16)
+    gemv_fmlal(L.wqkv16, x, 3 * D, D, qkv);
+  else
+    L.wqkv.forward(x, 1, qkv);
   for (size_t j = 0; j < 3 * D; ++j) qkv[j] += L.bqkv[j];
 
   // 本 token 的 k/v 追加到第 pos 槽(len == pos+1, 见 generate 调用点)
-  std::memcpy(kcache + pos * D, qkv + D, D * sizeof(float));
-  std::memcpy(vcache + pos * D, qkv + 2 * D, D * sizeof(float));
+  if constexpr (KV16) {
+    kern::f32_to_f16(qkv + D, k16 + pos * D, D);
+    kern::f32_to_f16(qkv + 2 * D, v16 + pos * D, D);
+  } else {
+    std::memcpy(kf32 + pos * D, qkv + D, D * sizeof(float));
+    std::memcpy(vf32 + pos * D, qkv + 2 * D, D * sizeof(float));
+  }
 
-  // SDPA 单 query 对 len 个 key
+  // SDPA 单 query 对 len 个 key(KV16: 每 key 升位 fp32 后计算)
   scores_.resize(len);
   attn_.assign(D, 0.f);
+  if constexpr (KV16) kvrow_.resize(D);
   for (size_t h = 0; h < H; ++h) {
     const float* qv = qkv + h * HD;
     for (size_t k = 0; k < len; ++k) {
-      const float* kv = kcache + k * D + h * HD;
+      const float* kv;
+      if constexpr (KV16) {
+        accel::f16_to_f32(k16 + k * D + h * HD, kvrow_.data(), HD);
+        kv = kvrow_.data();
+      } else {
+        kv = kf32 + k * D + h * HD;
+      }
       float dot = 0.f;
       for (size_t e = 0; e < HD; ++e) dot += qv[e] * kv[e];
       scores_[k] = dot * scale;
@@ -215,7 +293,13 @@ void T2SEngine::block_decode(size_t l, float* x, size_t pos, size_t len,
     float* ov = attn_.data() + h * HD;
     for (size_t k = 0; k < len; ++k) {
       const float p = scores_[k];
-      const float* vv = vcache + k * D + h * HD;
+      const float* vv;
+      if constexpr (KV16) {
+        accel::f16_to_f32(v16 + k * D + h * HD, kvrow_.data(), HD);
+        vv = kvrow_.data();
+      } else {
+        vv = vf32 + k * D + h * HD;
+      }
       for (size_t e = 0; e < HD; ++e) ov[e] += p * vv[e];
     }
   }
@@ -223,7 +307,10 @@ void T2SEngine::block_decode(size_t l, float* x, size_t pos, size_t len,
   // out proj + 残差 + post-LN(norm1)
   dec_xb_.resize(D);
   float* xb = dec_xb_.data();
-  L.wout.forward(attn_.data(), 1, xb);
+  if constexpr (GEMV16)
+    gemv_fmlal(L.wout16, attn_.data(), D, D, xb);
+  else
+    L.wout.forward(attn_.data(), 1, xb);
   for (size_t i = 0; i < D; ++i) xb[i] += L.bout[i];
   for (size_t i = 0; i < D; ++i) xb[i] += x[i];
   gsv::kern::layernorm(xb, L.n1g.data(), L.n1b.data(), xb, D, dims_.ln_eps);
@@ -235,14 +322,39 @@ void T2SEngine::block_decode(size_t l, float* x, size_t pos, size_t len,
   hbuf.resize(D);
   std::memcpy(hbuf.data(), xb, D * sizeof(float));
   ff_.resize(dims_.ffn);
-  L.w1.forward(xb, 1, ff_.data());
+  if constexpr (GEMV16)
+    gemv_fmlal(L.w116, xb, dims_.ffn, D, ff_.data());
+  else
+    L.w1.forward(xb, 1, ff_.data());
   for (size_t i = 0; i < dims_.ffn; ++i) ff_[i] += L.b1[i];
   gsv::kern::relu(ff_.data(), ff_.data(), dims_.ffn);
-  L.w2.forward(ff_.data(), 1, xb);
+  if constexpr (GEMV16)
+    gemv_fmlal(L.w216, ff_.data(), D, dims_.ffn, xb);
+  else
+    L.w2.forward(ff_.data(), 1, xb);
   for (size_t i = 0; i < D; ++i) xb[i] += L.b2[i];
   for (size_t i = 0; i < D; ++i) xb[i] += hbuf[i];
   gsv::kern::layernorm(xb, L.n2g.data(), L.n2b.data(), x, D, dims_.ln_eps);
-}
+}  // block_decode_impl<KV16,GEMV16>
+
+template void T2SEngine::block_prefill_impl<false>(size_t, float*, size_t,
+                                                   size_t, size_t, float*,
+                                                   uint16_t*, float*, uint16_t*);
+template void T2SEngine::block_prefill_impl<true>(size_t, float*, size_t,
+                                                  size_t, size_t, float*,
+                                                  uint16_t*, float*, uint16_t*);
+template void T2SEngine::block_decode_impl<false, false>(size_t, float*,
+                                                         size_t, size_t,
+                                                         float*, uint16_t*,
+                                                         float*, uint16_t*);
+template void T2SEngine::block_decode_impl<true, false>(size_t, float*, size_t,
+                                                        size_t, float*,
+                                                        uint16_t*, float*,
+                                                        uint16_t*);
+template void T2SEngine::block_decode_impl<true, true>(size_t, float*, size_t,
+                                                       size_t, float*,
+                                                       uint16_t*, float*,
+                                                       uint16_t*);
 
 // ---- 贪心采样(infer_panel_naive sample() top_k=1 同构) ----
 // 关键语义: torch 的 logits_to_probs 用 scatter_ 就地修改传入的 logits 张量,
@@ -296,14 +408,22 @@ GenResult T2SEngine::generate(const int64_t* phones, size_t T,
   if (T == 0 || P == 0) throw std::runtime_error("T/P 必须非零(golden 口径)");
   const size_t S = T + P;
 
-  // ---- scratch/cache 容量(跨调用复用) ----
-  if (cap_ < S + max_steps) {
+  // ---- scratch/cache 容量(跨调用复用; 模式切换或容量不足时重建) ----
+  if (cap_ < S + max_steps || fp16_.kv != kv_mode_active_) {
     cap_ = S + max_steps;
+    kv_mode_active_ = fp16_.kv;
     kc_.assign(dims_.n_layers, {});
     vc_.assign(dims_.n_layers, {});
+    kc16_.assign(dims_.n_layers, {});
+    vc16_.assign(dims_.n_layers, {});
     for (size_t l = 0; l < dims_.n_layers; ++l) {
-      kc_[l].resize(cap_ * D);
-      vc_[l].resize(cap_ * D);
+      if (fp16_.kv) {
+        kc16_[l].resize(cap_ * D);
+        vc16_[l].resize(cap_ * D);
+      } else {
+        kc_[l].resize(cap_ * D);
+        vc_[l].resize(cap_ * D);
+      }
     }
   }
 
@@ -327,18 +447,25 @@ GenResult T2SEngine::generate(const int64_t* phones, size_t T,
     for (size_t d = 0; d < D; ++d) xr[d] = erow[d] + alpha_audio_ * pe_[d];
   }
 
-  // ---- B1: prefill(24 层, 大矩阵乘走 Accelerate sgemm) ----
+  // ---- B1: prefill(24 层, 大矩阵乘固定 Accelerate sgemm) ----
   if (dbg) dbg->on_input(xy_.data(), S);
   const auto t0 = std::chrono::steady_clock::now();
   for (size_t l = 0; l < dims_.n_layers; ++l) {
-    block_prefill(l, xy_.data(), S, /*pos=*/0, /*text_len=*/T, kc_[l].data(), vc_[l].data());
+    if (fp16_.kv)
+      block_prefill_impl<true>(l, xy_.data(), S, /*pos=*/0, /*text_len=*/T,
+                               nullptr, kc16_[l].data(), nullptr,
+                               vc16_[l].data());
+    else
+      block_prefill_impl<false>(l, xy_.data(), S, /*pos=*/0, /*text_len=*/T,
+                                kc_[l].data(), nullptr, vc_[l].data(),
+                                nullptr);
     if (dbg) dbg->on_layer(l, xy_.data(), S);
   }
   const auto t1 = std::chrono::steady_clock::now();
 
   // 首 logits 来自最后一个音频 prompt 位置(xy_dec[:, -1])
   logits_.resize(dims_.vocab);
-  predict_layer(xy_.data() + (S - 1) * D, logits_.data());
+  predict_layer_fp(xy_.data() + (S - 1) * D, logits_.data());
 
   // ---- B2: decode 循环(GEMV + KV cache fp32 + 贪心) ----
   std::vector<int32_t> history;
@@ -378,10 +505,25 @@ GenResult T2SEngine::generate(const int64_t* phones, size_t T,
     pe_row(pe_.data(), P + idx);
     for (size_t d = 0; d < D; ++d) x1_[d] = erow[d] + alpha_audio_ * pe_[d];
 
-    for (size_t l = 0; l < dims_.n_layers; ++l)
-      block_decode(l, x1_.data(), cur_len, cur_len + 1, kc_[l].data(), vc_[l].data());
+    for (size_t l = 0; l < dims_.n_layers; ++l) {
+      if (fp16_.kv) {
+        if (fp16_.gemv)
+          block_decode_impl<true, true>(l, x1_.data(), cur_len, cur_len + 1,
+                                        nullptr, kc16_[l].data(), nullptr,
+                                        vc16_[l].data());
+        else
+          block_decode_impl<true, false>(l, x1_.data(), cur_len,
+                                         cur_len + 1, nullptr,
+                                         kc16_[l].data(), nullptr,
+                                         vc16_[l].data());
+      } else {
+        block_decode_impl<false, false>(l, x1_.data(), cur_len, cur_len + 1,
+                                        kc_[l].data(), nullptr,
+                                        vc_[l].data(), nullptr);
+      }
+    }
     ++cur_len;
-    predict_layer(x1_.data(), logits_.data());
+    predict_layer_fp(x1_.data(), logits_.data());
   }
   const auto t2 = std::chrono::steady_clock::now();
 
