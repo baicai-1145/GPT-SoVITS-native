@@ -34,6 +34,12 @@ add_library(gsv_rt STATIC
   src/runtime/mini_json.cpp
 )
 
+# ---- 内核库 ----
+add_library(gsv_kern STATIC
+  src/kern/kern.cpp
+  src/kern/gemv.cpp
+)
+
 # ---- CLI 工具 ----
 add_executable(gsv_tool src/runtime/gsv_tool.cpp)
 target_link_libraries(gsv_tool PRIVATE gsv_rt)
