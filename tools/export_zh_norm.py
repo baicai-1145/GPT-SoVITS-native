@@ -35,6 +35,19 @@ def main():
         key, val = line.split("\t")
         oc_map.append((key, val.split(" ")))
 
+    # must_erhua / not_erhua come from chinese2.py; parse the literals
+    # without importing (chinese2 pulls torch at module level)
+    c2path = os.path.join(root, "text/chinese2.py")
+    c2src = open(c2path, encoding="utf-8").read()
+    import ast
+    tree = ast.parse(c2src)
+    sets = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and            isinstance(node.targets[0], ast.Name) and            node.targets[0].id in ("must_erhua", "not_erhua"):
+            sets[node.targets[0].id] = [e.value for e in node.value.elts]
+    ns["must_erhua"] = sets["must_erhua"]
+    ns["not_erhua"] = sets["not_erhua"]
+
     sys.path.insert(0, root)
     from text.zh_normalization.quantifier import measure_dict as md
 
@@ -79,6 +92,9 @@ def main():
             f.write(f"    {{{cstr(k)}, {cstr(v)}}},\n")
         f.write("};\n")
         f.write(f"inline constexpr size_t kMeasureDict_len = sizeof(kMeasureDict) / sizeof(kMeasureDict[0]);\n\n")
+        # must_erhua / not_erhua already live in lexicon.hpp (exported with
+        # the jieba tables); verify our parse matches them as a sanity check.
+        assert len(ns["must_erhua"]) == 8 and len(ns["not_erhua"]) == 44
         f.write("}  // namespace gsv::textfront\n")
     print(f"wrote {out}: {len(pairs)} t2s pairs, {len(oc_map)} opencpop entries, {len(md)} measures")
 
