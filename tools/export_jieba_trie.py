@@ -39,6 +39,13 @@ Output format "GSVJTB01" (all integers little-endian):
                  u32 list_len; list_len x u16 state_id
                  # char -> ordered candidate state ids (source order kept;
                  # chars absent here fall back to ALL states in viterbi init)
+      fstart   : f64 x 4   # finalseg prob_start for plain Tokenizer.cut
+                           # (needed by ToneSandhi._split_word ->
+                           # jieba.cut_for_search), state order "BEMS"
+      ftrans   : 4 rows: u32 nnz; nnz x {u16 dst; u16 pad; f64 p}
+                           # missing transition == MIN_FLOAT (-3.14e100), NOT -inf
+                           # (differs from the POS-HMM!)
+      femit    : 4 rows: u32 n; n x {u32 cp; f64 p}   # sorted by cp
 """
 import argparse
 import importlib
@@ -105,6 +112,8 @@ def main():
         args.dict = os.path.join(args.site_packages, "jieba_fast", "dict.txt")
 
     psg = load_jieba(args.site_packages)
+
+    import jieba_fast.finalseg as finalseg  # noqa: F401  (used below)
 
     freq, tag_tab, total = build_freq_and_tags(args.dict)
     print(f"dict: {sum(1 for v in freq.values() if v > 0)} words, "
@@ -207,6 +216,18 @@ def main():
                 u32(len(cs_entries)) +
                 b"".join(u32(c) + u32(f) + u32(n) for c, f, n in cs_entries) +
                 u32(len(cs_list)) + b"".join(u16(s) for s in cs_list)),
+        section("fstart", b"".join(f64(finalseg.start_P[s]) for s in "BEMS")),
+        section("ftrans", b"".join(
+            u32(len(finalseg.trans_P[s])) +
+            b"".join(u16("BEMS".index(d)) + u16(0) + f64(p) for d, p in
+                     sorted(finalseg.trans_P[s].items(),
+                            key=lambda kv: "BEMS".index(kv[0])))
+            for s in "BEMS")),
+        section("femit", b"".join(
+            u32(len(em)) +
+            b"".join(u32(ord(c)) + f64(p) for c, p in
+                     sorted(em.items(), key=lambda kv: ord(kv[0])))
+            for em in (finalseg.emit_P[s] for s in "BEMS"))),
     ]
 
     header_size = 16 + 32 * len(secs)
