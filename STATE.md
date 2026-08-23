@@ -38,6 +38,7 @@
 
 | ID | 任务 | 依赖 | 所有者 | 状态 | 备注 |
 |---|---|---|---|---|---|
+| B10 | M3: 英文g2p+en_norm+LangSegmenter混排 | B9 | exec-txt | DONE | task/B5 | pairs 63/65(余2=G2PW类); rep_map正则key怪癖已复现 |
 | B9 | M3: TextFrontend 运行时编排(分句+组装) | B5,B7 | exec-txt | DONE | task/B5 | pairs parity 61/65; 真实口径=prompt_ids++分段ids(短句补。), phone_units假设证伪 |
 | C1 | HuBERT/SV 编码器 + 参考缓存 | A4 | exec-ar | DONE | task/B12 | 6/6 refs 全链 cos=1.0; convert.py WN bug 修复+hubert 重转 |
 | C2 | CLI 全链路串接 | 全 B+C1 | 决策者 | TODO | |
