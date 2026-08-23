@@ -61,13 +61,12 @@ P核2-3: VITS 合成第 N 段波形         (user-initiated QoS)
 | L2 Accelerate | vDSP_mmul / BNNS | 一切大 GEMM：AR prefill、VITS im2col 后的卷积 GEMM、BERT/HuBERT。M4 上自动调度到 SME 矩阵单元 |
 | L3 SME 实验分支 | FMOPA outer-product（未文档化，用户态可执行已被 Jena/tzakharko 验证） | 二期验证 int8 GEMV/GEMM 是否胜过 L1/L2 组合，赢了才合入 |
 
-数值策略:
-- 硬件前提（本机实测通过）: M4 支持 FEAT_FP16 + FEAT_I8MM；NEON fp16 FMA 双倍吞吐；
-  FMLAL 宽化 FMA 可 fp16 输入直接累进 fp32 —— "fp16 存储 + fp32 累加"零额外成本
-- 第一版运行时格式（2025-08 修订）: **fp16 权重存储 + 全程 fp32 计算与累加**。
-  乘法经 FMLAL 扩展精度（fp16 输入的精确乘积直接累进 fp32，无 fp16 中间舍入点）；
-  KV cache fp32 起步（fp16-KV 为编译开关，M6 与 int8 一并重评）；
-  fp32 权重布局保留作验证基线
+数值策略（两步走）:
+- 第一步（M1/M2 实现期）: **全 fp32 计算与累加**，权重加载 fp32 段，目标 = 与 torch golden
+  最大程度对齐（同源数值、仅归约顺序差异）；KV cache fp32
+- 第二步（fp16 化）: 权重切 fp16 段（源值即 fp16，逐位等价零噪声）+ FMLAL 扩展精度乘法
+  （无 fp16 中间舍入点）+ KV cache fp16 开关；每次切换过三道门后才合入
+- 硬件前提（本机实测）: FEAT_FP16+FEAT_I8MM；NEON fp16 FMA 双倍吞吐；FMLAL 可直接累进 fp32
 
 ### 精度依据（M0 定标结论，详见 tests/golden/CALIBRATION.md）
 
@@ -78,14 +77,12 @@ P核2-3: VITS 合成第 N 段波形         (user-initiated QoS)
 
 ### 精度一致性定义（"与 torch 一致"的可测试语义）
 
-逐位一致不可达（BLAS 归约顺序不同），采用三道门，具体数值在 M0 校准后锁定：
-- G1 张量级: 每个 golden 对照点 cos-sim ≥ 0.9999，且相对误差分布与 torch 自身半精度噪声同量级
-- G2 解码级: 固定种子贪心解码测试集，token 序列一致率 ≥ 98%（门槛待 M0 校准），
-  且任何分歧不得引发长度雪崩/死循环
-- G3 音频级: 相同输入下 mel-L1 距离不超过 torch 自身多次运行波动地板的 3 倍（M0 实测定标）
-- 阶段二（已批准）: AR 权重 int8 + per-channel scale + KV cache int8；VITS 量化逐层做 A/B 听感
-- 内核纪律: 累加/softmax/rmsnorm 统计量只用 fp32（fp16 尾数 10 位，长链必炸）；
-  不使用 bf16（M4 NEON 不支持）
+逐位一致不可达（BLAS 归约顺序不同），采用三道门，数值已于 M0 锁定（tests/golden/gates.json）：
+- G1 张量级: cos-sim ≥ 0.9999 且 max-rel ≤ 1e-3（provisional，首次 native 对照后复核）
+- G2 解码级: token 序列一致率 ≥ 98%，长度比 ∈ [0.8,1.25]，无雪崩
+- G3 音频级: 稳定锚点对上 mel 相对变化 ≤ 5%
+- 阶段二量化（已批准）: AR 权重 int8 + per-channel scale + KV int8；VITS 逐层 A/B 听感
+- 内核纪律: softmax/rmsnorm 统计量只用 fp32（fp16 尾数 10 位，长链必炸）；不用 bf16
 
 ## 4. 线程模型
 
@@ -116,7 +113,7 @@ P核2-3: VITS 合成第 N 段波形         (user-initiated QoS)
 | 里程碑 | 内容 | 验收 |
 |---|---|---|
 | M0 | convert.py + golden 数值基线导出（torch 记录各模型关键中间张量）+ 三道门数值定标 | .gsv 加载成功; golden 集合可复现; G1/G2/G3 门槛数值锁定 |
-| M1 | AR 引擎 fp16 版: prefill(Accelerate) + 手写 NEON decode GEMV + KV cache | 三道门全达标; 单核 decode 吞吐记录 |
+| M1 | AR 引擎: 先全 fp32 对齐 golden，再切 fp16（存储/FMLAL/KV）；prefill(Accelerate) + 手写 NEON decode GEMV + KV cache | fp32 步: G1/G2 达标; fp16 步: 三道门复验; decode 吞吐记录 |
 | M2 | SoVITS 全链路: enc_p/quantizer/flow/dec + weight_norm 融合 | 端到端出 wav, 听感与 torch 版无差异 |
 | M3 | 文本前端原生: 分词/G2PW/pinyin/规则 | 与 CPUFast 输出逐句 diff 为空（测试集 ≥200 句） |
 | M4 | 编码器 + 缓存 + CLI 整合 | CLI 一条命令完成 文本+参考音频→wav |
@@ -133,13 +130,6 @@ P核2-3: VITS 合成第 N 段波形         (user-initiated QoS)
 | SME 未文档化无 ABI 承诺 | 只在 L3 实验分支，运行时 AMXVER/SME 探测失败自动回退 |
 | v2Pro vs v2ProPlus 权重差异 | 引擎家族化设计，维度全部来自 ckpt 内嵌 config |
 
-## 9. 已定决策记录
+## 9. 决策记录
 
-1. 语言: C++20（Metal 移除后 Swift 失去主要优势）
-2. 版本: v2Pro 家族，参考实现 s2Gv2ProPlus.pth
-3. 文本前端: 全原生重写，运行时零 Python
-4. 交付: CLI
-5. 量化节奏: v1 = fp16存储 + 全fp32计算（见 §3 修订）；KV fp16 开关与 AR int8 同属阶段二（已批准）
-6. 性能指标: 无 RTF 要求，以 CPU 吃满率为准
-7. GPU/Metal/ANE: 永久排除
-8. 精度语义: 与 torch "完全一致" = G1/G2/G3 三道门达标（bitwise 不可达，已论证）
+已迁至 `AGENTS.md`「已定决策」清单（唯一维护点），此处不再重复。

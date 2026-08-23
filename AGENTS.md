@@ -18,7 +18,7 @@
 1. **纯 CPU**：禁止引入 Metal / GPU / ANE / CoreML 依赖
 2. **运行时零 Python**：Python 仅允许存在于 `tools/` 离线工具
 3. **版本锁 v2Pro 家族**：维度从 `.gsv` config 读取，禁止硬编码模型形状
-4. **数值纪律**：计算与累加一律 fp32（FMLAL 扩展精度乘积视同 fp32）；权重可存 fp16；KV cache 第一版 fp32；禁用 bf16
+4. **数值纪律（两步走）**：第一步全 fp32 实现并与 torch 对齐；第二步切 fp16（FMLAL 扩展精度视同 fp32、KV fp16 开关）。禁用 bf16。当前阶段以任务卡标注为准
 5. **Golden 纪律**：内核/引擎改动必须过 `tests/golden` 对照（门槛见 `tests/golden/gates.json` 与 CALIBRATION.md）
 6. **Bench 纪律**：性能主张附实测数据；常量禁止心算
 7. 第三方库默认不引入；确需引入先报决策者，更新 ARCHITECTURE.md 后才可用
@@ -62,7 +62,8 @@ BLOCKED 必须附最小复现信息。禁止只说"做完了"。
 
 ### Git 纪律
 
-- 每个执行者在独立分支/worktree 工作：`task/<task_id>`；公共基线在 `main`
+- 每个执行者在独立分支/worktree 工作：`task/<id>`；公共基线在 `main`
+- 执行者仅允许**本地 commit** 到自己的分支；**禁止提交测试脚本（tests/）与文档（*.md）**——这两类由决策者在验收合并时统一提交；**禁止 push**（本项目无远程）
 - 合并权在决策者；合并前抽查 DoD 第 1–3 条
 - 大文件永不入库（.gitignore 已配置，勿改动）
 
@@ -101,7 +102,7 @@ Phase E 量化（M6）: KV fp16 开关评估 → AR int8 权重 + KV int8
 
 1. 语言 C++20；交付 CLI
 2. GPU/Metal/ANE 永久排除；运行时零 Python
-3. v1.0 = fp16 权重存储 + 全 fp32 计算累加（2025-08 修订）；"与 torch 一致" = G1/G2/G3 达标
+3. 精度路线两步走：先全 fp32 对齐 torch，再切 fp16（ARCHITECTURE.md §3）；"一致" = G1/G2/G3 达标（bitwise 不可达已论证）
 4. KV fp16 开关与 AR int8 同属阶段二；VITS 量化需逐层 A/B 听感
 5. 性能北极星 = CPU 吃满率，RTF 仅记录
 6. 文本前端全原生重写，golden 以 CPUFast 输出为准

@@ -25,8 +25,8 @@
 
 | ID | 任务 | 依赖 | 所有者 | 状态 | 分支 | 备注 |
 |---|---|---|---|---|---|---|
-| B1 | M1: prefill(Accelerate) | A4 | 未分配 | TODO | — | |
-| B2 | M1: decode GEMV 循环 + KV cache(fp32) + top-k 贪心 | A3,A4 | 未分配 | TODO | — | 对 pairs G1/G2 |
+| B1 | M1-fp32步: prefill(Accelerate) | A4 | 未分配 | TODO | — | |
+| B2 | M1-fp32步: decode GEMV 循环 + KV cache(fp32) + top-k 贪心（fp16 化为后续独立任务） | A3,A4 | 未分配 | TODO | — | 对 pairs G1/G2 |
 | B3 | M2: enc_p + quantizer | A4 | 未分配 | TODO | — | |
 | B4 | M2: flow + dec(im2col→GEMM) + WAV 写出 | A4 | 未分配 | TODO | — | G3 只用稳定锚点对 |
 | B5 | M3: jieba DAG/HMM 移植 + 词典 trie | — | 未分配 | TODO | — | 不依赖骨架，可最早开工 |
