@@ -679,8 +679,11 @@ struct JiebaSegmenter::Impl {
     // tag-less finalseg.cut instead of __cut_detail, and non-Han blocks
     // yield raw pieces without m/eng/x tagging.
 
-    // finalseg viterbi: states B,E,M,S (ids 0..3); missing transition AND
-    // emission both fall back to MIN_FLOAT; PrevStatus fixed table.
+        // finalseg viterbi — mirrors jieba_fast's C extension
+    // (_jieba_fast_functions_wrap_py3.i::_viterbi), NOT the pure-python
+    // reference: strict '>' keeps the first PrevStatus candidate, a fallback
+    // picks the ASCII-larger prev when BOTH candidates stay <= MIN_FLOAT,
+    // and the final E/S comparison is also strict (tie -> E).
     void viterbiFinalseg(const char32_t* obs, uint32_t T,
                          uint8_t* routeOut) const {
         static constexpr uint8_t kPrev[4][3] = {
@@ -689,37 +692,45 @@ struct JiebaSegmenter::Impl {
             {2, 0, 0xFF},  // M <- M,B
             {3, 1, 0xFF},  // S <- S,E
         };
-        double V[2][4];
+        double V[512][4];
         uint8_t mem[512][4];
-        if (T > 512) throw std::runtime_error("finalseg: block too long");
+        if (T > 512 || T == 0) throw std::runtime_error("finalseg: bad block");
         for (uint32_t y = 0; y < 4; ++y) {
-            V[0][y] = fstart[y] + femitProb(y, obs[0]);
+            double em = kMinFloat;
+            double p = femitProb(y, obs[0]);
+            if (p != kMinFloat) em = p;
+            V[0][y] = em + fstart[y];
             mem[0][y] = 0xFF;
         }
         for (uint32_t t = 1; t < T; ++t) {
-            const auto& prevRow = V[(t - 1) & 1];
-            auto& curRow = V[t & 1];
+            const auto& prevRow = V[t - 1];
+            auto& curRow = V[t];
             for (uint8_t y = 0; y < 4; ++y) {
-                double em = femitProb(y, obs[t]);
-                double best = kMinInf;
+                double em = kMinFloat;
+                double p = femitProb(y, obs[t]);
+                if (p != kMinFloat) em = p;
+                double maxProb = kMinFloat;
                 uint8_t bestY0 = 0xFF;
-                bool first = true;
-                for (int k = 0; k < 3 && kPrev[y][k] != 0xFF; ++k) {
+                for (int k = 0; k < 2; ++k) {
                     uint8_t y0 = kPrev[y][k];
-                    double cand = (prevRow[y0] + ftransProb(y0, y)) + em;
-                    if (first || cand > best ||
-                        (cand == best && y0 > bestY0)) {
-                        best = cand;
+                    double prob = em + prevRow[y0] + ftransProb(y0, y);
+                    if (prob > maxProb) {
+                        maxProb = prob;
                         bestY0 = y0;
-                        first = false;
                     }
                 }
-                curRow[y] = best;
+                if (bestY0 == 0xFF) {
+                    // both candidates stayed <= MIN_FLOAT: ASCII-larger prev
+                    // (B:"ES"->S, M:"MB"->M, E:"BM"->M, S:"SE"->S)
+                    bestY0 = kPrev[y][0];
+                    if (kPrev[y][1] > bestY0) bestY0 = kPrev[y][1];
+                }
+                curRow[y] = maxProb;
                 mem[t][y] = bestY0;
             }
         }
-        // end: max over 'E'(1), 'S'(3); tuple tie -> larger id (= larger char)
-        uint8_t last = (V[(T - 1) & 1][3] >= V[(T - 1) & 1][1]) ? 3 : 1;
+        // end: strict comparison, tie -> E
+        uint8_t last = (V[(T - 1)][3] > V[(T - 1)][1]) ? 3 : 1;
         int64_t i = static_cast<int64_t>(T) - 1;
         uint8_t st = last;
         while (i >= 0) {

@@ -189,15 +189,31 @@ bool mergeContinuousThreeTones(std::vector<SegToken>* seg,
     std::vector<SegToken> out;
     for (size_t i = 0; i < n; ++i) {
         bool cond = false;
-        if (i >= 1 && !mergeLast[i - 1]) {
+        if (i >= 1) {
+            // NOTE evaluation order: python computes the tone conditions
+            // BEFORE testing not merge_last[i-1], so an empty finals element
+            // raises even when the previous word was already merged.
             bool raised = false;
             bool c;
             if (mode2) {
-                // fl[i-1][-1][-1]=='3' and fl[i][0][-1]=='3'
-                c = !fl[i - 1].empty() && !fl[i].empty() &&
-                    lastCharIs(fl[i - 1].back(), '3') &&
-                    lastCharIs(fl[i].front(), '3');
-                if ((fl[i - 1].empty() || fl[i].empty())) raised = true;
+                // python short-circuits left to right:
+                //   A.back().back()=='3' and B.front().back()=='3'
+                // so B's empty element only raises when A already matched.
+                const std::vector<std::string>& A = fl[i - 1];
+                const std::vector<std::string>& B = fl[i];
+                if (A.empty() || A.back().empty()) {
+                    raised = true;  // [] [-1] or '' [-1]
+                    c = false;
+                } else if (lastCharIs(A.back(), '3')) {
+                    if (B.empty() || B.front().empty()) {
+                        raised = true;
+                        c = false;
+                    } else {
+                        c = lastCharIs(B.front(), '3');
+                    }
+                } else {
+                    c = false;
+                }
             } else {
                 c = allToneThree(fl[i - 1], &raised) &&
                     allToneThree(fl[i], &raised);
@@ -206,7 +222,7 @@ bool mergeContinuousThreeTones(std::vector<SegToken>* seg,
                 fprintf(stderr, "_merge_continuous_three_tones failed\n");
                 return false;
             }
-            cond = c;
+            cond = c && !mergeLast[i - 1];
         }
         if (cond) {
             if (!isReduplication((*seg)[i - 1].word) &&
@@ -371,7 +387,12 @@ void ToneSandhi::modifiedTone(const std::u32string& word, std::string_view pos,
             if (j >= 1 && word[j] == word[j - 1] && !pos.empty() &&
                 (pos[0] == 'n' || pos[0] == 'v' || pos[0] == 'a') &&
                 !inMustNotNeural(word)) {
-                if (!popLastAppend(&(*finals)[j], '5')) { *ok = false; return; }
+                // python finals[j] with j possibly beyond the list -> IndexError
+                if (j >= finals->size() ||
+                    !popLastAppend(&(*finals)[j], '5')) {
+                    *ok = false;
+                    return;
+                }
             }
         }
         if (!*ok) return;
@@ -456,13 +477,20 @@ void ToneSandhi::modifiedTone(const std::u32string& word, std::string_view pos,
     }
 
     // ---- _three_sandhi ----
+    // python only calls _all_tone_inside specific branches; len<=1 words
+    // never touch it (so empty finals elements are safe there).
     {
-        bool raised = false;
-        const bool all3 = allToneThree(*finals, &raised);
-        if (raised) { *ok = false; return; }
-        if (n == 2 && all3) {
-            if (!popLastAppend(&(*finals)[0], '2')) { *ok = false; return; }
+        if (n == 2) {
+            bool raised = false;
+            const bool all3 = allToneThree(*finals, &raised);
+            if (raised) { *ok = false; return; }
+            if (all3 && !finals->empty()) {
+                if (!popLastAppend(&(*finals)[0], '2')) { *ok = false; return; }
+            }
         } else if (n == 3) {
+            bool raised = false;
+            const bool all3 = allToneThree(*finals, &raised);
+            if (raised) { *ok = false; return; }
             std::u32string first, second;
             if (!splitWord(jb_, word, &first, &second)) { *ok = false; return; }
             if (all3) {
@@ -489,13 +517,25 @@ void ToneSandhi::modifiedTone(const std::u32string& word, std::string_view pos,
                         if (r2) { *ok = false; return; }
                         if (s3 && sub.size() == 2) {
                             if (!popLastAppend(&sub[0], '2')) { *ok = false; return; }
-                        } else if (i == 1 && !s3 && !sub.empty() &&
-                                   !partA.empty() &&
-                                   lastCharIs(sub[0], '3') &&
-                                   lastCharIs(partA.back(), '3')) {
-                            if (!popLastAppend(&partA.back(), '2')) {
-                                *ok = false;
-                                return;
+                        } else if (i == 1 && !s3) {
+                            // python: sub[0][-1]=='3' and
+                            // finals_list[0][-1][-1]=='3' — an empty list
+                            // raises there (IndexError)
+                            bool r3 = false;
+                            const bool c1 =
+                                sub.empty() ? (r3 = true, false)
+                                            : lastCharIs(sub[0], '3');
+                            const bool c2 =
+                                !r3 ? (partA.empty()
+                                           ? (r3 = true, false)
+                                           : lastCharIs(partA.back(), '3'))
+                                    : false;
+                            if (r3) { *ok = false; return; }
+                            if (c1 && c2) {
+                                if (!popLastAppend(&partA.back(), '2')) {
+                                    *ok = false;
+                                    return;
+                                }
                             }
                         }
                     }
