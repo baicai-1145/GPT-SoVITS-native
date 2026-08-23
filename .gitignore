@@ -1,0 +1,9 @@
+# ---- 大文件/生成物不入库 ----
+pretrained_models/
+weights/
+test_wav/
+tests/golden/
+build/
+__pycache__/
+*.pyc
+.DS_Store
