@@ -279,6 +279,136 @@ def run_process(inp, outp):
                 f.write(f"E\t{idx}\t{type(e).__name__}\n")
 
 
+def run_process_en(inp, outp):
+    """Mixed zh/en frontend golden mirroring the CPUFast TTS runtime path:
+    preprocess(cut) -> per segment LangSegmenter.getTexts(text,"zh") ->
+    zh segments via chinese2 (is_g2pw=False), en segments via english.g2p.
+    P rows: idx, ids, w2ph, segs. En-segment word2ph entries are per-token
+    pronunciation lengths (phone_units granularity) so that
+    sum(word2ph)==len(phones) holds globally."""
+    sys.path.insert(0, "/Volumes/2T/GPT-SoVITS-CPUFast/GPT_SoVITS")
+    _stub_g2pw()
+    import logging
+    logging.disable(logging.CRITICAL)
+    from text import chinese2, cleaned_text_to_sequence
+    chinese2.is_g2pw = False
+    from text import english as eng
+    from text.LangSegmenter import LangSegmenter
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "tsm3", "/Volumes/2T/GPT-SoVITS-CPUFast/GPT_SoVITS/"
+        "TTS_infer_pack/text_segmentation_method.py")
+    tsm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tsm)
+    splits = tsm.splits
+    get_seg_method = tsm.get_method
+    split_big_text = tsm.split_big_text
+    import re
+    punct_chinese = ["!", "?", "\u2026", ",", ".", "-"]
+    coll_pat = re.compile(
+        f"([{''.join(re.escape(p) for p in punct_chinese)}])"
+        f"([{''.join(re.escape(p) for p in punct_chinese)}])+")
+
+    def get_first(text):
+        pat = "[" + "".join(re.escape(x) for x in splits) + "]"
+        return re.split(pat, text)[0].strip()
+
+    def filter_text(texts):
+        return [t for t in texts if t not in [None, " ", ""]]
+
+    def merge_short_text_in_array(texts, threshold):
+        if len(texts) < 2:
+            return texts
+        result, acc = [], ""
+        for ele in texts:
+            acc += ele
+            if len(acc) >= threshold:
+                result.append(acc)
+                acc = ""
+        if acc:
+            if result:
+                result[-1] += acc
+            else:
+                result.append(acc)
+        return result
+
+    def pre_seg_text(text, method):
+        text = text.strip("\n")
+        if len(text) == 0:
+            return []
+        if text[0] not in splits and len(get_first(text)) < 4:
+            text = "\u3002" + text
+        seg = get_seg_method(method)
+        text = seg(text)
+        while "\n\n" in text:
+            text = text.replace("\n\n", "\n")
+        texts = filter_text(text.split("\n"))
+        texts = merge_short_text_in_array(texts, 5)
+        out = []
+        for item in texts:
+            if len(item.strip()) == 0:
+                continue
+            if not re.sub(r"\W+", "", item):
+                continue
+            if item[-1] not in splits:
+                item += "\u3002"
+            if len(item) > 510:
+                out.extend(split_big_text(item))
+            else:
+                out.append(item)
+        return out
+
+    with open(outp, "w", encoding="utf-8") as f:
+        for idx, line in enumerate(read_lines(inp)):
+            method, _, text = line.partition("|")
+            try:
+                collapsed = coll_pat.sub(r"\1", text)
+                segs = pre_seg_text(collapsed, method.strip())
+                all_ids, all_w2ph = [], []
+                for seg in segs:
+                    for lseg in LangSegmenter.getTexts(seg, "zh"):
+                        lang, stext = lseg["lang"], lseg["text"]
+                        if lang == "en":
+                            ph = eng.g2p(eng.text_normalize(stext))
+                            # en tokens: word2ph at token granularity — count
+                            # phones contributed per simple_word_tokenize
+                            # token (gap tokens like spaces contribute none;
+                            # punctuation tokens contribute exactly 1)
+                            import re as _re
+                            toks = eng.simple_word_tokenize(
+                                eng.text_normalize(stext))
+                            counts = []
+                            for tk in toks:
+                                n = len(tk) and 1 or 1
+                                counts.append(max(n, 1))
+                            all_ids.extend(
+                                cleaned_text_to_sequence(ph, version="v2"))
+                            # exact per-token lengths recomputed below
+                            counts = []
+                            cursor = 0
+                            from text.english import normalize_pronunciation
+                            for tk in toks:
+                                pron = eng._g2p.pronounce_token(
+                                    tk, "")
+                                np_ = normalize_pronunciation(pron)
+                                counts.append(len(np_))
+                                cursor += len(np_)
+                            all_w2ph.extend(counts)
+                        else:
+                            phones, w2ph = chinese2.g2p(
+                                chinese2.text_normalize(stext))
+                            all_ids.extend(
+                                cleaned_text_to_sequence(phones,
+                                                         version="v2"))
+                            all_w2ph.extend(w2ph)
+                f.write("P\t%d\t%s\t%s\t%s\n" % (
+                    idx, esc(",".join(map(str, all_ids))),
+                    ",".join(map(str, all_w2ph)),
+                    _esc_join(segs)))
+            except Exception as e:
+                f.write(f"E\t{idx}\t{type(e).__name__}\n")
+
+
 if __name__ == "__main__":
     mode, inp, outp = sys.argv[1], sys.argv[2], sys.argv[3]
     if mode == "norm":
@@ -289,5 +419,7 @@ if __name__ == "__main__":
         run_split(inp, outp)
     elif mode == "process":
         run_process(inp, outp)
+    elif mode == "process_en":
+        run_process_en(inp, outp)
     else:
         raise SystemExit(f"unknown mode {mode}")

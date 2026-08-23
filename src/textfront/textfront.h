@@ -37,9 +37,11 @@ public:
         std::string error;
     };
 
-    // data paths: jieba trie bin + pinyin bin
+    // data paths: jieba trie bin + pinyin bin; cmudictPath is optional and
+    // enables the English segment path (mixed zh/en inputs). When absent,
+    // Latin segments fail with an error instead of silently misreading.
     bool load(const std::string& triePath, const std::string& pinyinPath,
-              std::string* err);
+              std::string* err, const std::string& cmudictPath = {});
 
     // Injection seam for B6's G2PW converter. nullptr restores the default
     // pypinyin behaviour. The object must outlive this TextFrontend.
@@ -70,6 +72,8 @@ public:
 
 private:
     ChineseG2p g2p_;
+    void* en_ = nullptr;  // std::unique_ptr<EnglishG2p>, type-erased to keep
+                          // english.h out of this header
 };
 
 }  // namespace gsv::textfront
