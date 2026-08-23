@@ -30,6 +30,8 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
 # ---- 运行时库 ----
 add_library(gsv_rt STATIC
   src/runtime/gsv_header.cpp
+  src/runtime/gsv_loader.cpp
+  src/runtime/mini_json.cpp
 )
 
 # ---- CLI 工具 ----
