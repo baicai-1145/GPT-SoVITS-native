@@ -36,13 +36,13 @@ public:
     // _merge_yi / _merge_continuous_three_tones{,_2}; this returns the same
     // surviving sequence (failures printed to stderr like the python prints).
     void preMergeForModify(std::vector<SegToken>* seg,
-                           const PypinyinResolver& resolver) const;
+                           const PinyinResolver& resolver) const;
 
     // tone_modifier.modified_tone(word, pos, finals). Mutates `finals`
     // in place. `ok=false` mirrors "python would raise" (empty finals
     // element indexed); on ok=false contents are unspecified.
     void modifiedTone(const std::u32string& word, std::string_view pos,
-                      const PypinyinResolver& resolver,
+                      const PinyinResolver& resolver,
                       std::vector<std::string>* finals, bool* ok) const;
 
 private:
