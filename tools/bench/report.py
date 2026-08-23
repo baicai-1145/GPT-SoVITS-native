@@ -75,17 +75,25 @@ def main() -> int:
     for suite, srows in suites.items():
         ap(f"## {suite}")
         ap("")
-        ap("| kernel | params | thr | ms | cv% | GFLOPS | GB/s | %NEON-peak(1P) | notes |")
-        ap("|---|---|---|---|---|---|---|---|---|")
+        ap("GFLOPS/GB/s are computed from **ms_min** (best batch): timing "
+           "noise is one-sided, so the minimum is the stable cross-run "
+           "statistic; median shown for reference.")
+        ap("")
+        ap("| kernel | params | thr | ms(min) | ms(med) | cv% | GFLOPS | "
+           "GB/s | %NEON-peak(1P) | notes |")
+        ap("|---|---|---|---|---|---|---|---|---|---|")
         for r in srows:
             gf = float(r["gflops"]) if r["gflops"] else 0.0
             pct = 100.0 * gf / (p_ghz * 32.0) if gf else ""
             notes = []
             if float(r["cv_pct"]) > UNSTABLE_CV:
                 notes.append(f"**UNSTABLE cv={r['cv_pct']}%**")
+            ms_min = r.get("ms_min", "")
             ap(f"| {r['kernel']} | {r['params']} | {r['threads']} | "
+               f"{f(ms_min, 4) if ms_min else ''} | "
                f"{f(r['ms_median'], 4)} | {f(r['cv_pct'], 1)} | "
-               f"{f(gf, 2)} | {f(r['gbps'], 2)} | {f(pct, 1) if pct != '' else ''} | "
+               f"{f(gf, 2)} | {f(r['gbps'], 2)} | "
+               f"{f(pct, 1) if pct != '' else ''} | "
                f"{'; '.join(notes)} |")
         ap("")
 
