@@ -200,6 +200,16 @@ struct JiebaSegmenter::Impl {
     std::vector<uint32_t> cs_cnt;
     std::vector<uint16_t> cs_list;
 
+    // finalseg (plain Tokenizer.cut / cut_for_search), states "BEMS"
+    bool hasFinalseg = false;
+    double fstart[4] = {0, 0, 0, 0};
+    uint32_t ftransOff[5] = {0, 0, 0, 0, 0};
+    std::vector<uint16_t> ftransDst;
+    std::vector<double> ftransP;
+    uint32_t femitOff[5] = {0, 0, 0, 0, 0};
+    std::vector<uint32_t> femitCp;
+    std::vector<double> femitP;
+
     // ---- dictionary lookups -------------------------------------------
 
     int cmpKey(const char32_t* q, uint32_t qlen, const Entry& e) const {
@@ -283,6 +293,26 @@ struct JiebaSegmenter::Impl {
             if (trans_dst[i] == y) return trans_p[i];
         }
         return kMinInf;  // trans_p[y0].get(y, MIN_INF)
+    }
+
+    // ---- finalseg lookups (missing -> MIN_FLOAT everywhere) -------------
+
+    double ftransProb(uint32_t y0, uint32_t y) const {
+        for (uint32_t i = ftransOff[y0]; i < ftransOff[y0 + 1]; ++i) {
+            if (ftransDst[i] == y) return ftransP[i];
+        }
+        return kMinFloat;
+    }
+
+    double femitProb(uint32_t y, uint32_t cp) const {
+        uint32_t b = femitOff[y], e = femitOff[y + 1];
+        while (b < e) {
+            uint32_t mid = b + (e - b) / 2;
+            if (femitCp[mid] < cp) b = mid + 1;
+            else if (femitCp[mid] > cp) e = mid;
+            else return femitP[mid];
+        }
+        return kMinFloat;
     }
 
     // ---- segmentation core ------------------------------------------------
@@ -642,6 +672,231 @@ struct JiebaSegmenter::Impl {
             --i;
         }
     }
+
+    // ---- plain Tokenizer.cut (HMM=True) + finalseg ------------------------
+    // Used by ToneSandhi._split_word via cutForSearch. Differs from the
+    // posseg path: re_han_default includes '%', buf fallback goes through
+    // tag-less finalseg.cut instead of __cut_detail, and non-Han blocks
+    // yield raw pieces without m/eng/x tagging.
+
+        // finalseg viterbi — mirrors jieba_fast's C extension
+    // (_jieba_fast_functions_wrap_py3.i::_viterbi), NOT the pure-python
+    // reference: strict '>' keeps the first PrevStatus candidate, a fallback
+    // picks the ASCII-larger prev when BOTH candidates stay <= MIN_FLOAT,
+    // and the final E/S comparison is also strict (tie -> E).
+    void viterbiFinalseg(const char32_t* obs, uint32_t T,
+                         uint8_t* routeOut) const {
+        static constexpr uint8_t kPrev[4][3] = {
+            {1, 3, 0xFF},  // B <- E,S
+            {0, 2, 0xFF},  // E <- B,M
+            {2, 0, 0xFF},  // M <- M,B
+            {3, 1, 0xFF},  // S <- S,E
+        };
+        double V[512][4];
+        uint8_t mem[512][4];
+        if (T > 512 || T == 0) throw std::runtime_error("finalseg: bad block");
+        for (uint32_t y = 0; y < 4; ++y) {
+            double em = kMinFloat;
+            double p = femitProb(y, obs[0]);
+            if (p != kMinFloat) em = p;
+            V[0][y] = em + fstart[y];
+            mem[0][y] = 0xFF;
+        }
+        for (uint32_t t = 1; t < T; ++t) {
+            const auto& prevRow = V[t - 1];
+            auto& curRow = V[t];
+            for (uint8_t y = 0; y < 4; ++y) {
+                double em = kMinFloat;
+                double p = femitProb(y, obs[t]);
+                if (p != kMinFloat) em = p;
+                double maxProb = kMinFloat;
+                uint8_t bestY0 = 0xFF;
+                for (int k = 0; k < 2; ++k) {
+                    uint8_t y0 = kPrev[y][k];
+                    double prob = em + prevRow[y0] + ftransProb(y0, y);
+                    if (prob > maxProb) {
+                        maxProb = prob;
+                        bestY0 = y0;
+                    }
+                }
+                if (bestY0 == 0xFF) {
+                    // both candidates stayed <= MIN_FLOAT: ASCII-larger prev
+                    // (B:"ES"->S, M:"MB"->M, E:"BM"->M, S:"SE"->S)
+                    bestY0 = kPrev[y][0];
+                    if (kPrev[y][1] > bestY0) bestY0 = kPrev[y][1];
+                }
+                curRow[y] = maxProb;
+                mem[t][y] = bestY0;
+            }
+        }
+        // end: strict comparison, tie -> E
+        uint8_t last = (V[(T - 1)][3] > V[(T - 1)][1]) ? 3 : 1;
+        int64_t i = static_cast<int64_t>(T) - 1;
+        uint8_t st = last;
+        while (i >= 0) {
+            routeOut[i] = st;
+            st = mem[i][st];
+            --i;
+        }
+    }
+
+    // finalseg.__cut: BMES grouping into words (Force_Split_Words is empty:
+    // only add_word(freq=0) populates it, and no user dict exists here)
+    void finalsegHanCut(const char32_t* sen, uint32_t begin, uint32_t end,
+                        std::vector<PosToken>* out) const {
+        std::vector<uint8_t> route(end - begin);
+        viterbiFinalseg(sen + begin, end - begin, route.data());
+        uint32_t beginPos = 0, nexti = 0;
+        const char* bmes = "BEMS";
+        for (uint32_t i = 0; i < route.size(); ++i) {
+            char st = bmes[route[i]];
+            PosToken tok;
+            tok.flag = "x";
+            if (st == 'B') {
+                beginPos = i;
+                continue;
+            } else if (st == 'E') {
+                encodeUtf8(sen + begin + beginPos, i - beginPos + 1, &tok.word);
+                out->push_back(std::move(tok));
+                nexti = i + 1;
+            } else if (st == 'S') {
+                encodeUtf8(sen + begin + i, 1, &tok.word);
+                out->push_back(std::move(tok));
+                nexti = i + 1;
+            }
+        }
+        if (nexti < route.size()) {
+            PosToken tok;
+            tok.flag = "x";
+            encodeUtf8(sen + begin + nexti, route.size() - nexti, &tok.word);
+            out->push_back(std::move(tok));
+        }
+    }
+
+    // finalseg.cut: Han runs -> BMES viterbi; other runs split by
+    // ([a-zA-Z0-9]+(?:\.\d+)?%?) and ALL pieces yielded verbatim.
+    void finalsegCut(const char32_t* sen, uint32_t begin, uint32_t end,
+                     std::vector<PosToken>* out) const {
+        uint32_t i = begin;
+        while (i < end) {
+            if (isHanDetail(sen[i])) {
+                uint32_t j = i;
+                while (j < end && isHanDetail(sen[j])) ++j;
+                finalsegHanCut(sen, i, j, out);
+                i = j;
+            } else {
+                uint32_t j = i;
+                while (j < end && !isHanDetail(sen[j])) ++j;
+                uint32_t k = i;
+                while (k < j) {
+                    if (isAsciiAlnum(sen[k])) {
+                        uint32_t m = k;
+                        while (m < j && isAsciiAlnum(sen[m])) ++m;
+                        if (m < j && sen[m] == U'.' && m + 1 < j &&
+                            isAsciiDigit(sen[m + 1])) {
+                            ++m;  // consume '.'
+                            while (m < j && isAsciiDigit(sen[m])) ++m;
+                        }
+                        if (m < j && sen[m] == U'%') ++m;
+                        emitSpan(sen, k, m, out);
+                        k = m;
+                    } else {
+                        uint32_t m = k;
+                        while (m < j && !isAsciiAlnum(sen[m])) ++m;
+                        emitSpan(sen, k, m, out);
+                        k = m;
+                    }
+                }
+                i = j;
+            }
+        }
+    }
+
+    // Tokenizer.__cut_DAG (no tags): buf flush uses finalseg.cut for OOV
+    void cutDagTokenizer(const char32_t* sen, uint32_t begin, uint32_t end,
+                         std::vector<PosToken>* out) const {
+        const uint32_t n = end - begin;
+        const char32_t* blk = sen + begin;
+        std::vector<std::vector<uint32_t>> dag;
+        buildDag(blk, n, &dag);
+        std::vector<RouteCell> route;
+        computeRoute(blk, n, dag, &route);
+
+        uint32_t x = 0;
+        bool bufActive = false;
+        uint32_t bufBegin = 0, bufEnd = 0;
+        auto flush = [&]() {
+            if (bufEnd - bufBegin == 1) {
+                emitSpan(blk, bufBegin, bufEnd, out);
+            } else if (!freqPositive(blk + bufBegin, bufEnd - bufBegin)) {
+                finalsegCut(blk, bufBegin, bufEnd, out);
+            } else {
+                for (uint32_t k = bufBegin; k < bufEnd; ++k)
+                    emitSpan(blk, k, k + 1, out);
+            }
+        };
+        while (x < n) {
+            uint32_t y = route[x].end + 1;
+            if (y - x == 1) {
+                if (!bufActive) { bufBegin = x; bufActive = true; }
+                bufEnd = y;
+            } else {
+                if (bufActive) { flush(); bufActive = false; }
+                emitSpan(blk, x, y, out);
+            }
+            x = y;
+        }
+        if (bufActive) flush();
+    }
+
+    // Tokenizer.cut(HMM=True): re_han_default INCLUDES '%'
+    static bool isHanDefault(uint32_t c) {
+        return isHanInternal(c) || c == '%';
+    }
+
+    void cutTokenizer(const char32_t* sen, uint32_t n,
+                      std::vector<PosToken>* out) const {
+        uint32_t i = 0;
+        while (i < n) {
+            if (isHanDefault(sen[i])) {
+                uint32_t j = i;
+                while (j < n && isHanDefault(sen[j])) ++j;
+                cutDagTokenizer(sen, i, j, out);
+                i = j;
+            } else {
+                uint32_t j = i;
+                while (j < n && !isHanDefault(sen[j])) ++j;
+                // re_skip_default = (\r\n|\s): whitespace tokens raw, other
+                // characters individually
+                uint32_t k = i;
+                while (k < j) {
+                    if (sen[k] == U'\r' && k + 1 < j && sen[k + 1] == U'\n') {
+                        emitLiteral("\r\n", "x", out);
+                        k += 2;
+                    } else if (isPySpace(sen[k])) {
+                        std::string w;
+                        encodeUtf8(sen + k, 1, &w);
+                        emitLiteral(w, "x", out);
+                        k += 1;
+                    } else {
+                        uint32_t m = k;
+                        while (m < j) {
+                            if (sen[m] == U'\r' && m + 1 < j && sen[m + 1] == U'\n') break;
+                            if (isPySpace(sen[m])) break;
+                            ++m;
+                        }
+                        for (uint32_t c2 = k; c2 < m; ++c2) {
+                            std::string w;
+                            encodeUtf8(sen + c2, 1, &w);
+                            emitLiteral(w, "x", out);
+                        }
+                        k = m;
+                    }
+                }
+                i = j;
+            }
+        }
+    }
 };
 
 JiebaSegmenter::~JiebaSegmenter() {
@@ -827,6 +1082,40 @@ bool JiebaSegmenter::loadMemory(const void* data, size_t size, std::string* err)
         for (uint32_t i = 0; i < listLen; ++i) impl->cs_list[i] = r.u16();
     }
 
+    // finalseg sections are optional (older binaries); cutForSearch needs them
+    if (section("fstart", &p, &nb)) {
+        ByteReader r(p, nb);
+        for (int i = 0; i < 4; ++i) impl->fstart[i] = r.f64();
+        if (!section("ftrans", &p, &nb)) return fail("ftrans missing");
+        {
+            ByteReader rt(p, nb);
+            for (int s = 0; s < 4; ++s) {
+                impl->ftransOff[s] = static_cast<uint32_t>(impl->ftransDst.size());
+                uint32_t nnz = rt.u32();
+                for (uint32_t i = 0; i < nnz; ++i) {
+                    impl->ftransDst.push_back(rt.u16());
+                    rt.u8(); rt.u8();  // pad
+                    impl->ftransP.push_back(rt.f64());
+                }
+            }
+            impl->ftransOff[4] = static_cast<uint32_t>(impl->ftransDst.size());
+        }
+        if (!section("femit", &p, &nb)) return fail("femit missing");
+        {
+            ByteReader re_(p, nb);
+            for (int s = 0; s < 4; ++s) {
+                impl->femitOff[s] = static_cast<uint32_t>(impl->femitCp.size());
+                uint32_t n = re_.u32();
+                for (uint32_t i = 0; i < n; ++i) {
+                    impl->femitCp.push_back(re_.u32());
+                    impl->femitP.push_back(re_.f64());
+                }
+            }
+            impl->femitOff[4] = static_cast<uint32_t>(impl->femitCp.size());
+        }
+        impl->hasFinalseg = true;
+    }
+
     impl_ = impl.release();
     if (err) err->clear();
     return true;
@@ -855,6 +1144,46 @@ void JiebaSegmenter::lcut(std::string_view utf8_sentence,
             impl_->cutSkipBlock(s, i, j, out);
             i = j;
         }
+    }
+}
+
+void JiebaSegmenter::cutForSearch(std::string_view utf8_sentence,
+                                  std::vector<std::string>* out) const {
+    if (!impl_) throw std::runtime_error("JiebaSegmenter::cutForSearch before load()");
+    if (!impl_->hasFinalseg)
+        throw std::runtime_error(
+            "jieba_trie.bin lacks finalseg tables; regenerate with "
+            "tools/export_jieba_trie.py");
+    std::u32string sen;
+    decodeUtf8(utf8_sentence, &sen);
+    std::vector<PosToken> words;  // plain Tokenizer.cut words (tags unused)
+    impl_->cutTokenizer(sen.data(), static_cast<uint32_t>(sen.size()), &words);
+
+    for (const PosToken& w : words) {
+        std::u32string cps;
+        decodeUtf8(w.word, &cps);
+        const char32_t* p = cps.data();
+        const uint32_t n = static_cast<uint32_t>(cps.size());
+        // gram2 hits for len>2, gram3 hits for len>3, then the word itself
+        if (n > 2) {
+            for (uint32_t i = 0; i + 1 < n; ++i) {
+                if (impl_->freqPositive(p + i, 2)) {
+                    std::string g;
+                    encodeUtf8(p + i, 2, &g);
+                    out->push_back(std::move(g));
+                }
+            }
+        }
+        if (n > 3) {
+            for (uint32_t i = 0; i + 2 < n; ++i) {
+                if (impl_->freqPositive(p + i, 3)) {
+                    std::string g;
+                    encodeUtf8(p + i, 3, &g);
+                    out->push_back(std::move(g));
+                }
+            }
+        }
+        out->push_back(w.word);
     }
 }
 

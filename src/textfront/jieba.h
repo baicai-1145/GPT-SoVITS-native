@@ -60,6 +60,13 @@ public:
     // Appends results to *out. Requires a successful load().
     void lcut(std::string_view utf8_sentence, std::vector<PosToken>* out) const;
 
+    // Mirrors jieba_fast.Tokenizer.cut_for_search(sentence) (HMM=True), i.e.
+    // plain word segmentation plus gram2/gram3 dictionary hits. Required by
+    // ToneSandhi._split_word. Uses the finalseg tables bundled in the binary
+    // (throws std::runtime_error if the loaded file predates them).
+    void cutForSearch(std::string_view utf8_sentence,
+                      std::vector<std::string>* out) const;
+
 private:
     struct Impl;
     Impl* impl_ = nullptr;
