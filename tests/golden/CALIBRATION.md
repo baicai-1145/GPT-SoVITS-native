@@ -49,3 +49,11 @@
    G2 稳定对 27/27、短对记录 36/36 agree=1.0/lratio=1.0；总 18966 步与 golden 全程一致。
    → 证明「fp16存储+fp32计算」同构假设成立，G1 provisional 门槛可复核收紧。
 4. 2 个 pair 缺输入字段（vo_BZLQ001_4_hutao_02__s1、vo_BZLQ001_6_hutao_02__s0）不参与对照。
+
+## G3 口径修订（B34 验收时决议, 决策者记录）
+
+- **原口径作废**：历史端到端 wav 不可跨进程复现——v2Pro dec 每次推理重采样 noise，
+  同 AR codes 下两次进程 wav mel_rel 可达 0.83（exec-sov probe 实验证实）。
+- **新 G3 主门**：native dec 输出 vs fixture 内 h_dec hook（CPUFast 同进程捕获、noise 张量
+  作为输入一并存入 fixture），≥5 锚点对 mel_rel ≤ 5%。
+- 历史端到端 wav 降为仅记录。B34 实测：6 锚点 mel_rel = 0.000000 ~ 0.000024（余量 >2000×）。

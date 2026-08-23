@@ -76,7 +76,7 @@ for pd in pairs:
         continue
     fails = []
     if not args.wav_only:
-        for tn, cn, tr in HOOK_PAIRS + DEC_HOOKS:
+        for tn, cn, tr in [(a,b,c) for a,b,c in HOOK_PAIRS] + [(a,b,None) for a,b in DEC_HOOKS]:  # fix: DEC_HOOKS 是二元组
             try:
                 t, c = load(pd / "hooks" / tn), load(dd / cn)
             except FileNotFoundError as e:
