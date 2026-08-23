@@ -44,7 +44,7 @@
 | C2 | CLI 全链路串接 | 全 B+C1 | exec-ar(授权公共地带) | DONE | task/C2 | 1468步位级复现; CLI冒烟亲测3.42s wav; RTF=3.75记录; M4 达成 |
 | D1 | bench harness(powermetrics/吃满率采样) | C2 | exec-txt | IN_PROGRESS | task/B5 | part1 DONE(bench三脚本+reporter); 正式定标留安静窗口; 发现AMX冷启动~10x需warmup |
 | D2 | 流水线重叠(AR‖SoVITS 双缓冲)+线程调优 | D1 | exec-txt(prep)/待分配 | IN_PROGRESS | task/B5 | prep DONE(SegQueue骨架); 待C2落地后接真实三阶段 |
-| E1 | KV fp16 开关评估 | C2 | 未分配 | TODO | |
+| E1 | KV fp16 开关评估 | C2 | exec-sov | DONE | task/B34 | 裁决B: --fp16默认=kv-only(与fp32逐位一致,G1 65/65); FMLAL gemv为实验开关(62/65,激活舍入雪崩归M6); 抽测1.77×待安静窗口定标 |
 | E2 | AR int8 权重+int8 KV | E1 | 未分配 | TODO | A/B 听感 |
 
 ## 阻塞/风险登记
