@@ -54,6 +54,7 @@ int main(int argc, char** argv) {
   const char* only = nullptr;
   const char* dump_layers = nullptr;  // 可选: 导出 xy 与逐层 prefill 输出(调试对拍)
   int max_steps = static_cast<int>(gsv::ar::T2SEngine::kMaxDecodeSteps);
+  gsv::ar::T2SEngine::Fp16Options fp16;  // M1-fp16: 默认全关(fp32 步不动)
   for (int i = 1; i < argc; ++i) {
     auto next = [&]() { return argv[++i]; };
     if (!std::strcmp(argv[i], "--weights")) weights = next();
@@ -62,11 +63,14 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--only")) only = next();
     else if (!std::strcmp(argv[i], "--dump-layers")) dump_layers = next();
     else if (!std::strcmp(argv[i], "--max-steps")) max_steps = std::atoi(next());
+    else if (!std::strcmp(argv[i], "--fp16")) { fp16.kv = true; fp16.gemv = true; }
+    else if (!std::strcmp(argv[i], "--fp16-kv")) fp16.kv = true;
+    else if (!std::strcmp(argv[i], "--fp16-gemv")) fp16.gemv = true;
   }
   if (!weights || !pairs_dir || !out_dir) {
     std::fprintf(stderr,
                  "用法: %s --weights w.gsv --pairs-dir DIR --out DIR [--only stem] "
-                 "[--max-steps N]\n",
+                 "[--max-steps N] [--fp16 | --fp16-kv | --fp16-gemv]\n",
                  argv[0]);
     return 2;
   }
@@ -75,6 +79,7 @@ int main(int argc, char** argv) {
   try {
     const gsv::rt::GsvFile wf(weights);
     gsv::ar::T2SEngine eng(wf);
+    eng.set_fp16(fp16);
     const size_t bert_dim = eng.dims().bert_dim;
 
     DIR* d = ::opendir(pairs_dir);
