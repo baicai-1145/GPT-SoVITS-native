@@ -14,12 +14,12 @@
 
 | ID | 任务 | 产出 | 所有者 | 状态 | 分支 | 备注 |
 |---|---|---|---|---|---|---|
-| A1 | CMake 骨架 + 目录结构 + 编译选项(`-mcpu=apple-m4 -O3`) | 可构建空工程 + tests 框架 | exec-a | CLAIMED | task/A | 含 .gsv 头部解析单测 |
-| A2 | `.gsv` 读取器（mmap、目录解析、64B 对齐校验） | `src/runtime/gsv_loader` + 单测 | exec-a | CLAIMED | task/A | 对照 tools/convert.py docstring 规范 |
-| A3 | NEON 内核层 v1: GEMV(fp16存储+fp32累加)/rmsnorm/rope/silu/softmax | `src/kern/*` + 数值单测 | exec-a | CLAIMED | task/A | 单测直接对 golden 层快照 |
-| A4 | Accelerate 封装: sgemm/hgemm 薄包装 + 线程池(QoS 分簇) | `src/kern/accel*` | exec-a | CLAIMED | task/A | |
+| A1 | CMake 骨架 + 目录结构 + 编译选项(`-mcpu=apple-m4 -O3`) | 可构建空工程 + tests 框架 | exec-a | DONE | task/A | 含 .gsv 头部解析单测 |
+| A2 | `.gsv` 读取器（mmap、目录解析、64B 对齐校验） | `src/runtime/gsv_loader` + 单测 | exec-a | DONE | task/A | 对照 tools/convert.py docstring 规范 |
+| A3 | NEON 内核层 v1: GEMV(fp16存储+fp32累加)/rmsnorm/rope/silu/softmax | `src/kern/*` + 数值单测 | exec-a | DONE | task/A | 层0出口: cos=1.0/maxrel=1.2e-6 ✅ 单测直接对 golden 层快照 |
+| A4 | Accelerate 封装: sgemm/hgemm 薄包装 + 线程池(QoS 分簇) | `src/kern/accel*` | exec-a | DONE | task/A | 本机无cblas_hgemm→f16升位回退已定论 |
 
-**出口条件**: A1–A4 全 DONE；用 A2+A3 手工跑通一个 AR 层并对上 layers_first 快照。
+**出口条件**: A1–A4 全 DONE；用 A2+A3 手工跑通一个 AR 层并对上 layers_first 快照。✅ 已达成并合入 main(e4b5b57)。Phase B 开工。
 
 ## Phase B — 三路并行
 
