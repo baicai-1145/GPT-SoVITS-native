@@ -13,3 +13,6 @@ src/textfront/data/*.bin
 
 # 可再生 dump(tests/regen 由脚本重建)
 tests/regen/
+
+# BERT fixtures(由 tools/export_bert_fixtures.py 再生)
+tests/golden_local/
