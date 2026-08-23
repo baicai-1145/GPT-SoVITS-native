@@ -37,6 +37,7 @@ add_library(gsv_rt STATIC
 add_library(gsv_kern STATIC
   src/kern/kern.cpp
   src/kern/gemv.cpp
+  src/kern/gemv_fmlal.cpp
   src/kern/accel.cpp
 )
 target_link_libraries(gsv_kern PUBLIC "-framework Accelerate")
