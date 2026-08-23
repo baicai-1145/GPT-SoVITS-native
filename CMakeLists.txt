@@ -59,9 +59,34 @@ add_library(gsv_encoder STATIC
 )
 target_link_libraries(gsv_encoder PUBLIC gsv_rt gsv_kern)
 
+# ---- SoVITS (B34: header-only 引擎 + 类型/工具) ----
+add_library(gsv_sovits INTERFACE)
+target_include_directories(gsv_sovits INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# ---- 文本前端 (B9/M3: jieba+g2p+归一化) ----
+add_library(gsv_textfront STATIC
+  src/textfront/jieba.cpp
+  src/textfront/pinyin.cpp
+  src/textfront/tone_sandhi.cpp
+  src/textfront/zh_norm.cpp
+  src/textfront/zh_rules.cpp
+  src/textfront/zh_verbalize.cpp
+  src/textfront/chinese_g2p.cpp
+  src/textfront/textfront.cpp
+)
+
 # ---- CLI 工具 ----
 add_executable(gsv_tool src/runtime/gsv_tool.cpp)
 target_link_libraries(gsv_tool PRIVATE gsv_rt)
+
+# ---- 全链路 CLI (task/C2) ----
+add_executable(gsv_native
+  src/main.cpp
+  src/runtime/pipeline.cpp
+  src/runtime/pipeline_condition.cpp
+)
+target_link_libraries(gsv_native PRIVATE gsv_rt gsv_kern gsv_ar gsv_encoder
+gsv_textfront gsv_sovits)
 
 # ---- 测试 ----
 enable_testing()
