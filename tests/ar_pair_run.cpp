@@ -63,14 +63,15 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--only")) only = next();
     else if (!std::strcmp(argv[i], "--dump-layers")) dump_layers = next();
     else if (!std::strcmp(argv[i], "--max-steps")) max_steps = std::atoi(next());
-    else if (!std::strcmp(argv[i], "--fp16")) { fp16.kv = true; fp16.gemv = true; }
+    else if (!std::strcmp(argv[i], "--fp16")) fp16.kv = true;  // 裁决 B: 默认仅 KV16(与 fp32 逐位一致)
     else if (!std::strcmp(argv[i], "--fp16-kv")) fp16.kv = true;
-    else if (!std::strcmp(argv[i], "--fp16-gemv")) fp16.gemv = true;
+    else if (!std::strcmp(argv[i], "--fp16-gemv")) fp16.gemv = true;  // 实验开关(激活舍入雪崩归 M6)
+    else if (!std::strcmp(argv[i], "--fp16-all")) { fp16.kv = true; fp16.gemv = true; }
   }
   if (!weights || !pairs_dir || !out_dir) {
     std::fprintf(stderr,
                  "用法: %s --weights w.gsv --pairs-dir DIR --out DIR [--only stem] "
-                 "[--max-steps N] [--fp16 | --fp16-kv | --fp16-gemv]\n",
+                 "[--max-steps N] [--fp16 | --fp16-kv | --fp16-gemv | --fp16-all]\n",
                  argv[0]);
     return 2;
   }

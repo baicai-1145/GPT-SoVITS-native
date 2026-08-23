@@ -25,7 +25,7 @@
 #include <vector>
 
 #include "runtime/pipeline.hpp"
-#include "runtime/pipeline_wav.hpp"
+#include "sovits/wav_writer.hpp"
 
 namespace {
 
@@ -155,7 +155,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   try {
-    gsv::rt::pipeline::write_wav_int16(out, res.audio.data(),
+    gsv::sovits::write_wav_int16(out, res.audio.data(),
                                        res.audio.size(), res.sr);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "错误: 写出失败: %s\n", e.what());
