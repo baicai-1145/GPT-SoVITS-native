@@ -62,6 +62,15 @@ def strip_prefix(k: str) -> str:
     return k
 
 
+# weight_norm 归一维覆盖表: 键名片段 → 求范数的维度(其余维度保留)。
+# torch 默认 dim=0(对 [out,in,k] 即按输出通道在 [in,k] 上求范数);
+# 例外: cnhubert.py 的 pos_conv 用 dim=2(对每个 (out,in) 核元素单独归一),
+# 若按默认融合会得到错误权重(实测 per-channel 范数偏差可达 6×)。
+WN_DIM_OVERRIDES = {
+    "pos_conv_embed.conv.": (0, 1),
+}
+
+
 def fuse_weight_norm(sd: dict) -> tuple[dict, int]:
     """融合 weight_g/weight_v → weight。返回新字典、融合对数与融合产物键名集合。
 
@@ -75,7 +84,13 @@ def fuse_weight_norm(sd: dict) -> tuple[dict, int]:
         base = gk[: -len("weight_g")]
         vk, wk = base + "weight_v", base + "weight"
         g, v = sd[gk].float(), sd[vk].float()
-        dims = list(range(1, v.dim()))
+        dims = None
+        for frag, d in WN_DIM_OVERRIDES.items():
+            if frag in base:
+                dims = list(d)
+                break
+        if dims is None:
+            dims = list(range(1, v.dim()))
         norm = v.pow(2).sum(dim=dims, keepdim=True).sqrt().clamp_min(1e-12)
         out[wk] = g * v / norm
         del out[gk], out[vk]
