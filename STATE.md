@@ -49,3 +49,5 @@
 
 | 时间 | 内容 | 影响 | 处置 |
 |---|---|---|---|
+| 15:17-15:27 | tests/golden 内容被清（refs/pairs/fixtures 全丢，根因未定位；weights 无损） | G3/锚点基线一度失效 | 已重导出恢复（65 pairs+56 refs）；CALIBRATION.md 从 git 恢复。**新政策：全员禁止 git clean/清理 ignored 目录；tests/golden 为决策者领地** |
+| 同日 | exec-sov 实验证实：v2Pro dec 每进程重采样 noise → 历史端到端 wav 跨进程不可复现（同 codes 下 mel_rel=0.83） | G3 锚点口径变更 | 决策者批准：G3 改为对照 fixture 内 h_dec hook（固定 noise 输入），历史 wav 降为仅记录；落实见 CALIBRATION 后续补录 |
