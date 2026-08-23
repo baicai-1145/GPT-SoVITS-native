@@ -71,6 +71,10 @@ add_library(gsv_textfront STATIC
   src/textfront/zh_norm.cpp
   src/textfront/zh_rules.cpp
   src/textfront/zh_verbalize.cpp
+  src/textfront/english.cpp
+  src/textfront/en_norm.cpp
+  src/textfront/chinese_g2p.cpp
+  src/textfront/textfront.cpp
   src/textfront/chinese_g2p.cpp
   src/textfront/textfront.cpp
 )
