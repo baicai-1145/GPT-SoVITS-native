@@ -4,6 +4,9 @@
 #include "textfront.h"
 
 #include "english.h"
+#include "g2pw.hpp"
+#include "g2pw_resolver.hpp"
+#include "polyphone_fix.h"
 #include "symbols2.hpp"
 
 namespace gsv::textfront {
@@ -504,7 +507,8 @@ std::vector<LangPiece> langSplitAllZh(const U32& t) {
 
 bool TextFrontend::load(const std::string& triePath,
                         const std::string& pinyinPath, std::string* err,
-                        const std::string& cmudictPath) {
+                        const std::string& cmudictPath,
+                        const G2pwOptions* g2pw) {
     if (!g2p_.load(triePath, pinyinPath, err)) return false;
     delete static_cast<EnglishG2p*>(en_);
     en_ = nullptr;
@@ -518,7 +522,53 @@ bool TextFrontend::load(const std::string& triePath,
         }
         en_ = e;
     }
+    // B6: install the sentence-level polyphone path when requested.
+    delete static_cast<G2PWResolver*>(g2pwResolver_);
+    g2pwResolver_ = nullptr;
+    delete static_cast<G2PWConverter*>(g2pwConv_);
+    g2pwConv_ = nullptr;
+    if (g2pw) {
+        auto* conv = new G2PWConverter;
+        std::string why;
+        if (!conv->load(g2pw->gsvPath, g2pw->assetsBin, g2pw->vocabPath,
+                        &why)) {
+            if (err)
+                *err = "g2pw: " + why +
+                       " (need readable " + g2pw->gsvPath + ", " +
+                       g2pw->assetsBin + ", " + g2pw->vocabPath +
+                       "; assets come from tools/export_g2pw_assets.py and "
+                       "the .gsv stays local — see STATE/README)";
+            delete conv;
+            return false;
+        }
+        const PolyphoneFixTable* fix = nullptr;
+        if (!g2pw->overridesBin.empty()) {
+            auto* pf = new PolyphoneFixTable;
+            if (!pf->load(g2pw->overridesBin, &why)) {
+                if (err) *err = "polyphone_overrides: " + why;
+                delete pf;
+                delete conv;
+                return false;
+            }
+            polyFix_ = pf;
+            fix = pf;
+        }
+        auto* resolver = new G2PWResolver(conv, &g2p_.builtinResolver());
+        g2pwConv_ = conv;
+        g2pwResolver_ = resolver;
+        g2p_.setResolver(resolver);
+        g2p_.setPolyphoneFix(fix);
+    } else {
+        g2p_.setResolver(nullptr);  // back to built-in pypinyin
+    }
     return true;
+}
+
+TextFrontend::~TextFrontend() {
+    delete static_cast<PolyphoneFixTable*>(polyFix_);
+    delete static_cast<G2PWResolver*>(g2pwResolver_);
+    delete static_cast<G2PWConverter*>(g2pwConv_);
+    delete static_cast<EnglishG2p*>(en_);
 }
 
 bool TextFrontend::process(const std::string& utf8Text, Result* out,
