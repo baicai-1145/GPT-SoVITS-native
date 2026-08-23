@@ -32,13 +32,16 @@ add_library(gsv_rt STATIC
   src/runtime/gsv_header.cpp
   src/runtime/gsv_loader.cpp
   src/runtime/mini_json.cpp
+  src/runtime/threadpool.cpp
 )
-
-# ---- 内核库 ----
 add_library(gsv_kern STATIC
   src/kern/kern.cpp
   src/kern/gemv.cpp
+  src/kern/accel.cpp
 )
+target_link_libraries(gsv_kern PUBLIC "-framework Accelerate")
+# macOS 13.3+ 旧 cblas 接口标记弃用; 启用新头(不带 ILP64, 保持 32 位整型约定)
+target_compile_definitions(gsv_kern PUBLIC ACCELERATE_NEW_LAPACK)
 
 # ---- CLI 工具 ----
 add_executable(gsv_tool src/runtime/gsv_tool.cpp)
