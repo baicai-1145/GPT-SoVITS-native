@@ -29,7 +29,7 @@
 | B2 | M1-fp32步: decode GEMV 循环 + KV cache(fp32) + top-k 贪心（fp16 化为后续独立任务） | A3,A4 | 未分配 | TODO | — | 对 pairs G1/G2 |
 | B3 | M2: enc_p + quantizer | A4 | 未分配 | TODO | — | |
 | B4 | M2: flow + dec(im2col→GEMM) + WAV 写出 | A4 | 未分配 | TODO | — | G3 只用稳定锚点对 |
-| B5 | M3: jieba DAG/HMM 移植 + 词典 trie | — | exec-txt | CLAIMED | task/B5 | 不依赖骨架，可最早开工；golden=CPUFast jieba_fast 分词输出 |
+| B5 | M3: jieba DAG/HMM 移植 + 词典 trie | — | exec-txt | DONE | task/B5 | 已合入 main；验收=204覆盖句+7504模糊句 diff 全空；trie.bin 由 tools/export_jieba_trie.py 再生不入库 |
 | B6 | M3: WordPiece tokenizer + G2PW 推理(复用 kern BERT) | A3 | 未分配 | TODO | — | |
 | B7 | M3: pypinyin 表 + 数字/符号规则 + symbols2 映射 | B5,B6 | 未分配 | TODO | — | diff 驱动 |
 | B8 | Transformer 编码栈原生(roberta-large 24L×1024d + G2PW BERT-base 12L×768d 共用 kernel) | A4 | 未分配 | TODO | — | 对 pairs bert_out/bert_feat_1024 过 G1；供 B6 与韵律特征使用 |
