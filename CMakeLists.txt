@@ -46,13 +46,18 @@ add_library(gsv_ar STATIC
   src/ar/t2s_engine.cpp
 )
 target_link_libraries(gsv_ar PUBLIC gsv_rt gsv_kern)
-
-# ---- SoVITS 引擎 (task/B34, header-only) ----
-add_library(gsv_sovits INTERFACE)
-target_include_directories(gsv_sovits INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(gsv_sovits INTERFACE gsv_rt gsv_kern)
 # macOS 13.3+ 旧 cblas 接口标记弃用; 启用新头(不带 ILP64, 保持 32 位整型约定)
 target_compile_definitions(gsv_kern PUBLIC ACCELERATE_NEW_LAPACK)
+
+# ---- 编码器 (task/C1: HuBERT + SV + fbank + wav + ref cache) ----
+add_library(gsv_encoder STATIC
+  src/runtime/wav.cpp
+  src/encoder/fbank.cpp
+  src/encoder/hubert.cpp
+  src/encoder/sv.cpp
+  src/encoder/ref_cache.cpp
+)
+target_link_libraries(gsv_encoder PUBLIC gsv_rt gsv_kern)
 
 # ---- CLI 工具 ----
 add_executable(gsv_tool src/runtime/gsv_tool.cpp)

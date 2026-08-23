@@ -31,3 +31,17 @@ add_test(NAME test_ar_unit COMMAND test_ar_unit)
 
 add_executable(ar_pair_run ar_pair_run.cpp)
 target_link_libraries(ar_pair_run PRIVATE gsv_ar)
+
+# ---- task/C1: 编码器单测与 fixtures 验收 harness(本地验证用) ----
+add_executable(test_c1_unit test_c1_unit.cpp)
+target_compile_definitions(test_c1_unit PRIVATE
+  GSV_WEIGHTS_DIR="${GSV_WEIGHTS_DIR}"
+  C1_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/local/c1_fixtures")
+target_link_libraries(test_c1_unit PRIVATE gsv_encoder)
+add_test(NAME test_c1_unit COMMAND test_c1_unit)
+
+add_executable(c1_run c1_run.cpp)
+target_compile_definitions(c1_run PRIVATE
+  GSV_WEIGHTS_DIR="${GSV_WEIGHTS_DIR}"
+  C1_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/local/c1_fixtures")
+target_link_libraries(c1_run PRIVATE gsv_encoder)
