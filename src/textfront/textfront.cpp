@@ -3,6 +3,9 @@
 // and TextPreprocessor.pre_seg_text + replace_consecutive_punctuation.
 #include "textfront.h"
 
+#include "english.h"
+#include "symbols2.hpp"
+
 namespace gsv::textfront {
 namespace {
 
@@ -396,9 +399,126 @@ std::vector<U32> TextFrontend::splitSentences(const U32& text,
     return out;
 }
 
+// ------------------------------------------------------------------
+// Language segmentation for all_zh inputs — mirrors the effective behaviour
+// of LangSegmenter.getTexts(text, "zh") over the split_lang splitter:
+//   - full_en(text) short-circuits to a single en segment
+//   - cores: [A-Za-z]+ -> en;  [0-9]+ -> digit (routed to zh); CJK runs and
+//     every other non-neutral char -> zh
+//   - neutral chars (punctuation/space/symbols) attach to the LEFT core;
+//     a leading neutral attaches rightward
+//   - adjacent same-language segments merge (digit merges into zh)
+// Verified against python on the mixed-sentence corpus (see B10 report).
+struct LangPiece {
+    bool isEn;
+    U32 text;
+};
+
+namespace {
+
+bool cpIsAsciiAlpha(uint32_t c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+bool cpIsDigit(uint32_t c) { return c >= '0' && c <= '9'; }
+
+enum class CpClass { En, Digit, Zh, Neutral };
+
+CpClass classifyCp(uint32_t c) {
+    if (cpIsAsciiAlpha(c)) return CpClass::En;
+    if (cpIsDigit(c)) return CpClass::Digit;
+    // CJK ideographs + kana + hangul act as language cores; everything else
+    // (punctuation, spaces, symbols) is neutral.
+    if ((c >= 0x3040 && c <= 0x30FF) || (c >= 0xAC00 && c <= 0xD7AF) ||
+        (c >= 0x3400 && c <= 0x4DBF) || (c >= 0x4E00 && c <= 0x9FFF) ||
+        (c >= 0xF900 && c <= 0xFAFF) || (c >= 0x20000 && c <= 0x323AF))
+        return CpClass::Zh;
+    return CpClass::Neutral;
+}
+
+bool fullEnText(const U32& t) {
+    bool hasAlpha = false;
+    for (uint32_t c : t) {
+        bool ok = cpIsAsciiAlpha(c) || cpIsDigit(c) || c == ' ' ||
+                  (c >= 0x20 && c <= 0x7E) || (c >= 0x2000 && c <= 0x206F) ||
+                  (c >= 0x3000 && c <= 0x303F) || (c >= 0xFF00 && c <= 0xFFEF);
+        if (!ok) return false;
+        if (cpIsAsciiAlpha(c)) hasAlpha = true;
+    }
+    return hasAlpha;
+}
+
+std::vector<LangPiece> langSplitAllZh(const U32& t) {
+    std::vector<LangPiece> pieces;
+    if (fullEnText(t)) return {LangPiece{true, t}};
+
+    struct Core {
+        CpClass cls;
+        U32 text;
+    };
+    std::vector<Core> cores;
+    U32 pendingNeutral;  // neutrals waiting while no core is open
+    size_t i = 0;
+    while (i < t.size()) {
+        CpClass cls = classifyCp(t[i]);
+        if (cls == CpClass::Neutral) {
+            if (cores.empty())
+                pendingNeutral += t[i];  // leading neutral: attaches forward
+            else
+                cores.back().text += t[i];
+            ++i;
+            continue;
+        }
+        U32 run;
+        while (i < t.size() && classifyCp(t[i]) == cls) {
+            run += t[i];
+            ++i;
+        }
+        if (!pendingNeutral.empty()) {
+            // leading neutrals attach forward to the first core
+            run.insert(0, pendingNeutral);
+            pendingNeutral.clear();
+        }
+        cores.push_back(Core{cls, std::move(run)});
+    }
+    if (cores.empty() && !pendingNeutral.empty())
+        cores.push_back(Core{CpClass::Zh, pendingNeutral});
+
+    // merge adjacent same-language cores (digit counts as zh)
+    auto sameLang = [](const Core& a, const Core& b) {
+        auto norm = [](CpClass c) { return c == CpClass::Digit ? CpClass::Zh : c; };
+        return norm(a.cls) == norm(b.cls);
+    };
+    std::vector<Core> merged;
+    for (auto& c : cores) {
+        if (!merged.empty() && sameLang(merged.back(), c))
+            merged.back().text += c.text;
+        else
+            merged.push_back(std::move(c));
+    }
+    for (auto& c : merged)
+        pieces.push_back(LangPiece{c.cls == CpClass::En, c.text});
+    return pieces;
+}
+
+}  // namespace
+
 bool TextFrontend::load(const std::string& triePath,
-                        const std::string& pinyinPath, std::string* err) {
-    return g2p_.load(triePath, pinyinPath, err);
+                        const std::string& pinyinPath, std::string* err,
+                        const std::string& cmudictPath) {
+    if (!g2p_.load(triePath, pinyinPath, err)) return false;
+    delete static_cast<EnglishG2p*>(en_);
+    en_ = nullptr;
+    if (!cmudictPath.empty()) {
+        auto* e = new EnglishG2p;
+        std::string e2;
+        if (!e->load(cmudictPath, &e2)) {
+            if (err) *err = "cmudict: " + e2;
+            delete e;
+            return false;
+        }
+        en_ = e;
+    }
+    return true;
 }
 
 bool TextFrontend::process(const std::string& utf8Text, Result* out,
@@ -414,14 +534,38 @@ bool TextFrontend::process(const std::string& utf8Text, Result* out,
 
     auto segments = splitSentences(collapsed, cutMethod);
     for (auto& seg : segments) {
-        G2pResult r;
-        if (!g2p_.run(enc(seg), &r)) {
-            out->error = "segment '" + enc(seg) + "': " + r.error;
-            return false;
+        // TTS runtime: per segment, LangSegmenter.getTexts(seg,"zh") splits
+        // zh/en/digit pieces; zh goes through chinese2, en through english.
+        for (const auto& piece : langSplitAllZh(seg)) {
+            if (piece.isEn) {
+                if (!en_) {
+                    out->error =
+                        "english segment but no cmudict loaded: '" +
+                        enc(piece.text) + "'";
+                    return false;
+                }
+                std::vector<int> lens;
+                auto phones = static_cast<EnglishG2p*>(en_)->g2p(
+                    enc(piece.text), &lens);
+                for (const auto& ph : phones) {
+                    int id = symbols2Id(ph);
+                    if (id < 0) id = symbols2Id("UNK");
+                    out->phones.push_back(id);
+                }
+                // phone_units granularity: one word2ph entry per token with
+                // its pronunciation length (sum stays len(phones))
+                for (int n : lens) out->word2ph.push_back(n > 0 ? n : 1);
+                continue;
+            }
+            G2pResult r;
+            if (!g2p_.run(enc(piece.text), &r)) {
+                out->error = "segment '" + enc(piece.text) + "': " + r.error;
+                return false;
+            }
+            for (int id : r.phones) out->phones.push_back(id);
+            for (int w : r.word2ph) out->word2ph.push_back(w);
         }
         out->sentences.push_back(enc(seg));
-        for (int id : r.phones) out->phones.push_back(id);
-        for (int w : r.word2ph) out->word2ph.push_back(w);
     }
     out->ok = true;
     return true;
