@@ -40,6 +40,12 @@ add_library(gsv_kern STATIC
   src/kern/accel.cpp
 )
 target_link_libraries(gsv_kern PUBLIC "-framework Accelerate")
+
+# ---- AR/T2S 引擎 (task/B12) ----
+add_library(gsv_ar STATIC
+  src/ar/t2s_engine.cpp
+)
+target_link_libraries(gsv_ar PUBLIC gsv_rt gsv_kern)
 # macOS 13.3+ 旧 cblas 接口标记弃用; 启用新头(不带 ILP64, 保持 32 位整型约定)
 target_compile_definitions(gsv_kern PUBLIC ACCELERATE_NEW_LAPACK)
 

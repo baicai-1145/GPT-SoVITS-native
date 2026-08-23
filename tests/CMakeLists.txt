@@ -18,3 +18,16 @@ gsv_add_test(test_accel)
 # 层验证 harness(由 tools/layer0_check.py 驱动, 不注册 ctest)
 add_executable(layer0_check layer0_check.cpp)
 target_link_libraries(layer0_check PRIVATE gsv_rt gsv_kern)
+
+# ---- task/B12: AR 引擎单测与 pairs 验收 harness(本地验证用) ----
+add_executable(test_ar_unit test_ar_unit.cpp)
+target_include_directories(test_ar_unit PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(test_ar_unit PRIVATE
+  GSV_WEIGHTS_DIR="${GSV_WEIGHTS_DIR}"
+  GSV_KERN_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/kern_golden"
+  GSV_AR_RAW_DIR="${CMAKE_CURRENT_SOURCE_DIR}/local/golden_raw")
+target_link_libraries(test_ar_unit PRIVATE gsv_ar)
+add_test(NAME test_ar_unit COMMAND test_ar_unit)
+
+add_executable(ar_pair_run ar_pair_run.cpp)
+target_link_libraries(ar_pair_run PRIVATE gsv_ar)

@@ -25,8 +25,8 @@
 
 | ID | 任务 | 依赖 | 所有者 | 状态 | 分支 | 备注 |
 |---|---|---|---|---|---|---|
-| B1 | M1-fp32步: prefill(Accelerate) | A4 | 未分配 | TODO | — | |
-| B2 | M1-fp32步: decode GEMV 循环 + KV cache(fp32) + top-k 贪心（fp16 化为后续独立任务） | A3,A4 | 未分配 | TODO | — | 对 pairs G1/G2 |
+| B1 | M1-fp32步: prefill(Accelerate) | A4 | exec-ar | DONE | task/B12 | G1 63/63 | |
+| B2 | M1-fp32步: decode GEMV 循环 + KV cache(fp32) + top-k 贪心（fp16 化为后续独立任务） | A3,A4 | exec-ar | DONE | task/B12 | 18966步全程一致; 采样口径=惩罚后(见CALIBRATION) |
 | B3 | M2: enc_p + quantizer | A4 | 未分配 | TODO | — | |
 | B4 | M2: flow + dec(im2col→GEMM) + WAV 写出 | A4 | 未分配 | TODO | — | G3 只用稳定锚点对 |
 | B5 | M3: jieba DAG/HMM 移植 + 词典 trie | — | exec-txt | DONE | task/B5 | 已合入 main；验收=204覆盖句+7504模糊句 diff 全空；trie.bin 由 tools/export_jieba_trie.py 再生不入库 |
