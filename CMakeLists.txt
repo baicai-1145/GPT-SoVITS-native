@@ -33,6 +33,7 @@ add_library(gsv_rt STATIC
   src/runtime/gsv_loader.cpp
   src/runtime/mini_json.cpp
   src/runtime/threadpool.cpp
+  src/runtime/segqueue.cpp
 )
 add_library(gsv_kern STATIC
   src/kern/kern.cpp
