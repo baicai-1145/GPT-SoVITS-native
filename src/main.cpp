@@ -55,6 +55,8 @@ void printHelp(const char* argv0) {
       "  --threads N       线程数 (0=自动)           [默认 0]\n"
       "  --prompt-text S   参考文本 (空串禁用)   [默认 原来你也玩原神。]\n"
       "  --no-cache        禁用参考特征缓存\n"
+      "  --overlap         流水重叠模式: AR(N+1) ‖ SoVITS(N) (数值同串行)\n"
+      "  --timing-csv F    per-segment 三阶段耗时 CSV 输出路径\n"
       "  -h/--help         本帮助\n",
       argv0);
 }
@@ -65,6 +67,7 @@ int main(int argc, char** argv) {
   std::string text, refWav, weights = "weights", data = "src/runtime/data",
                               out = "out.wav";
   gsv::rt::pipeline::PipelineOptions opt;
+  int opt_threads = 0;
   bool haveText = false, haveRef = false;
 
   for (int i = 1; i < argc; ++i) {
@@ -100,9 +103,14 @@ int main(int argc, char** argv) {
     } else if (a == "--seed") {
       opt.seed = std::strtoull(next("--seed").c_str(), nullptr, 10);
     } else if (a == "--threads") {
-      opt.threads = std::atoi(next("--threads").c_str());
+      opt_threads = std::atoi(next("--threads").c_str());
+      opt.threads = opt_threads;
     } else if (a == "--prompt-text") {
       opt.prompt_text = next("--prompt-text");
+    } else if (a == "--overlap") {
+      opt.overlap = true;
+    } else if (a == "--timing-csv") {
+      opt.timing_csv = next("--timing-csv");
     } else if (a == "--no-cache") {
       opt.use_ref_cache = false;
     } else {
@@ -128,6 +136,15 @@ int main(int argc, char** argv) {
     return 2;
   }
 
+  // §4 线程旋钮: --threads N 经 VECLIB_MAXIMUM_THREADS 限制 Accelerate 内部
+  // GEMM 线程宽度 (prefill/VITS/BERT); AR decode 为单线程 NEON GEMV 本就保守。
+  // 必须在首次 Accelerate 调用(权重加载)前设置。0/缺省 = 不限制(全 P 核)。
+  if (opt_threads > 0) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%d", opt_threads);
+    ::setenv("VECLIB_MAXIMUM_THREADS", buf, /*overwrite=*/1);
+  }
+
   const double tStart = nowMs();
   gsv::rt::pipeline::Pipeline pipe;
   std::string err;
@@ -143,12 +160,9 @@ int main(int argc, char** argv) {
     return 1;
   }
   const double tDone = nowMs();
-  // 首包延迟(近似口径) = 首段 AR+Vocoder 耗时; 参考条件构建未单独计时,
-  // 仅记录不作为性能主张 (M5 bench harness 再细化)。
-  const double firstPacketMs =
-      res.segments.empty()
-          ? 0.0
-          : res.segments.front().ar_ms + res.segments.front().voc_ms;
+  // 首包延迟 = 合成开始→首段音频就绪 (pipeline 精确测量, 两模式同语义);
+  // 不含模型加载时间, 仅记录不作为性能主张。
+  const double firstPacketMs = res.first_packet_ms;
 
   if (res.audio.empty()) {
     std::fprintf(stderr, "错误: 未产出任何音频\n");

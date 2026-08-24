@@ -96,7 +96,8 @@ def main():
         if ns != ch:
             norm_pairs.append((ch, ns))
     import json as _json
-    pd_path = "/Users/baicai1145/miniconda3/envs/GPTSoVits/lib/python3.10/site-packages/pypinyin/phrases_dict.json"
+    import pypinyin
+    pd_path = Path(pypinyin.__file__).parent / "phrases_dict.json"
     with open(pd_path, encoding="utf-8") as _f:
         _pd = _json.load(_f)
 

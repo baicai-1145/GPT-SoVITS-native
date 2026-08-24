@@ -1,6 +1,9 @@
 // pipeline.cpp — C2: 全链路编排实现 (口径见 pipeline.hpp)
 #include "runtime/pipeline.hpp"
 
+#include "runtime/segqueue.hpp"
+
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -121,7 +124,7 @@ bool Pipeline::load(const std::string& weightsDir, const std::string& dataDir,
       }
     return false;
   };
-  std::string trieP, pinyinP;
+  std::string trieP, pinyinP, cmuP;
   if (!firstExisting({joinPath(dataDir, "jieba_trie.bin"),
                       joinPath(dataDir + "/../..", "textfront/data/jieba_trie.bin")},
                      &trieP)) {
@@ -134,8 +137,39 @@ bool Pipeline::load(const std::string& weightsDir, const std::string& dataDir,
     if (err) *err = "找不到 pinyin.bin (于 " + dataDir + ")";
     return false;
   }
+  // cmudict 可选: 存在则启用英文段路径(B10), 缺失时纯中文不受影响
+  firstExisting({joinPath(dataDir, "cmudict.bin"),
+                 joinPath(dataDir + "/../..", "textfront/data/cmudict.bin")},
+                &cmuP);
+
+  // B6: G2PW 可选加载 (存在 g2pw_bert.gsv + g2pw_assets.bin + bert_vocab.txt 时自动启用)
+  textfront::TextFrontend::G2pwOptions g2pwOpt;
+  std::string g2pwGsv, g2pwAssets, g2pwVocab, g2pwOverrides;
+  const bool haveG2pw =
+      firstExisting({joinPath(weightsDir, "g2pw_bert.gsv"),
+                     joinPath(weightsDir + "/..", "weights/g2pw_bert.gsv")},
+                    &g2pwGsv) &&
+      firstExisting({joinPath(dataDir, "g2pw_assets.bin"),
+                     joinPath(dataDir + "/../..", "textfront/data/g2pw_assets.bin")},
+                    &g2pwAssets) &&
+      firstExisting({joinPath(dataDir, "bert_vocab.txt"),
+                     joinPath(dataDir + "/../..", "textfront/data/bert_vocab.txt")},
+                    &g2pwVocab);
+  if (haveG2pw) {
+    g2pwOpt.gsvPath = g2pwGsv;
+    g2pwOpt.assetsBin = g2pwAssets;
+    g2pwOpt.vocabPath = g2pwVocab;
+    if (firstExisting({joinPath(dataDir, "polyphone_overrides.bin"),
+                       joinPath(dataDir + "/../..",
+                                "textfront/data/polyphone_overrides.bin")},
+                      &g2pwOverrides)) {
+      g2pwOpt.overridesBin = g2pwOverrides;
+    }
+  }
+
   try {
-    if (!tf_.load(trieP, pinyinP, err)) return false;
+    if (!tf_.load(trieP, pinyinP, err, cmuP, haveG2pw ? &g2pwOpt : nullptr))
+      return false;
     if (!tok_.load(joinPath(dataDir, "roberta_vocab.txt"), err)) return false;
 
     bert_.cfg = bert::BertConfig{};  // roberta-wwm-ext-large 默认即此
@@ -298,9 +332,10 @@ struct Feat {
   std::vector<float> bert;  // [phones.size()*1024]
 };
 
-Feat featurize(textfront::TextFrontend* tf, textfront::ChineseG2p* g2pNorm,
-               const BertTokenizer* tok, const bert::BertModel& bm,
-               const std::string& utf8, std::string* /*err*/) {
+Feat featurize(const textfront::TextFrontend* tf,
+               const textfront::ChineseG2p* g2pNorm, const BertTokenizer* tok,
+               const bert::BertModel& bm, const std::string& utf8,
+               std::string* /*err*/) {
   textfront::TextFrontend::Result one;
   if (!tf->process(utf8, &one, /*cutMethod=*/0))
     throw std::runtime_error(one.error);
@@ -310,7 +345,11 @@ Feat featurize(textfront::TextFrontend* tf, textfront::ChineseG2p* g2pNorm,
   if (f.phones.empty()) return f;
   if (f.word2ph.empty()) throw std::runtime_error("word2ph 为空: " + utf8);
 
-  f.normU8 = u32ToUtf8(g2pNorm->textNormalize(utf8ToU32(utf8)));
+  // BERT 输入文本必须与 word2ph 同基准: process(cut0) 会按 splitSentences
+  // 规则补前置 。(短句/非 SPLITS 开头), 该规则发生在 clean_text 之前 ⇒
+  // 归一文本要对"有效段"(one.sentences[0]) 取, 不能对原始 utf8。
+  if (one.sentences.empty()) return f;
+  f.normU8 = u32ToUtf8(g2pNorm->textNormalize(utf8ToU32(one.sentences[0])));
   std::vector<int64_t> ids, tt, amask;
   tok->encode(f.normU8, &ids, &tt, &amask);
   // roberta forward 至 layer21 输出 (hidden_states[-3]); 权重只读复用。
@@ -336,10 +375,16 @@ Feat featurize(textfront::TextFrontend* tf, textfront::ChineseG2p* g2pNorm,
   const size_t nPhones = f.phones.size();
   f.bert.assign(nPhones * 1024, 0.f);
   const size_t charN = cpCount(f.normU8);
-  if (charN != f.word2ph.size())
-    throw std::runtime_error("word2ph 与 norm_text 长度不一致 (" +
-                             std::to_string(f.word2ph.size()) + " vs " +
-                             std::to_string(charN) + "): " + f.normU8);
+  if (charN != f.word2ph.size()) {
+    // 混合中英段: B10 的 EN 片词 word2ph 是"每词 token"粒度(总和仍=phones),
+    // 与 get_bert_feature 的按字符索引不兼容 —— CPUFast 对非 zh 语言本就置零
+    // (get_bert_inf)。此处同样置零并告警; 契约细化待决策者/B6 裁定。
+    std::fprintf(stderr,
+                 "[pipeline] 警告: 混合/英文段 word2ph(%zu)!=字符数(%zu), "
+                 "该段 BERT 特征置零 (%s)\n",
+                 f.word2ph.size(), charN, f.normU8.c_str());
+    return f;
+  }
   if (Ln >= charN + 2) {
     size_t o = 0;
     for (size_t ch = 0; ch < charN; ++ch) {
@@ -388,14 +433,127 @@ bool Pipeline::buildPrompt(PromptCond* out, std::string* err) {
   }
 }
 
+// ---- D2: 三阶段实现 (串行/重叠两模式调用完全相同的函数) ----
+Pipeline::SegArIn Pipeline::stageFeaturize(const SegText& t) const {
+  Feat f = featurize(&tf_, &g2pNorm_, &tok_, bert_, t.sentence, nullptr);
+  SegArIn r;
+  r.phonesSeg = std::move(f.phones);
+  r.normText = std::move(f.normU8);
+  if (r.phonesSeg.empty()) return r;  // 纯标点段: 下游直通
+  // AR 输入 = prompt_phones ⊕ 段 phones (CPUFast all_phones 口径)
+  if (prompt_.ready && !prompt_.phones.empty()) {
+    r.phonesAll = prompt_.phones;
+    r.phonesAll.insert(r.phonesAll.end(), r.phonesSeg.begin(),
+                       r.phonesSeg.end());
+    r.bertAll = prompt_.bert;
+    r.bertAll.insert(r.bertAll.end(), f.bert.begin(), f.bert.end());
+  } else {
+    r.phonesAll = r.phonesSeg;
+    r.bertAll = std::move(f.bert);
+  }
+  return r;
+}
+
+Pipeline::SegSovIn Pipeline::stageAr(const SegArIn& in,
+                                     const std::vector<int64_t>& promptSem) {
+  SegSovIn o;
+  o.empty = in.phonesSeg.empty();
+  if (o.empty) return o;  // 纯标点段直通, 不触碰 RNG (与 C2 串行语义一致)
+
+  const double t0 = nowMs();
+  ar::GenResult gen =
+      ar_->generate(in.phonesAll.data(), in.phonesAll.size(),
+                    promptSem.data(), promptSem.size(), in.bertAll.data());
+  o.arMs = nowMs() - t0;
+  o.hitEos = gen.hit_eos;
+  o.codes.assign(gen.sampled.begin(), gen.sampled.end());
+  o.rawArgmax = gen.raw_argmax;
+  o.phonesSeg = in.phonesSeg;
+  o.normText = in.normText;
+  o.empty = gen.sampled.empty();
+  if (o.empty) {
+    std::fprintf(stderr, "[pipeline] 警告: AR 未产出 token (%s)\n",
+                 in.normText.c_str());
+    return o;
+  }
+
+  // 噪声按段序抽取: overlap 模式下本函数只在 stage2 线程 FIFO 执行 ⇒
+  // 与串行模式的抽取序列逐位一致
+  const size_t Tq = o.codes.size() * 2;
+  o.noise.resize(192 * Tq);
+  if (!rngSeeded_) {
+    rng_.seed(opt_.seed);
+    rngSeeded_ = true;
+  }
+  std::normal_distribution<float> nd(0.f, 1.f);
+  for (float& v : o.noise) v = nd(rng_);
+  return o;
+}
+
+void Pipeline::stageVoc(const SegSovIn& in, SegmentResult* seg,
+                        const DecodeCondition& cond) const {
+  seg->norm_text = in.normText;
+  seg->phones = in.phonesSeg;
+  seg->tokens.assign(in.codes.begin(), in.codes.end());
+  seg->raw_argmax = in.rawArgmax;
+  seg->ar_ms = in.arMs;
+  seg->hit_eos = in.hitEos;
+  if (in.empty) return;
+
+  sovits::SovitsEngine::Inputs si;
+  si.codes = in.codes.data();
+  si.n_codes = in.codes.size();
+  si.phones = in.phonesSeg.data();
+  si.n_phones = in.phonesSeg.size();
+  si.ge = cond.ge.data();
+  si.ge_text = cond.ge_text.data();
+  si.noise = in.noise.data();
+  si.Tq_expected = in.codes.size() * 2;
+  const double t1 = nowMs();
+  sovits::Tensor2D wavOut;
+  static sovits::Dumper noopDumper;  // 未 enable → 不落盘
+  sovits_->run(si, wavOut, noopDumper);
+  seg->voc_ms = nowMs() - t1;
+  seg->audio_frames = wavOut.T;
+
+  // 峰值归一 (>1 才除), 存归一后波形供拼接
+  double mx = 0.0;
+  for (float v : wavOut.d) mx = std::max(mx, double(std::abs(v)));
+  const bool needDiv = mx > 1.0;
+  seg->audio.resize(wavOut.T);
+  for (size_t i = 0; i < wavOut.T; ++i)
+    seg->audio[i] = needDiv ? wavOut.d[i] / float(mx) : wavOut.d[i];
+}
+
+static void writeTimingCsv(const std::string& path,
+                           const std::vector<SegmentResult>& segs) {
+  FILE* fp = fopen(path.c_str(), "w");
+  if (!fp) {
+    std::fprintf(stderr, "[pipeline] 警告: 无法写计时 CSV %s\n", path.c_str());
+    return;
+  }
+  std::fprintf(fp,
+               "idx,norm_text,phones,tokens,t_textfront_ms,t_ar_ms,t_sov_ms,"
+               "t_wait_ms,audio_frames,hit_eos\n");
+  for (size_t i = 0; i < segs.size(); ++i) {
+    const auto& g = segs[i];
+    std::fprintf(fp, "%zu,\"%s\",%zu,%zu,%.3f,%.3f,%.3f,%.3f,%zu,%d\n", i,
+                 g.norm_text.c_str(), g.phones.size(), g.tokens.size(), g.tf_ms,
+                 g.ar_ms, g.voc_ms, g.wait_ms, g.audio_frames,
+                 int(g.hit_eos));
+  }
+  fclose(fp);
+}
+
 bool Pipeline::synthesize(const std::string& utf8Text,
                           const std::string& refWavPath, SynthResult* out,
                           std::string* err) {
+  const double tSynth = nowMs();
   try {
     // 1. 参考条件 (缓存/编码器)
     if (!buildReference(refWavPath, out, err)) return false;
 
-    // 2. 文本前端: 先整体切段, 再逐段独立处理 (CPUFast 每段独立 clean_text)
+    // 2. 文本前端切段 (CPUFast 口径); 提示文本条件一次构建
     textfront::TextFrontend::Result full;
     if (!tf_.process(utf8Text, &full, opt_.cut_method)) {
       if (err) *err = full.error;
@@ -405,89 +563,87 @@ bool Pipeline::synthesize(const std::string& utf8Text,
       if (err) *err = "文本前端未产出任何合成段";
       return false;
     }
-
-    // 3. SoVITS 噪声 RNG (自定种子语义, 与 torch 非位等价)
-    std::mt19937_64 rng(opt_.seed);
-    std::normal_distribution<float> nd(0.f, 1.f);
-
-    // 3. 提示文本条件 (一次构建, 全段复用)
     if (!prompt_.ready && !buildPrompt(&prompt_, err)) return false;
 
     std::vector<float> allAudio;
-    for (const auto& segStr : full.sentences) {
-      SegmentResult seg;
-      seg.sentence = segStr;
-
-      // 3a. 单句前端 + BERT 特征 (cut0: 不再重切)
-      Feat f = featurize(&tf_, &g2pNorm_, &tok_, bert_, segStr, err);
-      if (f.phones.empty()) continue;  // 纯标点段跳过
-      seg.norm_text = f.normU8;
-      seg.phones = f.phones;  // SoVITS 文本输入 = 段自身 phones (无提示前缀)
-
-      // 3b. AR 输入 = prompt_phones ⊕ 段 phones (CPUFast all_phones 口径),
-      //     bert 同序拼接; 无提示文本时退化为段自身。
-      std::vector<int64_t> phonesAll;
-      std::vector<float> bertAll;
-      if (prompt_.ready && !prompt_.phones.empty()) {
-        phonesAll = prompt_.phones;
-        phonesAll.insert(phonesAll.end(), f.phones.begin(), f.phones.end());
-        bertAll = prompt_.bert;
-        bertAll.insert(bertAll.end(), f.bert.begin(), f.bert.end());
-      } else {
-        phonesAll = f.phones;
-        bertAll = f.bert;
-      }
-
-      // 3d. AR 贪心生成
-      const double t0 = nowMs();
-      ar::GenResult gen = ar_->generate(
-          phonesAll.data(), phonesAll.size(), out->prompt_semantic.data(),
-          out->prompt_semantic.size(), bertAll.data());
-      seg.ar_ms = nowMs() - t0;
-      seg.tokens = gen.sampled;
-      seg.raw_argmax = gen.raw_argmax;  // ↔ pairs golden tokens 口径
-      seg.hit_eos = gen.hit_eos;
-      if (seg.tokens.empty()) {
-        std::fprintf(stderr, "[pipeline] 警告: AR 未产出 token (%s)\n",
-                     segStr.c_str());
-        continue;
-      }
-
-      // 3e. SoVITS decode (噪声外部注入)
-      const size_t Tq = seg.tokens.size() * 2;
-      std::vector<float> noise(192 * Tq);
-      for (float& v : noise) v = nd(rng);
-      std::vector<int64_t> codes64(seg.tokens.begin(), seg.tokens.end());
-      sovits::SovitsEngine::Inputs in;
-      in.codes = codes64.data();
-      in.n_codes = seg.tokens.size();
-      in.phones = seg.phones.data();
-      in.n_phones = seg.phones.size();
-      in.ge = out->cond.ge.data();
-      in.ge_text = out->cond.ge_text.data();
-      in.noise = noise.data();
-      in.Tq_expected = Tq;
-      const double t1 = nowMs();
-      sovits::Tensor2D wavOut;
-      static sovits::Dumper noopDumper;  // 未 enable → 不落盘
-      sovits_->run(in, wavOut, noopDumper);
-      seg.voc_ms = nowMs() - t1;
-
-      // 峰值归一 (>1 才除) 后入列
-      seg.audio_frames = wavOut.T;
-      double mx = 0.0;
-      for (float v : wavOut.d) mx = std::max(mx, double(std::abs(v)));
-      const bool needDiv = mx > 1.0;
-      allAudio.reserve(allAudio.size() + seg.audio_frames + kSilence);
-      for (size_t i = 0; i < seg.audio_frames; ++i)
-        allAudio.push_back(needDiv ? wavOut.d[i] / float(mx) : wavOut.d[i]);
+    auto appendSeg = [&](SegmentResult&& seg) {
+      if (seg.audio.empty()) return;  // 空段(纯标点/无 token)不进结果
+      allAudio.reserve(allAudio.size() + seg.audio.size() + kSilence);
+      allAudio.insert(allAudio.end(), seg.audio.begin(), seg.audio.end());
       // fragment_interval=0.3s 静音尾 (每段都加, 与 audio_postprocess 一致)
       allAudio.insert(allAudio.end(), kSilence, 0.f);
       out->segments.push_back(std::move(seg));
+    };
+
+    if (!opt_.overlap) {
+      // ---- 串行模式: 同一阶段函数顺序内联 (数值路径与重叠态一致) ----
+      rngSeeded_ = false;
+      for (const auto& segStr : full.sentences) {
+        SegmentResult seg;
+        seg.sentence = segStr;
+        const double t0 = nowMs();
+        SegArIn ain = stageFeaturize({segStr});
+        seg.tf_ms = nowMs() - t0;
+        seg.norm_text = ain.normText;
+        seg.phones = ain.phonesSeg;
+        SegSovIn sin = stageAr(ain, out->prompt_semantic);
+        stageVoc(sin, &seg, out->cond);
+        if (!seg.audio.empty()) noteFirstPacket(nowMs() - tSynth);
+        appendSeg(std::move(seg));
+      }
+    } else {
+      // ---- 重叠模式: SegQueue 双缓冲, AR(N+1) ‖ SoVITS(N) ----
+      // QoS 落位(§4): textfront/BERT→utility(E 核); AR/VITS→P 核。
+      using gsv::runtime::SegTiming;
+      using Pipe = gsv::runtime::SegmentPipeline<SegText, SegArIn, SegSovIn,
+                                                 SegmentResult>;
+      Pipe pipe(
+          [this](const SegText& t, SegTiming&) {
+            return stageFeaturize(t);
+          },
+          [this, &out](const SegArIn& a, SegTiming&) {
+            return stageAr(a, out->prompt_semantic);
+          },
+          [this, &tSynth, &out](const SegSovIn& v, SegTiming&) {
+            SegmentResult seg;
+            stageVoc(v, &seg, out->cond);
+            if (!seg.audio.empty()) noteFirstPacket(nowMs() - tSynth);
+            return seg;
+          },
+          /*qos1=*/"utility", /*qos2=*/"user_initiated",
+          /*qos3=*/"user_initiated", /*queueCap=*/2);
+      pipe.start();
+
+      // 异常传输: stage 抛错经 envelope 送达 drain, 此处重抛给调用方
+      size_t submitted = 0, drained = 0;
+      try {
+        for (; submitted < full.sentences.size(); ++submitted)
+          pipe.submit({full.sentences[submitted]});
+        pipe.shutdownInput();
+        while (drained < full.sentences.size()) {
+          Pipe::WavItem it;
+          if (!pipe.drain(it)) break;
+          SegmentResult seg = std::move(it.data);
+          if (it.exc) std::rethrow_exception(it.exc);
+          if (it.timing) {
+            seg.tf_ms = it.timing->t_textfrontMs;
+            seg.wait_ms = it.timing->t_waitMs;
+          }
+          seg.sentence = full.sentences[drained];
+          appendSeg(std::move(seg));
+          ++drained;
+        }
+      } catch (...) {
+        pipe.cancel();
+        throw;
+      }
     }
 
     out->audio = std::move(allAudio);
     out->sr = kSr;
+    out->first_packet_ms = firstPacketMs();
+    if (!opt_.timing_csv.empty())
+      writeTimingCsv(opt_.timing_csv, out->segments);
     return true;
   } catch (const std::exception& e) {
     if (err) *err = e.what();
