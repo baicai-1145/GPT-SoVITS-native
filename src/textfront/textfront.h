@@ -28,6 +28,18 @@ using U32 = std::u32string;
 
 class TextFrontend {
 public:
+    // B6: G2PW polyphone engine paths. When provided to load(), the
+    // pipeline builds a G2PWConverter(+resolver) and installs it as the
+    // default polyphone path (sentence-level decisions). All three files
+    // are runtime-loaded, never baked in; load() fails with a friendly
+    // message when one is missing.
+    struct G2pwOptions {
+        std::string gsvPath;    // e.g. weights/g2pw_bert.gsv (~911MB)
+        std::string assetsBin;  // e.g. data/g2pw_assets.bin (~8.6MB)
+        std::string vocabPath;  // e.g. data/bert_vocab.txt
+        std::string overridesBin;  // data/polyphone_overrides.bin (~2.6MB);
+                                   // empty disables correct_pronunciation
+    };
     struct Result {
         std::vector<std::string> sentences;  // synthesis segments, UTF-8;
                                              // each ends with a splits char
@@ -41,11 +53,14 @@ public:
     // enables the English segment path (mixed zh/en inputs). When absent,
     // Latin segments fail with an error instead of silently misreading.
     bool load(const std::string& triePath, const std::string& pinyinPath,
-              std::string* err, const std::string& cmudictPath = {});
+              std::string* err, const std::string& cmudictPath = {},
+              const G2pwOptions* g2pw = nullptr);
+    ~TextFrontend();
 
     // Injection seam for B6's G2PW converter. nullptr restores the default
     // pypinyin behaviour. The object must outlive this TextFrontend.
     void setResolver(const PinyinResolver* r) { g2p_.setResolver(r); }
+
 
     // Full pipeline. cutMethod: TTS_infer_pack text_segmentation_method id,
     // 0..5 ("cut0".."cut5"); runtime default is "cut1".
@@ -72,7 +87,10 @@ public:
 
 private:
     ChineseG2p g2p_;
-    void* en_ = nullptr;  // std::unique_ptr<EnglishG2p>, type-erased to keep
+    void* en_ = nullptr;
+    void* g2pwConv_ = nullptr;      // G2PWConverter (owned when g2pw given)
+    void* g2pwResolver_ = nullptr;  // G2PWResolver (owned)
+    void* polyFix_ = nullptr;       // PolyphoneFixTable (owned when given)  // std::unique_ptr<EnglishG2p>, type-erased to keep
                           // english.h out of this header
 };
 

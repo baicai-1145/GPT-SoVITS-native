@@ -51,6 +51,24 @@ public:
     virtual void resolve(const char32_t* word, size_t len,
                          std::vector<PinyinSyl>* syllables) const = 0;
 
+    // B6 sentence-level polyphone hook. A resolver that decides readings
+    // with WHOLE-SENTENCE context (G2PW) overrides this and fills exactly
+    // one entry per codepoint of [text, text+len), returning true. The
+    // default word-level resolvers return false — ChineseG2p then falls
+    // back to per-word resolve() as before.
+    virtual bool resolveSentence(const char32_t*, size_t,
+                                 std::vector<PinyinSyl>*) const {
+        return false;
+    }
+
+    // Same as resolveSentence but in raw pypinyin TONE3 ("yi2") — the
+    // domain where CPUFast's correct_pronunciation dictionary overrides
+    // apply. Only sentence-capable resolvers return true.
+    virtual bool resolveSentenceTone3(const char32_t*, size_t,
+                                      std::vector<std::string>*) const {
+        return false;
+    }
+
     // chr(cp).isnumeric() equivalent (python str.isnumeric), consumed by
     // ToneSandhi's yi/bu rules. Default covers ASCII digits; the pypinyin
     // implementation overrides with the exported BMP table. After

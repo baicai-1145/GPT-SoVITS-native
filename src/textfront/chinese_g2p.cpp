@@ -2,7 +2,9 @@
 // replace_punctuation / g2p / _g2p (is_g2pw=False) / _merge_erhua /
 // _map_initial_final_to_phones.
 #include "chinese_g2p.h"
+#include "polyphone_fix.h"
 
+#include <cctype>
 #include <cstdio>
 
 #include "symbols2.hpp"
@@ -260,6 +262,21 @@ bool ChineseG2p::run(const std::string& utf8Text, G2pResult* out) const {
     for (auto& seg : segments) {
         if (seg.empty()) continue;
         std::string segUtf8 = enc(seg);
+        // B6 sentence-level polyphone context: when the active resolver is
+        // G2PW-backed it decides every Han reading with the whole segment as
+        // BERT input — this is what makes 长/地-class decisions match python
+        // (word-level calls provably differ: 长=chang2 alone but zhang3 in
+        // 成长). One PinyinSyl per codepoint on success.
+        std::vector<std::string> sentRds;  // TONE3 per codepoint
+        const bool haveSent =
+            resolver().resolveSentenceTone3(seg.data(), seg.size(), &sentRds);
+        if (!haveSent) {
+            // fall back to the marked-domain hook (no dict layer there)
+            std::vector<PinyinSyl> sentSyl;
+            if (resolver().resolveSentence(seg.data(), seg.size(), &sentSyl))
+                sentRds.clear();  // unsupported combo for now: see below
+        }
+        size_t cursor = 0;  // codepoint offset into seg for sentence slices
         std::vector<PosToken> toks;
         jb_.lcut(segUtf8, &toks);
         std::vector<SegToken> cut;
@@ -267,10 +284,41 @@ bool ChineseG2p::run(const std::string& utf8Text, G2pResult* out) const {
         sandhi.preMergeForModify(&cut, resolver());
 
         for (auto& tok : cut) {
-            if (tok.flag == "eng") continue;
+            const size_t wlen = tok.word.size();
+            if (tok.flag == "eng") {
+                cursor += wlen;  // python advances pre_word_length too
+                continue;
+            }
             std::vector<std::string> initials, finals;
-            getInitialsFinals(resolver(), tok.word.data(), tok.word.size(),
-                              &initials, &finals);
+            bool usedSent = false;
+            if (haveSent && cursor + wlen <= seg.size() &&
+                sentRds.size() == seg.size() &&
+                std::equal(tok.word.begin(), tok.word.end(),
+                           seg.begin() + static_cast<long>(cursor))) {
+                // python: word_pinyins = pinyins[pre:now]; then
+                // correct_pronunciation(word, word_pinyins)
+                std::vector<std::string> rd(
+                    sentRds.begin() + static_cast<long>(cursor),
+                    sentRds.begin() + static_cast<long>(cursor + wlen));
+                if (fix_) fix_->apply(tok.word, &rd);
+                // pinyin[0].isalpha() ? initials/finals : verbatim — mirrors
+                // getInitialsFinals' raw handling (non-Han passthrough)
+                for (const auto& py : rd) {
+                    if (!py.empty() &&
+                        std::isalpha(static_cast<unsigned char>(py[0]))) {
+                        initials.push_back(toInitials(py));
+                        finals.push_back(toFinalsTone3(py));
+                    } else {
+                        initials.push_back(py);
+                        finals.push_back(py);
+                    }
+                }
+                usedSent = true;
+            }
+            if (!usedSent)
+                getInitialsFinals(resolver(), tok.word.data(), wlen,
+                                  &initials, &finals);
+            cursor += wlen;
             bool ok = true;
             sandhi.modifiedTone(tok.word, tok.flag, resolver(), &finals,
                                 &ok);

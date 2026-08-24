@@ -18,13 +18,12 @@
 #include <vector>
 
 #include "textfront/g2pw.hpp"
+#include "textfront/pinyin.h"
 
 namespace gsv::textfront {
 
-struct PinyinSyl {
-  std::string text;
-  bool raw;
-};
+// PinyinSyl now lives in pinyin.h (single definition; the resolver seam
+// owns it). The local duplicate is gone.
 
 namespace detail {
 inline char32_t kMarkTable[4][6] = {
@@ -94,31 +93,70 @@ inline std::string tone3ToMarked(const std::string& s) {
   return out;
 }
 
-// PolyphoneResolver 形适配器 (duck-type 兼容 exec-txt PinyinResolver 缝;
-// 合并时可改为继承其抽象基类, 方法签名一致)
-class G2PWResolver {
+// PolyphoneResolver 适配器 — 正式继承 exec-txt 的 PinyinResolver 抽象基类。
+// resolve() 保持词级语义(回退路径); resolveSentence() 是 B6 注入的主路径:
+// 整句送 convert(), BERT 拿到完整上下文, 多音字决策与 python 句级链路一致
+// (实测: 单字"长"=chang2 而 句级"成长"[1]=zhang3, 词级必错)。
+class G2PWResolver : public PinyinResolver {
  public:
-  explicit G2PWResolver(const G2PWConverter* conv) : conv_(conv) {}
+  // numSrc: the built-in pypinyin resolver providing the isNumeric BMP
+  // table. Without it, ToneSandhi's yi/bu/ge quantifier rules silently
+  // misfire on Han digits ('一个' would keep ge4 instead of neutralizing
+  // to ge5 — found the hard way against pairs s9).
+  explicit G2PWResolver(const G2PWConverter* conv,
+                        const PinyinResolver* numSrc = nullptr)
+      : conv_(conv), numSrc_(numSrc) {}
+
+  bool isNumeric(uint32_t cp) const override {
+    return numSrc_ ? numSrc_->isNumeric(cp)
+                   : PinyinResolver::isNumeric(cp);
+  }
 
   void resolve(const char32_t* word, size_t len,
-               std::vector<PinyinSyl>* syllables) const {
-    syllables->clear();
-    std::string utf8;
-    for (size_t i = 0; i < len; ++i) utf8_append(uint32_t(word[i]), utf8);
-    const std::vector<std::string> py = conv_->convert(utf8);
-    // raw 判定: convert 输出中非 Han 位置为原字符透传(无调尾),
-    // Han 读音(含无音字"字5"形态)恒以数字调尾结尾。
-    syllables->reserve(py.size());
-    for (const auto& e : py) {
-      const bool has_tone = !e.empty() && e.back() >= '1' && e.back() <= '5';
-      if (has_tone)
-        syllables->push_back({tone3ToMarked(e), false});
-      else
-        syllables->push_back({e, true});
-    }
+               std::vector<PinyinSyl>* syllables) const override {
+    *syllables = sylsFromReadings(convertCps(word, len));
+  }
+
+  bool resolveSentence(const char32_t* text, size_t len,
+                       std::vector<PinyinSyl>* syllables) const override {
+    *syllables = sylsFromReadings(convertCps(text, len));
+    return true;
+  }
+
+  // Raw TONE3 domain for chinese2-style correct_pronunciation: python
+  // applies the polyphone dictionaries to g2pw's tone3 outputs BEFORE the
+  // marked-pinyin conversion, so the pipeline needs this layer exposed.
+  bool resolveSentenceTone3(const char32_t* text, size_t len,
+                            std::vector<std::string>* out) const override {
+    *out = convertCps(text, len);
+    return true;
   }
 
   const G2PWConverter* conv_;
+  const PinyinResolver* numSrc_ = nullptr;
+
+ private:
+  // convert() 输出长度 == 输入码点数 (s2t 逐字保长)
+  std::vector<std::string> convertCps(const char32_t* word, size_t len) const {
+    std::string utf8;
+    utf8.reserve(len * 3);
+    for (size_t i = 0; i < len; ++i) utf8_append(uint32_t(word[i]), utf8);
+    return conv_->convert(utf8);
+  }
+
+  static std::vector<PinyinSyl> sylsFromReadings(
+      const std::vector<std::string>& py) {
+    std::vector<PinyinSyl> out;
+    out.reserve(py.size());
+    for (const auto& e : py) {
+      const bool has_tone = !e.empty() && e.back() >= '1' && e.back() <= '5';
+      if (has_tone)
+        out.push_back({tone3ToMarked(e), false});
+      else
+        out.push_back({e, true});
+    }
+    return out;
+  }
 };
 
 }  // namespace gsv::textfront

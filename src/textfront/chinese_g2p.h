@@ -31,6 +31,17 @@ public:
     // Pass nullptr to restore the built-in PypinyinResolver. The pointed
     // object must outlive this instance.
     void setResolver(const PinyinResolver* r) { external_ = r; }
+
+    // B6/M3: correct_pronunciation dictionary layer (polyphone_overrides
+    // bin). Applied to sentence-slice readings before marked conversion;
+    // nullptr disables (word-level path unaffected).
+    void setPolyphoneFix(const class PolyphoneFixTable* t) { fix_ = t; }
+
+    // Built-in pypinyin resolver (never affected by setResolver): exposes
+    // the exported chr(cp).isnumeric() table. External resolvers must
+    // delegate their isNumeric() here — ToneSandhi's yi/bu/ge rules depend
+    // on Han-digit numerics ('一'.isnumeric() is True in python).
+    const PypinyinResolver& builtinResolver() const { return resolver_; }
     const PinyinResolver& resolver() const {
         return external_ ? *external_ : resolver_;
     }
@@ -45,6 +56,7 @@ private:
     JiebaSegmenter jb_;
     PypinyinResolver resolver_;
     const PinyinResolver* external_ = nullptr;  // B6 injection seam
+    const class PolyphoneFixTable* fix_ = nullptr;  // M3 override dicts
     TextNormalizer tn_;
     bool loaded_ = false;
 };
