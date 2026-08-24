@@ -12,9 +12,9 @@ class FlowWN {
  public:
   size_t hidden = 0, n_layers = 0;
   // cond_layer: Conv1d(gin → 2*hidden*n_layers, k=1), weight_norm 已融合 fp32
-  Conv1dF32 cond;
-  std::vector<Conv1dF32> in_layers;      // hidden→2h, k=5 dil=1
-  std::vector<Conv1dF32> res_skip;       // h→2h (末层 h→h), k=1
+  Conv1d cond;
+  std::vector<Conv1d> in_layers;      // hidden→2h, k=5 dil=1
+  std::vector<Conv1d> res_skip;       // h→2h (末层 h→h), k=1
 
   void load(const rt::GsvFile& f, std::string_view prefix, size_t h, size_t nl,
             size_t gin, size_t kernel = 5) {
@@ -92,9 +92,9 @@ class FlowWN {
 class ResidualCouplingLayer {
  public:
   size_t half = 0, hidden = 0;
-  Conv1dF32 pre;   // half → hidden, k=1
+  Conv1d pre;   // half → hidden, k=1
   FlowWN enc;
-  Conv1dF32 post;  // hidden → half (mean_only)
+  Conv1d post;  // hidden → half (mean_only)
 
   void load(const rt::GsvFile& f, std::string_view prefix, size_t channels,
             size_t h, size_t gin) {

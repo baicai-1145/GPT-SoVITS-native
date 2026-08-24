@@ -18,8 +18,8 @@ namespace gsv::sovits {
 class ResBlock1 {
  public:
   size_t channels = 0;
-  Conv1dF32 convs1[3];  // dilations {1,3,5}, k=3
-  Conv1dF32 convs2[3];  // dilation 1
+  Conv1d convs1[3];  // dilations {1,3,5}, k=3
+  Conv1d convs2[3];  // dilation 1
 
   void load(const rt::GsvFile& f, std::string_view prefix, size_t ch,
             size_t kernel_size, const size_t (&dil)[3]) {
@@ -38,13 +38,13 @@ class ResBlock1 {
 
 class Generator {
  public:
-  Conv1dF32 conv_pre;   // 192→768 k7
-  Conv1dF32 cond;       // 1024→768 k1 (ge 广播)
+  Conv1d conv_pre;   // 192→768 k7
+  Conv1d cond;       // 1024→768 k1 (ge 广播)
   static constexpr size_t kStages = 5;
-  ConvT1dF32 ups[kStages];
+  ConvT1d ups[kStages];
   ResBlock1 resblocks[kStages][3];
   static constexpr size_t kResKernels = 3;
-  Conv1dF32 conv_post;  // 24→1 k7 无 bias
+  Conv1d conv_post;  // 24→1 k7 无 bias
 
   void load(const rt::GsvFile& f) {
     static const size_t kUpsU[kStages] = {10, 8, 2, 2, 2};

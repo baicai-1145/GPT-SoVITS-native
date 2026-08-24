@@ -16,7 +16,7 @@ namespace gsv::sovits {
 
 class FFN {
  public:
-  Conv1dF32 conv_1, conv_2;
+  Conv1d conv_1, conv_2;
   // torch: conv_1 = Conv1d(in_ch, filt, k) 权重[filt,in,k]; conv_2 反之
   void load(const rt::GsvFile& f, std::string_view prefix, size_t in_ch,
             size_t filt, size_t k) {
@@ -91,7 +91,7 @@ class Encoder {
 class MRTE {
  public:
   MultiHeadAttention cross_attention;  // hidden 512, 4 heads, 无 rel-pos
-  Conv1dF32 c_pre, text_pre, c_post;
+  Conv1d c_pre, text_pre, c_post;
 
   void load(const rt::GsvFile& f, std::string_view prefix) {
     std::string p(prefix);

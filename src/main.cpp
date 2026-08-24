@@ -58,6 +58,7 @@ void printHelp(const char* argv0) {
       "  --no-cache        禁用参考特征缓存\n"
       "  --overlap         流水重叠模式: AR(N+1) ‖ SoVITS(N) (数值同串行)\n"
       "  --timing-csv F    per-segment 三阶段耗时 CSV 输出路径\n"
+      "  --amx             SoVITS conv 启用 AMX fp16 GEMM 后端(实验; 默认关)\n"
       "  -h/--help         本帮助\n",
       argv0);
 }
@@ -110,6 +111,8 @@ int main(int argc, char** argv) {
       opt.prompt_text = next("--prompt-text");
     } else if (a == "--overlap") {
       opt.overlap = true;
+    } else if (a == "--amx") {
+      opt.sovits_amx = true;
     } else if (a == "--timing-csv") {
       opt.timing_csv = next("--timing-csv");
     } else if (a == "--no-cache") {

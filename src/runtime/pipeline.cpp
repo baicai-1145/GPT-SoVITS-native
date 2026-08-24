@@ -181,7 +181,7 @@ bool Pipeline::load(const std::string& weightsDir, const std::string& dataDir,
     ar_ = std::make_unique<ar::T2SEngine>(*fAr_);
     sovits_ = std::make_unique<sovits::SovitsEngine>();
     fSov_ = std::make_unique<rt::GsvFile>(joinPath(weightsDir, "sovits_v2ProPlus.gsv"));
-    sovits_->load(fSov_->path());
+    sovits_->load(fSov_->path(), opt.sovits_amx);
     cond_.load(*fSov_);
     fHub_ = std::make_unique<rt::GsvFile>(joinPath(weightsDir, "hubert_base.gsv"));
     hubert_ = std::make_unique<encoder::HubertEngine>(*fHub_);

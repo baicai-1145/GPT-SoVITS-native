@@ -18,7 +18,7 @@ class MultiHeadAttention {
  public:
   size_t channels = 0, heads = 0, dk = 0;
   size_t win_table = 0;  // 2W+1; 0 表示无相对位置编码
-  Conv1dF32 conv_q, conv_k, conv_v, conv_o;
+  Conv1d conv_q, conv_k, conv_v, conv_o;
   std::vector<float> emb_rel_k, emb_rel_v;  // [win_table, dk]
 
   void load(const rt::GsvFile& f, std::string_view prefix, size_t ch,

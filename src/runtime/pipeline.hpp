@@ -45,6 +45,7 @@ struct PipelineOptions {
                             // 空串 = 无提示文本(CPUFast no_prompt_text 口径)
   bool overlap = false;    // D2: AR(N+1) ‖ SoVITS(N) 流水重叠(纯调度, 数值同串行)
   std::string timing_csv;  // D2: per-segment 三阶段耗时 CSV 路径 (空=不写)
+  bool sovits_amx = false; // E5-P2: SoVITS conv 接入 AMX 后端 (--amx; 默认关)
 };
 
 struct SegmentResult {
