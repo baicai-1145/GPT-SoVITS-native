@@ -62,8 +62,8 @@ class Conv1d {
       b.assign(o, 0.f);  // conv_post 无 bias (is_bias=False)
     }
 #if defined(GSV_AMX_GEMM)
-    // 预打包仅限大块且非逐点卷积: k==1 的 GEMV/点积形 pack+cast 开销不抵收益
-    if (amx_enabled() && out_c >= kAmxMinOutC && k > 1) {
+    // 预打包: k>1 大块 + k==1 点积形 (E6: 直写 panel 后 k==1 也反超 sgemm)
+    if (amx_enabled() && out_c >= kAmxMinOutC) {
       panel_ = kern::amx_pack(w_f16.data(), out_c, in_c * k);
       has_panel_ = true;
     }
@@ -85,7 +85,7 @@ class Conv1d {
     const size_t T = x.T;
     const size_t K = in_c * k;
 #if defined(GSV_AMX_GEMM)
-    // ---- AMX 路径: 仅 k>1 大块; im2col 直接写 panel 布局 (零中间趟) ----
+    // ---- AMX 路径: k>1 大块与 k==1 点积形; im2col 直接写 panel 布局 ----
     if (has_panel_ && k > 1 && dilation == 1 &&
         T >= 64 && kern::amx_gemm_available()) {
       // GEMM 全量覆写输出, 免 memset
@@ -93,12 +93,44 @@ class Conv1d {
       y.T = T;
       y.d.resize(out_c * T);
       thread_local std::vector<uint8_t> act_panel;
+      const bool prof = sov_timing_enabled();
+      const double tp0 = prof ? now_ms_e6() : 0.0;
       im2col_to_panel_f16(x.d.data(), in_c, T, k, dilation, act_panel);
+      if (prof) g_conv_split().prep += now_ms_e6() - tp0;
       kern::AmxPanel pb;
       pb.rows = T;
       pb.K = K;
       pb.buf = std::move(act_panel);
+      const double tg0 = prof ? now_ms_e6() : 0.0;
       kern::gemm_f16_amx_pp(panel_, pb, y.d.data(), out_c, T);
+      if (prof) {
+        g_conv_split().gemm += now_ms_e6() - tg0;
+        ++g_conv_split().n;
+      }
+      add_bias(y);
+      return;
+    }
+    // k==1 点积形: 同一直写布局 (k=1 退化为 cast_transpose→panel)
+    if (has_panel_ && k == 1 && dilation == 1 &&
+        T >= 64 && kern::amx_gemm_available()) {
+      const bool prof = sov_timing_enabled();
+      y.C = out_c;
+      y.T = T;
+      y.d.resize(out_c * T);
+      thread_local std::vector<uint8_t> act_panel;
+      const double tp1 = prof ? now_ms_e6() : 0.0;
+      im2col_to_panel_f16(x.d.data(), in_c, T, 1, 1, act_panel);
+      if (prof) g_conv_split().prep += now_ms_e6() - tp1;
+      kern::AmxPanel pb;
+      pb.rows = T;
+      pb.K = K;
+      pb.buf = std::move(act_panel);
+      const double tg1 = prof ? now_ms_e6() : 0.0;
+      kern::gemm_f16_amx_pp(panel_, pb, y.d.data(), out_c, T);
+      if (prof) {
+        g_conv_split().gemm += now_ms_e6() - tg1;
+        ++g_conv_split().n;
+      }
       add_bias(y);
       return;
     }
@@ -108,7 +140,9 @@ class Conv1d {
     thread_local std::vector<float> wf;
     wf.resize(w_f16.size());
     kern::accel::f16_to_f32(w_f16.data(), wf.data(), w_f16.size());
-    y.reset(out_c, T);
+    y.C = out_c;  // GEMM beta=0 全量覆写, 免 memset
+    y.T = T;
+    y.d.resize(out_c * T);
     if (k == 1 && dilation == 1) {
       // 逐点: y = W[out, in] · x[in, T]
       kern::accel::sgemm('N', 'N', static_cast<int>(out_c),
