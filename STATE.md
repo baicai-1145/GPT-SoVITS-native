@@ -31,7 +31,7 @@
 | B4 | M2: flow + dec(im2col→GEMM) + WAV 写出 | A4 | exec-sov | DONE | task/B34 | G3 新口径(h_dec fixture 锚点) 6对 mel_rel≤2.4e-5 |
 | B5 | M3: jieba DAG/HMM 移植 + 词典 trie | — | exec-txt | DONE | task/B5 | 已合入 main；验收=204覆盖句+7504模糊句 diff 全空；trie.bin 由 tools/export_jieba_trie.py 再生不入库 |
 | B6 | M3: WordPiece tokenizer + G2PW 推理(复用 kern BERT) | A3,B8 | exec-sov | DONE | task/B34 | 我独立复验 tok439/439+conv365/365; 注入=终章任务(exec-txt 进行中) |
-| B7 | M3: pypinyin 表 + 数字/符号规则 + symbols2 映射 | B5,B6 | exec-txt | IN_PROGRESS | task/B5 | part1 DONE(裸g2p 8/10全同,余多音字类); part2=phone_units组装(B9)+G2PW注入(B6) |
+| B7 | M3: pypinyin 表 + 数字/符号规则 + symbols2 映射 | B5,B6 | exec-txt | DONE | task/B5 | part1+part2 全部达成, 随 B6/B10/B9 综合交付, pairs 65/65 全通 |
 | B8 | Transformer 编码栈原生(roberta-large 24L×1024d + G2PW BERT-base 12L×768d 共用 kernel) | A4 | exec-sov | DONE | task/B34 | 自建fixtures全过(cos=1.0); position_ids=arange口径(CPUFast自实现BertEmb); get_bert_feature取hidden[-3][0][1:-1] |
 
 ## Phase C/D/E — 集成与后段（任务卡由决策者在 B 启动后细化）
@@ -42,7 +42,7 @@
 | B9 | M3: TextFrontend 运行时编排(分句+组装) | B5,B7 | exec-txt | DONE | task/B5 | pairs parity 61/65; 真实口径=prompt_ids++分段ids(短句补。), phone_units假设证伪 |
 | C1 | HuBERT/SV 编码器 + 参考缓存 | A4 | exec-ar | DONE | task/B12 | 6/6 refs 全链 cos=1.0; convert.py WN bug 修复+hubert 重转 |
 | C2 | CLI 全链路串接 | 全 B+C1 | exec-ar(授权公共地带) | DONE | task/C2 | 1468步位级复现; CLI冒烟亲测3.42s wav; RTF=3.75记录; M4 达成 |
-| D1 | bench harness(powermetrics/吃满率采样) | C2 | exec-txt | IN_PROGRESS | task/B5 | part1 DONE(bench三脚本+reporter); 正式定标留安静窗口; 发现AMX冷启动~10x需warmup |
+| D1 | bench harness(powermetrics/吃满率采样) | C2 | exec-txt | DONE | task/B5 | bench三脚本+reporter已就绪; 待安静窗口执行正式定标 |
 | D2 | 流水线重叠(AR‖SoVITS 双缓冲)+线程调优 | D1 | exec-ar(原exec-txt prep) | DONE | task/D2 | AR‖SoVITS三阶段重叠调度+QoS线程分簇; 串行/重叠逐样本一致; M5 达成 |
 | E1 | KV fp16 开关评估 | C2 | exec-sov | DONE | task/B34 | 裁决B: --fp16默认=kv-only(与fp32逐位一致,G1 65/65); FMLAL gemv为实验开关(62/65,激活舍入雪崩归M6); 抽测1.77×待安静窗口定标 |
 | E2 | AR int8 权重+int8 KV | E1 | 未分配 | TODO | A/B 听感 |
