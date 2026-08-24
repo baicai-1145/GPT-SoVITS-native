@@ -39,7 +39,9 @@ struct PipelineOptions {
   uint64_t seed = 42;      // SoVITS 噪声种子(自定 RNG; 与 torch 非位等价)
   int cut_method = 1;      // cut0..cut5, 与 CPUFast text_split_method 对应
   bool use_ref_cache = true;
-  std::string prompt_text = "原来你也玩原神。";  // 参考文本(AR 条件前缀);
+  // 参考文本必须与参考音频实际内容一致, 错配会致 AR 复读退化;
+  // 默认空 = no_prompt_text 口径(CPUFast 支持), 用户须显式传入正确转写
+  std::string prompt_text;
                             // 空串 = 无提示文本(CPUFast no_prompt_text 口径)
   bool overlap = false;    // D2: AR(N+1) ‖ SoVITS(N) 流水重叠(纯调度, 数值同串行)
   std::string timing_csv;  // D2: per-segment 三阶段耗时 CSV 路径 (空=不写)

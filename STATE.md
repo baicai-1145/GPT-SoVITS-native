@@ -49,7 +49,7 @@
 | E2-SOV | SoVITS 端到端 fp16 算子(真FMLAL GEMM) | E1 | exec-sov | REVIEW | task/E2-SOV | 重做达标: 真fp16计算/RSS-36%/G3过(mel_rel≤0.0144); 但手写FMLAL比AMX sgemm慢2.9x→待裁决: 仅可作--sovits-fp16选装开关合入, 默认保持fp32 |
 | E2-ENC | BERT/RoBERTa/HuBERT 编码栈 fp16 化 | E1 | exec-txt | DONE | task/E2-ENC | view零拷贝+真FMLAL+生命周期修复; 初判REJECTED系误判(短句基线vs长句对照无效): 受控A/B证fp16与fp32输出token级一致(同句均910)且load 4.6s→170ms → 已reapply(f754269); 调节链fp16安全性与AR采样语义问题拆分至E4 |
 | E3 | AR int8 权重+int8 KV (原E2) | E2-AR | 未分配 | TODO | A/B 听感 |
-| E4 | 长单段AR复读环鲁棒性: 对齐python topk_sampling(top_k/top_p/temperature+惩罚,CALIBRATION)或移植early_stop_num | C2 | 未分配 | TODO | fp32/fp16均复现(44phones单段910tokens复读); 贪心确定性vs python采样随机性; 拆句即正常(68/72) |
+| E4 | 长单段AR复读环鲁棒性: 对齐python topk_sampling(top_k/top_p/temperature+惩罚,CALIBRATION)或移植early_stop_num | C2 | 未分配 | TODO | 复读事件根因已定位=默认参考文本与参考音频错配(修正为no_prompt_text默认, 910→68 tokens); 本卡降级为低优先级鲁棒性储备 |
 
 ## 阻塞/风险登记
 
