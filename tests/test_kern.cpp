@@ -1,7 +1,6 @@
 // test_kern.cpp — A3 内核原语单测: torch golden 对 + NEON/参考实现自洽 + 统计量纪律抽查
 #include "test_util.h"
 
-#include "kern/gemv_fmlal.hpp"
 #include "kern/kern.hpp"
 
 #include <cmath>
@@ -135,63 +134,6 @@ GSV_TEST(gemv_neon_vs_ref_odd_shapes) {
     for (size_t i = 0; i < out_; ++i)
       if (std::fabs(y1[i] - y2[i]) > 1e-5f) ++mismatch;
     CHECK_EQ(mismatch, size_t{0});
-  }
-}
-
-// ---- E2-ENC: 矩阵版 FMLAL GEMM 单测 ----
-// 语义: C[M,N]=Σ_k A[m,k]·B[n,k] (A/B fp16, FMLAL 融入 fp32 累加)
-// 参考: 同位型升位 fp32 后顺序点积(与 FMLAL 单积精度等价: fp16×fp16 积在 fp32 内
-// 精确, 差异仅归约顺序)。奇形覆盖: K 非 8 倍数(卷积 K=9)、M/N 非 4 倍数。
-GSV_TEST(gemm_f16x_fmlal_matches_ref) {
-  Rng rng;
-  for (auto [M, N, K] : {std::tuple{8u, 1024u, 1024u},   // bert FC: T=8
-                         {32u, 4096u, 1024u},            // bert inter: T=32
-                         {14u, 768u, 768u},              // g2pw
-                         {96u, 200u, 9u},                // sv 3x3 conv: K=9
-                         {2048u, 50u, 1024u},            // sv l3ds 行带
-                         {17u, 31u, 7u},                 // 奇形兼收
-                         {1u, 1u, 1u},
-                         {64u, 3u, 1536u}}) {
-    std::vector<uint16_t> a(M * K), b(N * K);
-    for (auto& v : a) {
-      _Float16 h(rng.next() * 0.5f);
-      __builtin_memcpy(&v, &h, 2);
-    }
-    for (auto& v : b) {
-      _Float16 h(rng.next() * 0.5f);
-      __builtin_memcpy(&v, &h, 2);
-    }
-    std::vector<float> got(M * N);
-    gsv::kern::gemm_f16x_fmlal(a.data(), b.data(), got.data(), M, N, K);
-    // 参考: 升位 fp32 顺序点积
-    std::vector<float> af(M * K), bf(N * K);
-    for (size_t i = 0; i < a.size(); ++i) {
-      _Float16 h;
-      __builtin_memcpy(&h, &a[i], 2);
-      af[i] = static_cast<float>(h);
-    }
-    for (size_t i = 0; i < b.size(); ++i) {
-      _Float16 h;
-      __builtin_memcpy(&h, &b[i], 2);
-      bf[i] = static_cast<float>(h);
-    }
-    size_t mismatch = 0;
-    double worst = 0;
-    for (size_t m = 0; m < M; ++m)
-      for (size_t n = 0; n < N; ++n) {
-        double acc = 0;
-        for (size_t k = 0; k < K; ++k)
-          acc += double(af[m * K + k]) * double(bf[n * K + k]);
-        const double d = std::fabs(acc - double(got[m * N + n]));
-        worst = std::max(worst, d);
-        // fp16×fp16 积精确落 fp32; 差异仅归约顺序 → fp32 舍入噪声级容差
-        if (d > 1e-4 * (1.0 + std::fabs(acc))) ++mismatch;
-      }
-    char buf[160];
-    std::snprintf(buf, sizeof buf,
-                  "gemm_f16x_fmlal M=%u N=%u K=%u mismatch=%zu worst=%.3g",
-                  unsigned(M), unsigned(N), unsigned(K), mismatch, worst);
-    CHECK_MSG(mismatch == 0, buf);
   }
 }
 

@@ -35,32 +35,22 @@ inline void softmax_rows(float* s, size_t rows, size_t cols) {
   }
 }
 
-struct Linear {  // y[T,out] = x[T,in]·Wᵀ + b; fp16 直读权重 + FMLAL 前向
-  kern::accel::DenseF16 w;      // view(f16 指针)或 fp32 常驻(无 f16 段时)
+struct Linear {  // y[T,out] = x[T,in]·Wᵀ + b; W 存 [out,in] 行主
+  std::vector<float> w;
   std::vector<float> b;
   size_t in = 0, out = 0;
   void load(const rt::GsvFile& f, const std::string& pfx, size_t o, size_t i,
             bool has_bias = true) {
     out = o;
     in = i;
-    const auto* t = f.tensor(pfx + ".weight");
-    if (!t) {
-      std::fprintf(stderr, "bert: missing tensor %s.weight\n", pfx.c_str());
-      std::abort();
-    }
-    if (t->has_f16()) {
-      w = kern::accel::DenseF16::view_f16(t->data_f16_raw(), o, i);  // 零拷贝 FMLAL
-    } else {
-      std::vector<float> wf;
-      load_tensor_f32(f, pfx + ".weight", wf, {o, i});
-      w = kern::accel::DenseF16(wf.data(), o, i);
-    }
+    load_tensor_f32(f, pfx + ".weight", w, {o, i});
     if (has_bias) load_tensor_f32(f, pfx + ".bias", b, {o});
   }
-  // xh: 复用 fp16 激活暂存(引擎持有, 跨层复用)
-  void forward(const Matrix& x, Matrix& y, std::vector<uint16_t>& xh) const {
+  void forward(const Matrix& x, Matrix& y) const {
     y.reset(x.rows, out);
-    w.forward(x.d.data(), x.rows, y.d.data(), xh);
+    kern::accel::sgemm('N', 'T', int(x.rows), int(out), int(in), 1.f,
+                       x.d.data(), int(x.cols), w.data(), int(in), 0.f,
+                       y.d.data(), int(out));
     if (!b.empty())
       for (size_t t = 0; t < x.rows; ++t)
         for (size_t o = 0; o < out; ++o) y.d[t * out + o] += b[o];
@@ -117,14 +107,13 @@ struct BertLayer {
   }
 
   void forward(const Matrix& x, const std::vector<float>& ext_mask,
-               Matrix& y, Matrix& scr, Matrix& ctxh,
-               std::vector<uint16_t>& xh) const {
+               Matrix& y, Matrix& scr, Matrix& ctxh) const {
     const size_t T = x.rows, C = x.cols, H = heads, dh = C / H;
-    // QKV 投影(FMLAL fp16×fp16→fp32)
+    // QKV 投影
     Matrix qm, km, vm;
-    q.forward(x, qm, xh);
-    k.forward(x, km, xh);
-    v.forward(x, vm, xh);
+    q.forward(x, qm);
+    k.forward(x, km);
+    v.forward(x, vm);
     // 逐头: S = Q_h·K_hᵀ/√dh (+mask 列) → softmax → ctx[:,head] = S·V_h
     scr.reset(T, T);
     ctxh.reset(T, C);
@@ -145,24 +134,18 @@ struct BertLayer {
                          ctxh.d.data() + off, int(C));
     }
     y.reset(T, C);
-    attn_out.forward(ctxh, y, xh);   // dense(FMLAL)
-    for (size_t i = 0; i < y.d.size(); ++i) y.d[i] += x.d[i];  // res(fp32)
-    attn_ln.forward(y);   // LayerNorm fp32
-    // FFN(FMLAL)
+    attn_out.forward(ctxh, y);   // dense
+    for (size_t i = 0; i < y.d.size(); ++i) y.d[i] += x.d[i];  // res
+    attn_ln.forward(y);
+    // FFN
     Matrix mid;
-    inter.forward(y, mid, xh);
-    for (float& z : mid.d) z = gelu_erf(z);  // GELU fp32
+    inter.forward(y, mid);
+    for (float& z : mid.d) z = gelu_erf(z);
     Matrix f2;
-    ffn_out.forward(mid, f2, xh);
-    for (size_t i = 0; i < f2.d.size(); ++i) f2.d[i] += y.d[i];  // res(fp32)
+    ffn_out.forward(mid, f2);
+    for (size_t i = 0; i < f2.d.size(); ++i) f2.d[i] += y.d[i];  // res
     out_ln.forward(f2);
     y.d.swap(f2.d);
-  }
-
-  void forward(const Matrix& x, const std::vector<float>& ext_mask,
-               Matrix& y, Matrix& scr, Matrix& ctxh) const {
-    std::vector<uint16_t> xh;
-    forward(x, ext_mask, y, scr, ctxh, xh);
   }
 };
 

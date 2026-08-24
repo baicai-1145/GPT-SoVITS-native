@@ -44,14 +44,11 @@ class SvEngine {
     void apply(float* x, int c, size_t s) const;  // [c, s] 每通道一行
   };
   struct Aff {  // fusion.AFF: local_att(cat[x,ds]) → 门控融合
-    const uint16_t* w1 = nullptr;  // [inter,2C] 1x1 卷积权重(fp16 直读)
-    const uint16_t* w2 = nullptr;  // [C,inter] 1x1 卷积权重(fp16 直读)
-    std::vector<uint16_t> w2_own;  // 无 f16 段时的一次性量化副本(fp16 常驻, 拥有权)
+    std::vector<float> w1, w2;  // [inter,2C] / [C,inter] 1x1 卷积权重摊平
     std::vector<float> b1, b2;  // 两个 1x1 卷积的 bias(local_att Conv2d bias=True!)
     Bn bn1, bn2;
     int inter = 0, ch = 0;
-    void apply(const float* x, const float* ds, float* out, int h, int w,
-               std::vector<uint16_t>& xh, std::vector<uint16_t>& xh2);
+    void apply(const float* x, const float* ds, float* out, int h, int w);
     // scratch / 对拍
     std::vector<float> cat_, att_, att_t_;
     std::vector<float> last_out;  // 最近一次 apply 的输出 xo
@@ -60,14 +57,13 @@ class SvEngine {
     bool aff = false;
     int width = 0, scale = 0, exp_planes = 0;
     int stride = 1;
-    const uint16_t* conv1_w = nullptr;  // 1x1 权重摊平 [Co,Ci] (fp16 直读)
-    const uint16_t* conv3_w = nullptr;  // 1x1 权重摊平 [exp,Ci] (fp16 直读)
-    std::vector<const uint16_t*> convs_w;  // 3x3 权重摊平 [width,width*9] (fp16 直读)
+    std::vector<float> conv1_w, conv3_w;          // 1x1 权重摊平 [Co,Ci]
+    std::vector<std::vector<float>> convs_w;      // 3x3 权重摊平 [width,width*9]
     std::vector<Bn> bns;
     Bn bn1, bn3;
     std::vector<Aff> fuses;                       // scale-1 个(AFF 块才有)
     bool has_shortcut = false;
-    const uint16_t* sc_w = nullptr;  // 1x1 权重摊平 (fp16 直读)
+    std::vector<float> sc_w;
     Bn sc_bn;
     void apply(const float* in, int c_in, int h_in, int w_in, SvEngine& eng);
     std::vector<float> last_out;  // 最近一次 apply 的输出(对拍用)
@@ -85,9 +81,9 @@ class SvEngine {
   void load_block(int l, int i, bool expect_aff);
 
   const rt::GsvFile* f_;
-  std::vector<float> conv1_w_;  // [64, 9] stem conv (fp32 常驻, 仅 576 参)
+  std::vector<float> conv1_w_;  // [64, 9]
   Bn bn1_;
-  const uint16_t* l3ds_w_ = nullptr;   // [2048, 1024*9] fp16 直读
+  std::vector<float> l3ds_w_;   // [2048, 1024*9]
   Aff fuse34_;
   std::vector<Block> stages_[5];  // 1..4
   int c_after_[5]{};              // 各 stage 输出通道
@@ -96,17 +92,10 @@ class SvEngine {
   std::vector<float> cols_, tmp_, tmp2_, nxt_;
   std::vector<float> cur_, ds_, o_conv1_, o_fuse_, emb_;
   std::vector<std::vector<float>> o_layer_;
-  std::vector<uint16_t> xh_, xh2_;    // fp16 激活暂存(AFF 转置量化复用)
-  std::vector<uint16_t> cols16_;      // fp16 im2col 暂存(conv2d_f16)
 
-  // 静态 conv2d(fp32 权重, im2col → sgemm('N','T')); 仅 stem conv1(fp32-only 段)使用
   static void conv2d(const float* in, int c_in, int h, int w, const float* wt,
                      int c_out, int kh, int kw, int stride, int pad,
                      std::vector<float>& cols, std::vector<float>& out);
-  // fp16 直读版: im2col 量化 fp16 + gemm_f16x_fmlal(FMLAL 融合 fp32 累加)
-  void conv2d_f16(const float* in, int c_in, int h, int w, const uint16_t* w16,
-                  int c_out, int kh, int kw, int stride, int pad,
-                  std::vector<float>& cols_unused, std::vector<float>& out);
 };
 
 }  // namespace gsv::encoder

@@ -173,21 +173,21 @@ bool Pipeline::load(const std::string& weightsDir, const std::string& dataDir,
     if (!tok_.load(joinPath(dataDir, "roberta_vocab.txt"), err)) return false;
 
     bert_.cfg = bert::BertConfig{};  // roberta-wwm-ext-large 默认即此
-    fBert_ = std::make_unique<rt::GsvFile>(
-        joinPath(weightsDir, "roberta_wwm_ext_large.gsv"));
-    bert_.load(*fBert_, "bert");
+    bert_.load(rt::GsvFile(joinPath(weightsDir, "roberta_wwm_ext_large.gsv")),
+               "bert");
 
-    fAr_ = std::make_unique<rt::GsvFile>(joinPath(weightsDir, "ar_s1v3.gsv"));
-    ar_ = std::make_unique<ar::T2SEngine>(*fAr_);
+    ar_ = std::make_unique<ar::T2SEngine>(
+        rt::GsvFile(joinPath(weightsDir, "ar_s1v3.gsv")));
     sovits_ = std::make_unique<sovits::SovitsEngine>();
-    fSov_ = std::make_unique<rt::GsvFile>(joinPath(weightsDir, "sovits_v2ProPlus.gsv"));
-    sovits_->load(fSov_->path());
-    cond_.load(*fSov_);
-    fHub_ = std::make_unique<rt::GsvFile>(joinPath(weightsDir, "hubert_base.gsv"));
-    hubert_ = std::make_unique<encoder::HubertEngine>(*fHub_);
-    fSv_ = std::make_unique<rt::GsvFile>(
-        joinPath(weightsDir, "eres2netv2_sv.gsv"));
-    sv_ = std::make_unique<encoder::SvEngine>(*fSv_);
+    sovits_->load(joinPath(weightsDir, "sovits_v2ProPlus.gsv"));
+    {
+      rt::GsvFile sovF(joinPath(weightsDir, "sovits_v2ProPlus.gsv"));
+      cond_.load(sovF);
+      hubert_ = std::make_unique<encoder::HubertEngine>(
+          rt::GsvFile(joinPath(weightsDir, "hubert_base.gsv")));
+      sv_ = std::make_unique<encoder::SvEngine>(
+          rt::GsvFile(joinPath(weightsDir, "eres2netv2_sv.gsv")));
+    }
   } catch (const std::exception& e) {
     if (err) *err = e.what();
     return false;
@@ -358,9 +358,9 @@ Feat featurize(const textfront::TextFrontend* tf,
   x.reset(Ln, C);
   for (size_t t = 0; t < Ln; ++t)
     for (size_t c = 0; c < C; ++c)
-      x.d[t * C + c] = bm.word_emb_w[size_t(ids[t]) * C + c] +
-                       bm.pos_emb_w[t * C + c] +
-                       bm.type_emb_w[size_t(tt[t]) * C + c];
+      x.d[t * C + c] = bm.word_emb.w[size_t(ids[t]) * C + c] +
+                       bm.pos_emb.w[t * C + c] +
+                       bm.type_emb.w[size_t(tt[t]) * C + c];
   bm.emb_ln.forward(x);
   std::vector<float> ext(Ln);
   for (size_t j = 0; j < Ln; ++j)
@@ -586,9 +586,9 @@ bool Pipeline::synthesize(const std::string& utf8Text,
         seg.tf_ms = nowMs() - t0;
         seg.norm_text = ain.normText;
         seg.phones = ain.phonesSeg;
-            SegSovIn sin = stageAr(ain, out->prompt_semantic);
+        SegSovIn sin = stageAr(ain, out->prompt_semantic);
         stageVoc(sin, &seg, out->cond);
-            if (!seg.audio.empty()) noteFirstPacket(nowMs() - tSynth);
+        if (!seg.audio.empty()) noteFirstPacket(nowMs() - tSynth);
         appendSeg(std::move(seg));
       }
     } else {

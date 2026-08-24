@@ -54,6 +54,10 @@ DenseF16::DenseF16(const float* w32_src, size_t out, size_t in) : out_(out), in_
   w_.assign(w32_src, w32_src + out_ * in_);
 }
 
-// DenseF16::forward 已在 accel.hpp 内联实现(view→FMLAL / 常驻→sgemm)
+void DenseF16::forward(const float* x, size_t T, float* y) const {
+  sgemm('N', 'T', static_cast<int>(T), static_cast<int>(out_), static_cast<int>(in_),
+        1.0f, x, static_cast<int>(in_), w_.data(), static_cast<int>(in_),
+        0.0f, y, static_cast<int>(out_));
+}
 
 }  // namespace gsv::kern::accel

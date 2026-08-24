@@ -63,11 +63,11 @@ HubertEngine::HubertEngine(const GsvFile& f) {
     if (t.numel() != rows * cols || !t.has_f16())
       throw std::runtime_error(std::string(name) + ": 形状/f16 段不符");
     Dense d;
-    d.w = accel::DenseF16::view_f16(t.data_f16_raw(), rows, cols);  // 零拷贝 FMLAL
+    d.w = accel::DenseF16(t.data_f16_raw(), rows, cols);
     return d;
   };
 
-  // ---- CNN 层(权重 fp16 直读 [out, in*k]; layer0 附 GroupNorm affine) ----
+  // ---- CNN 层(权重摊平为 im2col 布局 [out, in*k]; layer0 附 GroupNorm affine) ----
   int in_c = 1;
   for (int li = 0; li < 7; ++li) {
     const std::string p = "feature_extractor.conv_layers." + std::to_string(li) + ".";
@@ -77,9 +77,11 @@ HubertEngine::HubertEngine(const GsvFile& f) {
         static_cast<int>(wv.dims[2]) != k)
       throw std::runtime_error("hubert conv 形状与 config 不符");
     ConvL& L = convs_[li];
-    if (!wv.has_f16())
-      throw std::runtime_error("hubert conv 权重缺 f16 段: " + p);
-    L.w16 = wv.data_f16_raw();  // fp16 直读(FMLAL)
+    L.w.resize(static_cast<size_t>(out_c) * in_c * k);
+    if (wv.has_f16())
+      accel::f16_to_f32(wv.data_f16_raw(), L.w.data(), L.w.size());
+    else
+      std::memcpy(L.w.data(), wv.data_f32(), L.w.size() * sizeof(float));
     if (li == 0) {
       L.has_gn = true;
       L.gn_g = vec_any((p + "layer_norm.weight").c_str());
@@ -134,27 +136,23 @@ void HubertEngine::gelu(float* x, size_t n) {
     x[i] = 0.5f * x[i] * (1.0f + std::erf(x[i] * static_cast<float>(M_SQRT1_2)));
 }
 
-// CNN 单层: valid 卷积(fp16 路径)。im2col 量化到 fp16 cols16_, 权重 fp16 直读,
-// gemm_f16x_fmlal: out[out_c, T] = W[out_c, in*k]·colsᵀ (FMLAL 融合 fp32 累加,
-// 通道主输出零转置, 后续 GroupNorm/下一层卷积直接消费)。
+// CNN 单层: valid 卷积。输出直接写通道主 [out_c, T](out[C',t] = Σ W'[C',·]·cols[t,·],
+// 即 sgemm('N','T')), 后续 GroupNorm/下一层卷积都按通道主消费 —— 全程零转置。
 void HubertEngine::conv_layer(int li, const std::vector<float>& in, int in_c, size_t in_len,
                               std::vector<float>& out, int& out_c, size_t& out_len) {
   const int k = conv_kernel_[li], s = conv_stride_[li];
   const size_t T = (in_len - static_cast<size_t>(k)) / static_cast<size_t>(s) + 1;
   out_c = conv_dim_[li];
-  const size_t KK = static_cast<size_t>(in_c) * k;
-  cols16_.resize(T * KK);
+  cols_.resize(T * static_cast<size_t>(in_c) * k);
   for (size_t t = 0; t < T; ++t)
     for (int c = 0; c < in_c; ++c)
-      for (int kk = 0; kk < k; ++kk) {
-        const __fp16 h = static_cast<__fp16>(
-            in[static_cast<size_t>(c) * in_len + t * s + kk]);
-        std::memcpy(cols16_.data() + t * KK + static_cast<size_t>(c) * k + kk, &h,
-                    sizeof h);
-      }
+      for (int kk = 0; kk < k; ++kk)
+        cols_[t * in_c * k + c * k + kk] =
+            in[static_cast<size_t>(c) * in_len + t * s + kk];
   out.resize(static_cast<size_t>(out_c) * T);
-  kern::gemm_f16x_fmlal(convs_[li].w16, cols16_.data(), out.data(),
-                        static_cast<size_t>(out_c), T, KK);
+  accel::sgemm('N', 'T', out_c, static_cast<int>(T), in_c * k, 1.0f,
+               convs_[li].w.data(), in_c * k, cols_.data(), static_cast<int>(in_c * k),
+               0.0f, out.data(), static_cast<int>(T));
   out_len = T;
 }
 
@@ -199,21 +197,16 @@ size_t HubertEngine::run(const float* waveform, size_t n) {
                          proj_ln_b_.data(), tmp_.data() + t * conv_dim_[6], conv_dim_[6],
                          ln_eps_);
   x_.resize(T * hidden_);
-  proj_.w.forward(tmp_.data(), T, x_.data(), xh_);
+  proj_.w.forward(tmp_.data(), T, x_.data());
   for (size_t i = 0; i < T * hidden_; ++i) x_[i] += proj_.b[i % hidden_];
   proj_o_ = x_;
 
   // ---- pos_conv: 分组卷积(pad=K/2 双侧, 输出 T+1 帧) → SamePad 去尾 → GELU → x += · ----
-  // fp16 路径: pos_w_ 是 weight_norm 融合产物(仅存 fp32 段) → 量化到 fp16 后 FMLAL。
   {
     const int G = conv_pos_groups_, cg = hidden_ / G, K = conv_pos_k_;
     const size_t P = static_cast<size_t>(K) / 2;
     const size_t Tp = T + 1;  // (T+2P-K+1)
-    const size_t KK = static_cast<size_t>(cg) * K;
-    // 按组连续布局: 组 g 的 [Tp,KK] 块紧排(gemm_f16x_fmlal 的 B 侧行 stride=KK)
-    cols16_.resize(static_cast<size_t>(G) * Tp * KK);
-    pos_w16_.resize(static_cast<size_t>(hidden_) * cg * K);  // 融合产物→fp16 一次性量化
-    kern::f32_to_f16(pos_w_.data(), pos_w16_.data(), pos_w16_.size());
+    cols_.resize(Tp * static_cast<size_t>(G) * cg * K);
     for (int g = 0; g < G; ++g)
       for (size_t t = 0; t < Tp; ++t)
         for (int j = 0; j < cg; ++j)
@@ -223,23 +216,16 @@ size_t HubertEngine::run(const float* waveform, size_t n) {
                 (src >= P && src < P + T)
                     ? x_[(src - P) * hidden_ + static_cast<size_t>(g) * cg + j]
                     : 0.f;
-            const __fp16 h = static_cast<__fp16>(v);
-            std::memcpy(cols16_.data() +
-                            (static_cast<size_t>(g) * Tp + t) * KK +
-                             static_cast<size_t>(j) * K + kk,
-                        &h, sizeof h);
+            cols_[(static_cast<size_t>(t) * G * cg + static_cast<size_t>(g) * cg + j) * K +
+                  kk] = v;
           }
     pos_out_.resize(Tp * hidden_);
-    tmp_.resize(static_cast<size_t>(cg) * Tp);  // [cg, Tp] 通道主 gemm 直出中转
     for (int g = 0; g < G; ++g) {
-      const uint16_t* wg = pos_w16_.data() + static_cast<size_t>(g) * cg * cg * K;
-      kern::gemm_f16x_fmlal(wg, cols16_.data() + static_cast<size_t>(g) * Tp * KK,
-                            tmp_.data(), cg, Tp, KK);
-      // 通道主 [cg,Tp] → 行主 [Tp,hidden] 槽位(消费端布局)
-      for (size_t t = 0; t < Tp; ++t)
-        for (int i = 0; i < cg; ++i)
-          pos_out_[t * hidden_ + static_cast<size_t>(g) * cg + i] =
-              tmp_[static_cast<size_t>(i) * Tp + t];
+      const float* wg = pos_w_.data() + static_cast<size_t>(g) * cg * cg * K;
+      accel::sgemm('N', 'T', static_cast<int>(Tp), cg, cg * K, 1.0f,
+                   cols_.data() + static_cast<size_t>(g) * cg * K,
+                   static_cast<int>(G) * cg * K, wg, static_cast<int>(cg * K), 0.0f,
+                   pos_out_.data() + static_cast<size_t>(g) * cg, hidden_);
     }
     // conv bias(逐输出通道)
     for (size_t t = 0; t < Tp; ++t)
@@ -267,9 +253,9 @@ size_t HubertEngine::run(const float* waveform, size_t n) {
     float* qp = qkv_.data();
     float* kp = qp + T * hidden_;
     float* vp = kp + T * hidden_;
-    L.q.w.forward(x_.data(), T, qp, xh_);
-    L.k.w.forward(x_.data(), T, kp, xh_);
-    L.v.w.forward(x_.data(), T, vp, xh_);
+    L.q.w.forward(x_.data(), T, qp);
+    L.k.w.forward(x_.data(), T, kp);
+    L.v.w.forward(x_.data(), T, vp);
     for (size_t t = 0; t < T; ++t) {
       for (int i = 0; i < hidden_; ++i) {
         qp[t * hidden_ + i] += L.q.b[static_cast<size_t>(i)];
@@ -299,7 +285,7 @@ size_t HubertEngine::run(const float* waveform, size_t n) {
     }
     // out proj + 残差 + post-LN
     resid_ = x_;                                   // attn_residual
-    L.o.w.forward(att_.data(), T, x_.data(), xh_);
+    L.o.w.forward(att_.data(), T, x_.data());
     for (size_t i = 0; i < T * hidden_; ++i) x_[i] += L.o.b[i % hidden_];
     if (l == 0) cap_l0attn_.assign(x_.begin(), x_.begin() + static_cast<long>(T * hidden_));
     for (size_t i = 0; i < T * hidden_; ++i) x_[i] += resid_[i];
@@ -309,11 +295,11 @@ size_t HubertEngine::run(const float* waveform, size_t n) {
     if (l == 0) cap_l0ln1_ = x_;
     // FFN(GELU) + 残差 + final LN
     ff_.resize(T * inter_);
-    L.f1.w.forward(x_.data(), T, ff_.data(), xh_);
+    L.f1.w.forward(x_.data(), T, ff_.data());
     for (size_t i = 0; i < T * inter_; ++i) ff_[i] += L.f1.b[i % inter_];
     gelu(ff_.data(), ff_.size());
     resid_ = x_;
-    L.f2.w.forward(ff_.data(), T, x_.data(), xh_);
+    L.f2.w.forward(ff_.data(), T, x_.data());
     for (size_t i = 0; i < T * hidden_; ++i) x_[i] += L.f2.b[i % hidden_];
     if (l == 0) cap_l0ffn_.assign(x_.begin(), x_.begin() + static_cast<long>(T * hidden_));
     for (size_t i = 0; i < T * hidden_; ++i) x_[i] += resid_[i];

@@ -45,26 +45,3 @@ target_compile_definitions(c1_run PRIVATE
   GSV_WEIGHTS_DIR="${GSV_WEIGHTS_DIR}"
   C1_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/local/c1_fixtures")
 target_link_libraries(c1_run PRIVATE gsv_encoder)
-
-# ---- task/E2-ENC: fp16 化验收 harness(本地跨分支对照用, 不注册 ctest) ----
-add_executable(e2_enc_dump local/e2_enc_dump.cpp)
-target_link_libraries(e2_enc_dump PRIVATE gsv_rt gsv_kern gsv_encoder)
-
-add_executable(e2_hub_layers local/e2_hub_layers.cpp)
-target_link_libraries(e2_hub_layers PRIVATE gsv_rt gsv_kern gsv_encoder)
-
-add_executable(e2_sv_layers local/e2_sv_layers.cpp)
-target_link_libraries(e2_sv_layers PRIVATE gsv_rt gsv_kern gsv_encoder)
-
-# c2_pairs_run(全链路 phones/tokens 与 pairs golden 对照; 需 data/weights)
-add_executable(c2_pairs_run local/c2_pairs_run.cpp)
-target_sources(c2_pairs_run PRIVATE ${CMAKE_SOURCE_DIR}/src/runtime/pipeline.cpp
-  ${CMAKE_SOURCE_DIR}/src/runtime/pipeline_condition.cpp)
-target_link_libraries(c2_pairs_run PRIVATE gsv_rt gsv_kern gsv_ar gsv_encoder
-gsv_textfront gsv_sovits)
-
-add_executable(e2_g2pw_all local/e2_g2pw_all.cpp)
-target_link_libraries(e2_g2pw_all PRIVATE gsv_rt gsv_kern gsv_textfront)
-
-add_executable(e2_bench local/e2_bench.cpp)
-target_link_libraries(e2_bench PRIVATE gsv_rt gsv_kern gsv_encoder)

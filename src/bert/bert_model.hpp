@@ -18,19 +18,17 @@ struct BertConfig {
 
 struct BertModel {
   BertConfig cfg;
-  // Embedding 查表(非 matmul): fp32 常驻(word 21128×1024=86MB; pos/type 极小)
-  std::vector<float> word_emb_w, pos_emb_w, type_emb_w;
+  Linear word_emb, pos_emb, type_emb;  // 仅用 w (查表)
   LayerNorm1D emb_ln;
   std::vector<BertLayer> stack;
 
   void load(const rt::GsvFile& f, const std::string& pfx = "bert") {
     const size_t C = cfg.hidden;
-    load_tensor_f32(f, pfx + ".embeddings.word_embeddings.weight", word_emb_w,
-                    {cfg.vocab, C});
-    load_tensor_f32(f, pfx + ".embeddings.position_embeddings.weight", pos_emb_w,
-                    {cfg.max_pos, C});
-    load_tensor_f32(f, pfx + ".embeddings.token_type_embeddings.weight", type_emb_w,
-                    {cfg.type_vocab, C});
+    word_emb.load(f, pfx + ".embeddings.word_embeddings", cfg.vocab, C, false);
+    pos_emb.load(f, pfx + ".embeddings.position_embeddings", cfg.max_pos, C,
+                 false);
+    type_emb.load(f, pfx + ".embeddings.token_type_embeddings",
+                  cfg.type_vocab, C, false);
     emb_ln.load(f, pfx + ".embeddings.LayerNorm", C, cfg.ln_eps);
     stack.resize(cfg.layers);
     for (size_t i = 0; i < cfg.layers; ++i)
@@ -51,16 +49,15 @@ struct BertModel {
     x.reset(T, C);
     for (size_t t = 0; t < T; ++t)
       for (size_t c = 0; c < C; ++c)
-        x.d[t * C + c] = word_emb_w[size_t(ids[t]) * C + c] +
-                         pos_emb_w[t * C + c] +
-                         type_emb_w[size_t(tt[t]) * C + c];
+        x.d[t * C + c] = word_emb.w[size_t(ids[t]) * C + c] +
+                         pos_emb.w[t * C + c] +
+                         type_emb.w[size_t(tt[t]) * C + c];
     emb_ln.forward(x);
     dm.dump("bert_emb_out", x);
 
     Matrix y, scr, ctxh;
-    std::vector<uint16_t> xh;  // fp16 激活暂存(跨层复用)
     for (size_t i = 0; i < cfg.layers; ++i) {
-      stack[i].forward(x, ext, y, scr, ctxh, xh);
+      stack[i].forward(x, ext, y, scr, ctxh);
       x.d.swap(y.d);
       if (i == 0) dm.dump("bert_layer0_out", x);
       if (i == cfg.layers - 3) dm.dump("bert_layer_m3_out", x);  // hidden_states[-3]

@@ -1,9 +1,7 @@
-// sv.cpp — ERes2NetV2 推理实现(E2-ENC fp16 化: 权重 fp16 直读 + FMLAL 矩阵乘,
-// LayerNorm/BN/残差/统计量保持 fp32; 激活转 fp16 暂存复用 scratch)
+// sv.cpp — ERes2NetV2 推理实现(逐算子对照 CPUFast; fp16 权重无损升位, 计算全 fp32)
 #include "encoder/sv.hpp"
 
 #include "kern/accel.hpp"
-#include "kern/gemv_fmlal.hpp"
 #include "kern/kern.hpp"
 #include "runtime/gsv_loader.hpp"
 
@@ -44,19 +42,8 @@ SvEngine::Bn load_bn(const GsvFile& f, const std::string& p) {
   return bn;
 }
 
-// 卷积/AFF 权重: 优先 f16 段零拷贝直读; 无 f16 段的小权重(fp32 段存储, 如
-// local_att.3) 一次性量化到 own 常驻副本(fp16, 内存减半) —— 前向仍全 FMLAL。
-const uint16_t* load_conv_w(const GsvFile& f, const std::string& name,
-                           std::vector<uint16_t>* own = nullptr) {
-  const TensorView* t = f.tensor(name);
-  if (!t) throw std::runtime_error("sv 缺张量: " + name);
-  if (t->has_f16()) return t->data_f16_raw();
-  if (!own) throw std::runtime_error("sv conv 权重无 f16 段且未提供量化副本槽: " + name);
-  own->resize(t->numel());
-  std::vector<float> wf(t->numel());
-  std::memcpy(wf.data(), t->data_f32(), wf.size() * sizeof(float));
-  kern::f32_to_f16(wf.data(), own->data(), wf.size());
-  return own->data();
+std::vector<float> load_conv_w(const GsvFile& f, const std::string& name) {
+  return vec_any(f, name);
 }
 
 }  // namespace
@@ -103,62 +90,28 @@ void SvEngine::conv2d(const float* in, int c_in, int h, int w, const float* wt,
                0.0f, out.data(), static_cast<int>(S));
 }
 
-// fp16 直读版 conv2d: im2col 量化到 cols16_(fp16) + gemm_f16x_fmlal
-// (out[c_out,S] = W[c_out,K]·cols[S,K]ᵀ, FMLAL 融合 fp32 累加; 通道主输出)
-void SvEngine::conv2d_f16(const float* in, int c_in, int h, int w, const uint16_t* w16,
-                         int c_out, int kh, int kw, int stride, int pad,
-                         std::vector<float>& /*cols_unused*/,
-                         std::vector<float>& out) {
-  const int oh = (h + 2 * pad - kh) / stride + 1;
-  const int ow = (w + 2 * pad - kw) / stride + 1;
-  const size_t S = static_cast<size_t>(oh) * ow;
-  const size_t K = static_cast<size_t>(c_in) * kh * kw;
-  cols16_.resize(S * K);
-  for (int oy = 0; oy < oh; ++oy)
-    for (int ox = 0; ox < ow; ++ox) {
-      uint16_t* row = cols16_.data() + (static_cast<size_t>(oy) * ow + ox) * K;
-      for (int c = 0; c < c_in; ++c)
-        for (int ky = 0; ky < kh; ++ky)
-          for (int kx = 0; kx < kw; ++kx) {
-            const int iy = oy * stride - pad + ky;
-            const int ix = ox * stride - pad + kx;
-            const __fp16 hv =
-                (iy >= 0 && iy < h && ix >= 0 && ix < w)
-                    ? static_cast<__fp16>(
-                          in[(static_cast<size_t>(c) * h + iy) * w + ix])
-                    : __fp16(0);
-            std::memcpy(row + (static_cast<size_t>(c) * kh + ky) * kw + kx, &hv,
-                        sizeof hv);
-          }
-    }
-  out.assign(static_cast<size_t>(c_out) * S, 0.f);
-  kern::gemm_f16x_fmlal(w16, cols16_.data(), out.data(), static_cast<size_t>(c_out),
-                        S, K);
-}
-
 // ---- Aff(fusion.AFF): xo = x*(1+tanh(att)) + ds*(1-tanh(att)) ----
-void SvEngine::Aff::apply(const float* x, const float* ds, float* out, int h, int w,
-                           std::vector<uint16_t>& xh, std::vector<uint16_t>& xh2) {
+void SvEngine::Aff::apply(const float* x, const float* ds, float* out, int h, int w) {
   const size_t s = static_cast<size_t>(h) * w;
 #ifdef C1_TRACE
-  std::fprintf(stderr, "    [aff ch=%d inter=%d s=%zu w1=%p w2=%p bn1=%zu/%zu bn2=%zu/%zu]\n",
-               ch, inter, s, (const void*)w1, (const void*)w2, bn1.g.size(), bn1.var.size(),
-               bn2.g.size(), bn2.var.size());
+  std::fprintf(stderr, "    [aff ch=%d inter=%d s=%zu w1=%zu w2=%zu bn1=%zu/%zu bn2=%zu/%zu ptr=%p/%p]\n",
+               ch, inter, s, w1.size(), w2.size(), bn1.g.size(), bn1.var.size(),
+               bn2.g.size(), bn2.var.size(), (const void*)w1.data(), (const void*)w2.data());
 #endif
   cat_.resize(2 * static_cast<size_t>(ch) * s);
   std::memcpy(cat_.data(), x, static_cast<size_t>(ch) * s * sizeof(float));
   std::memcpy(cat_.data() + static_cast<size_t>(ch) * s, ds,
               static_cast<size_t>(ch) * s * sizeof(float));
   att_.resize(static_cast<size_t>(inter) * s);
-  // gemm1: att[inter,S] = W1[inter,2ch]·cat[2ch,S]。收缩维 2ch 在 cat 行向 ——
-  // 转置量化 cat→[S,2ch]fp16 后 gemm(A=W1, B=catᵀ) 直接得通道主 att[inter,S]。
-  if (xh.size() < 2 * static_cast<size_t>(ch) * s) xh.resize(2 * static_cast<size_t>(ch) * s);
-  kern::f32_trans_to_f16(cat_.data(), xh.data(), 2 * ch, s);
-  kern::gemm_f16x_fmlal(w1, xh.data(), att_.data(),
-                        static_cast<size_t>(inter), s,
-                        2 * static_cast<size_t>(ch));
 #ifdef C1_TRACE
-  std::fprintf(stderr, "    [aff gemm1 done]\n");
+  std::fprintf(stderr, "    [aff gemm1]\n");
+#endif
+  // cat_ 是通道主 [2ch,S] → 'N','N'
+  accel::sgemm('N', 'N', inter, static_cast<int>(s), 2 * ch, 1.0f, w1.data(), 2 * ch,
+               cat_.data(), static_cast<int>(s), 0.0f, att_.data(),
+               static_cast<int>(s));
+#ifdef C1_TRACE
+  std::fprintf(stderr, "    [aff gemm1 done] att[0]=%.5f att[1]=%.5f\n", att_[0], att_[1]);
 #endif
   for (int e = 0; e < inter; ++e) {
     float* row = att_.data() + static_cast<size_t>(e) * s;
@@ -168,14 +121,15 @@ void SvEngine::Aff::apply(const float* x, const float* ds, float* out, int h, in
   bn1.apply(att_.data(), inter, s);
   gsv::kern::silu(att_.data(), att_.data(), att_.size());
   att_t_.resize(static_cast<size_t>(ch) * s);
-  // gemm2 同构: att_t[ch,S] = W2[ch,inter]·att[inter,S] → 转置量化 + gemm 直出通道主
-  if (xh2.size() < static_cast<size_t>(inter) * s) xh2.resize(static_cast<size_t>(inter) * s);
-  kern::f32_trans_to_f16(att_.data(), xh2.data(), inter, s);  // [inter,S]→[S,inter]fp16
-  kern::gemm_f16x_fmlal(w2, xh2.data(), att_t_.data(),
-                        static_cast<size_t>(ch), s,
-                        static_cast<size_t>(inter));
 #ifdef C1_TRACE
-  std::fprintf(stderr, "    [aff gemm2 done]\n");
+  std::fprintf(stderr, "    [aff gemm2]\n");
+#endif
+  // att_ 此时是 [inter, s] 通道主(gemm1 输出), 故第二支路是 'N','N'
+  accel::sgemm('N', 'N', ch, static_cast<int>(s), inter, 1.0f, w2.data(), inter,
+               att_.data(), static_cast<int>(s), 0.0f, att_t_.data(),
+               static_cast<int>(s));
+#ifdef C1_TRACE
+  std::fprintf(stderr, "    [aff bn2]\n");
 #endif
   for (int e = 0; e < ch; ++e) {
     float* row = att_t_.data() + static_cast<size_t>(e) * s;
@@ -202,19 +156,13 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
   // 注意: in 可能就是 eng.tmp_(调用方把主缓冲喂进来) —— 必须写入另一缓冲防别名。
   int h = h_in, w = w_in;
   if (stride == 1) {
-    // 1x1 s1: 零 im2col。in 通道主 [c_in,S] → 转置量化 xh_[S,c_in];
-    // gemm(A=W[co1,c_in], B=xh) 直接得通道主 nxt_[co1,S] —— 不经 tmp_
-    // (in 可能别名 eng.tmp_, 不得写回)。
+    // in 与 W 都是通道主([c_in,S] / [co1,c_in]) → 直接 'N','N', 零 im2col
     const size_t s = static_cast<size_t>(h) * w;
-    if (eng.xh_.size() < static_cast<size_t>(c_in) * s)
-      eng.xh_.resize(static_cast<size_t>(c_in) * s);
-    kern::f32_trans_to_f16(in, eng.xh_.data(), c_in, s);
     eng.nxt_.resize(static_cast<size_t>(co1) * s);
-    kern::gemm_f16x_fmlal(conv1_w, eng.xh_.data(), eng.nxt_.data(),
-                          static_cast<size_t>(co1), s,
-                          static_cast<size_t>(c_in));
+    accel::sgemm('N', 'N', co1, static_cast<int>(s), c_in, 1.0f, conv1_w.data(), c_in,
+                 in, static_cast<int>(s), 0.0f, eng.nxt_.data(), static_cast<int>(s));
   } else {
-    eng.conv2d_f16(in, c_in, h, w, conv1_w, co1, 1, 1, stride, 0, eng.cols_, eng.nxt_);
+    conv2d(in, c_in, h, w, conv1_w.data(), co1, 1, 1, stride, 0, eng.cols_, eng.nxt_);
     h = (h - 1) / stride + 1;
     w = (w - 1) / stride + 1;
   }
@@ -241,16 +189,16 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
       if (aff) std::fprintf(stderr, "  [fuse i=%d]\n", i);
 #endif
       if (aff) {
-        fuses[static_cast<size_t>(i - 1)].apply(sp.data(), chunk(i), fus.data(), h, w,
-                                               eng.xh_, eng.xh2_);
+        fuses[static_cast<size_t>(i - 1)].apply(sp.data(), chunk(i), fus.data(), h, w);
         std::memcpy(sp.data(), fus.data(), sp.size() * sizeof(float));
       } else {
         for (size_t j = 0; j < sp.size(); ++j) sp[j] += chunk(i)[j];
       }
     }
     // convs[i](3x3 p1 s1) + bns + ReLU20 → 拼接槽位 i
-    eng.conv2d_f16(i == 0 ? chunk(0) : sp.data(), width, h, w, convs_w[static_cast<size_t>(i)],
-                   width, 3, 3, 1, 1, eng.cols_, eng.nxt_);
+    conv2d(i == 0 ? chunk(0) : sp.data(), width, h, w,
+           convs_w[static_cast<size_t>(i)].data(), width, 3, 3, 1, 1, eng.cols_,
+           eng.nxt_);
     bns[static_cast<size_t>(i)].apply(eng.nxt_.data(), width, s);
     for (float& v : eng.nxt_) v = relu20(v);
     std::memcpy(eng.tmp2_.data() + static_cast<size_t>(i) * width * s, eng.nxt_.data(),
@@ -259,8 +207,8 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
   }
 
   // conv3(k1) + bn3
-  eng.conv2d_f16(eng.tmp2_.data(), co1, h, w, conv3_w, exp_planes, 1, 1, 1, 0,
-                 eng.cols_, eng.nxt_);
+  conv2d(eng.tmp2_.data(), co1, h, w, conv3_w.data(), exp_planes, 1, 1, 1, 0,
+         eng.cols_, eng.nxt_);
   bn3.apply(eng.nxt_.data(), exp_planes, s);
 
 #ifdef C1_TRACE
@@ -270,8 +218,8 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
   if (!has_shortcut) {
     for (size_t j = 0; j < eng.nxt_.size(); ++j) eng.nxt_[j] += in[j];
   } else {
-    eng.conv2d_f16(in, c_in, h_in, w_in, sc_w, exp_planes, 1, 1, stride, 0, eng.cols_,
-                   eng.tmp_);
+    conv2d(in, c_in, h_in, w_in, sc_w.data(), exp_planes, 1, 1, stride, 0, eng.cols_,
+           eng.tmp_);
     sc_bn.apply(eng.tmp_.data(), exp_planes, s);
     for (size_t j = 0; j < eng.nxt_.size(); ++j) eng.nxt_[j] += eng.tmp_[j];
   }
@@ -317,7 +265,7 @@ void SvEngine::load_block(int l, int i, bool expect_aff) {
           f_->tensor((fp + "0.weight").c_str())->dims[0]);  // [inter, 2*width,1,1]
       a.ch = blk.width;
       a.w1 = load_conv_w(*f_, fp + "0.weight");
-      a.w2 = load_conv_w(*f_, fp + "3.weight", &a.w2_own);  // 可能无 f16 段→量化副本
+      a.w2 = load_conv_w(*f_, fp + "3.weight");
       a.b1 = vec_any(*f_, fp + "0.bias");   // Conv2d 默认 bias=True!
       a.b2 = vec_any(*f_, fp + "3.bias");
       a.bn1 = load_bn(*f_, fp + "1");
@@ -333,7 +281,7 @@ void SvEngine::load_block(int l, int i, bool expect_aff) {
 }
 
 SvEngine::SvEngine(const GsvFile& f) : f_(&f) {
-  conv1_w_ = vec_any(f, "conv1.weight");  // stem conv: fp32 常驻(仅 576 参, 无 f16 段)
+  conv1_w_ = load_conv_w(f, "conv1.weight");
   bn1_ = load_bn(f, "bn1");
 
   struct StageDef {
@@ -357,7 +305,7 @@ SvEngine::SvEngine(const GsvFile& f) : f_(&f) {
   fuse34_.ch =
       static_cast<int>(f.tensor("fuse34.local_att.3.weight")->dims[0]);  // 2048
   fuse34_.w1 = load_conv_w(f, "fuse34.local_att.0.weight");
-  fuse34_.w2 = load_conv_w(f, "fuse34.local_att.3.weight", &fuse34_.w2_own);
+  fuse34_.w2 = load_conv_w(f, "fuse34.local_att.3.weight");
   fuse34_.b1 = vec_any(f, "fuse34.local_att.0.bias");
   fuse34_.b2 = vec_any(f, "fuse34.local_att.3.bias");
   fuse34_.bn1 = load_bn(f, "fuse34.local_att.1");
@@ -410,13 +358,13 @@ size_t SvEngine::forward3(const float* fbk, size_t frames) {
     }
   }
 
-  // layer3_ds(1024→2048, k3, s2, p1) 作用在 layer3 输出上(fp16 直读)
-  conv2d_f16(o_layer_[3].data(), c_after_[3], h3, w3, l3ds_w_, c_after_[4], 3, 3, 2,
+  // layer3_ds(1024→2048, k3, s2, p1) 作用在 layer3 输出上
+  conv2d(o_layer_[3].data(), c_after_[3], h3, w3, l3ds_w_.data(), c_after_[4], 3, 3, 2,
          1, cols_, ds_);
 
   // fuse34(AFF) on (layer4 输出, ds)
   o_fuse_.resize(ds_.size());
-  fuse34_.apply(tmp_.data(), ds_.data(), o_fuse_.data(), h, w, xh_, xh2_);
+  fuse34_.apply(tmp_.data(), ds_.data(), o_fuse_.data(), h, w);
 
   // flatten(C×F) → mean over T
   const int C = c_after_[4];  // 2048

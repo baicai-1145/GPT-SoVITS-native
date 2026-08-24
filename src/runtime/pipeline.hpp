@@ -152,9 +152,6 @@ class Pipeline {
   std::unique_ptr<sovits::SovitsEngine> sovits_;
   std::unique_ptr<encoder::HubertEngine> hubert_;
   std::unique_ptr<encoder::SvEngine> sv_;
-  // E2-ENC: fp16 直读视图(Linear/DenseF16/conv w16 指向 mmap)要求 GsvFile
-  // 生命周期覆盖引擎 —— 由 Pipeline 持有(析构顺序: 引擎先于文件, 成员倒序✓)
-  std::unique_ptr<rt::GsvFile> fBert_, fAr_, fSov_, fHub_, fSv_;
   ConditionBuilder cond_;
   encoder::RefCache refCache_{"c2cond-v2"};  // v2: ssl_proj stride-2 口径
   std::string weightsDir_;
