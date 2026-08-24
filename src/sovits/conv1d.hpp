@@ -64,7 +64,16 @@ class Conv1d {
 #if defined(GSV_AMX_GEMM)
     // 预打包: k>1 大块 + k==1 点积形 (E6: 直写 panel 后 k==1 也反超 sgemm)
     if (amx_enabled() && out_c >= kAmxMinOutC) {
-      panel_ = kern::amx_pack(w_f16.data(), out_c, in_c * k);
+      // bias 折叠: 权重增广末列 = b[o] (f16), 配合激活 ones 列
+      const size_t Kw2 = in_c * k;
+      std::vector<uint16_t> wa(out_c * (Kw2 + 1));
+      for (size_t oo = 0; oo < out_c; ++oo) {
+        for (size_t pp = 0; pp < Kw2; ++pp)
+          wa[oo * (Kw2 + 1) + pp] = w_f16[oo * Kw2 + pp];
+        wa[oo * (Kw2 + 1) + Kw2] =
+            f16_round(oo < b.size() ? b[oo] : 0.f);
+      }
+      panel_ = kern::amx_pack(wa.data(), out_c, Kw2 + 1);
       has_panel_ = true;
     }
 #endif
@@ -95,11 +104,12 @@ class Conv1d {
       thread_local std::vector<uint8_t> act_panel;
       const bool prof = sov_timing_enabled();
       const double tp0 = prof ? now_ms_e6() : 0.0;
-      im2col_to_panel_f16(x.d.data(), in_c, T, k, dilation, act_panel);
+      im2col_to_panel_f16(x.d.data(), in_c, T, k, dilation, act_panel,
+                          /*append_ones_col=*/true);
       if (prof) g_conv_split().prep += now_ms_e6() - tp0;
       kern::AmxPanel pb;
       pb.rows = T;
-      pb.K = K;
+      pb.K = K + 1;
       pb.buf = std::move(act_panel);
       const double tg0 = prof ? now_ms_e6() : 0.0;
       kern::gemm_f16_amx_pp(panel_, pb, y.d.data(), out_c, T);
@@ -107,8 +117,7 @@ class Conv1d {
         g_conv_split().gemm += now_ms_e6() - tg0;
         ++g_conv_split().n;
       }
-      add_bias(y);
-      return;
+      return;  // bias 已折叠进 GEMM
     }
     // k==1 点积形: 同一直写布局 (k=1 退化为 cast_transpose→panel)
     if (has_panel_ && k == 1 && dilation == 1 &&
@@ -119,11 +128,12 @@ class Conv1d {
       y.d.resize(out_c * T);
       thread_local std::vector<uint8_t> act_panel;
       const double tp1 = prof ? now_ms_e6() : 0.0;
-      im2col_to_panel_f16(x.d.data(), in_c, T, 1, 1, act_panel);
+      im2col_to_panel_f16(x.d.data(), in_c, T, 1, 1, act_panel,
+                          /*append_ones_col=*/true);
       if (prof) g_conv_split().prep += now_ms_e6() - tp1;
       kern::AmxPanel pb;
       pb.rows = T;
-      pb.K = K;
+      pb.K = K + 1;
       pb.buf = std::move(act_panel);
       const double tg1 = prof ? now_ms_e6() : 0.0;
       kern::gemm_f16_amx_pp(panel_, pb, y.d.data(), out_c, T);
@@ -131,8 +141,7 @@ class Conv1d {
         g_conv_split().gemm += now_ms_e6() - tg1;
         ++g_conv_split().n;
       }
-      add_bias(y);
-      return;
+      return;  // bias 已折叠进 GEMM
     }
 #endif
     // ---- sgemm 升位路径 (回退安全: 无 AMX/--amx 关/GEMV 形) ----

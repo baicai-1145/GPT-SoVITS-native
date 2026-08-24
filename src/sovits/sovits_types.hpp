@@ -177,8 +177,11 @@ inline void im2col_cast_transpose_f16(const float* x, size_t C, size_t T,
 // 内层 4 行×4 列转置后整 8B 写一行内 4 个行槽 — 与 pack NEON 路径同构。
 inline void im2col_to_panel_f16(const float* x, size_t C, size_t T,
                                 size_t k, size_t dil,
-                                std::vector<uint8_t>& out) {
-  const size_t K = C * k;
+                                std::vector<uint8_t>& out,
+                                bool append_ones_col = false) {
+  // Kp1 > K 时末列全 1.0, 配合权重增广列实现 bias 折叠进 GEMM
+  const size_t K = C * k + (append_ones_col ? 1 : 0);
+  const size_t Kw = C * k;
   const size_t nt = (T + 31) / 32;
   // 免全量 memset (容量复用): 仅尾块未用行在写入后单独补零
   out.resize(nt * K * 64 + 64);
@@ -193,6 +196,7 @@ inline void im2col_to_panel_f16(const float* x, size_t C, size_t T,
     uint16_t* drow = reinterpret_cast<uint16_t*>(dst + (t / 32) * K * 64 +
                                                  (t % 32) * 2);
     const long s0 = static_cast<long>(t) - pad_l;
+    if (append_ones_col) drow[Kw * 32] = 0x3C00;
     for (size_t c = 0; c < C; ++c) {
       uint16_t* dp = drow + c * k * 32;
       for (long kk = 0; kk < static_cast<long>(k); ++kk) {
@@ -221,6 +225,8 @@ inline void im2col_to_panel_f16(const float* x, size_t C, size_t T,
         continue;
       }
       uint8_t* d = dst + (t / 32) * K * 64 + (t % 32) * 2;
+      if (append_ones_col)
+        reinterpret_cast<uint16_t*>(d + Kw * 64)[t % 32] = 0x3C00;  // f16 1.0
       for (size_t c = 0; c < C; ++c) {
         // 相邻时间步窗口: 同通道内偏移 +1 (非 +T!)
         const float* w[8];
