@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <chrono>
+#include <cstdlib>
 #include <cstdio>
 #include <sys/stat.h>
 #include <string>
@@ -175,10 +177,14 @@ inline void im2col_cast_transpose_f16(const float* x, size_t C, size_t T,
 // 内层 4 行×4 列转置后整 8B 写一行内 4 个行槽 — 与 pack NEON 路径同构。
 inline void im2col_to_panel_f16(const float* x, size_t C, size_t T,
                                 size_t k, size_t dil,
-                                std::vector<uint8_t>& out) {
-  const size_t K = C * k;
+                                std::vector<uint8_t>& out,
+                                bool append_ones_col = false) {
+  // Kp1 > K 时末列全 1.0, 配合权重增广列实现 bias 折叠进 GEMM
+  const size_t K = C * k + (append_ones_col ? 1 : 0);
+  const size_t Kw = C * k;
   const size_t nt = (T + 31) / 32;
-  out.assign(nt * K * 64 + 64, 0);
+  // 免全量 memset (容量复用): 仅尾块未用行在写入后单独补零
+  out.resize(nt * K * 64 + 64);
   const uintptr_t pbase = (uintptr_t)out.data();
   uint8_t* dst = out.data() + ((64 - (pbase & 63)) & 63);
   const long pad_l = static_cast<long>((k - 1) * dil) / 2;
@@ -190,6 +196,7 @@ inline void im2col_to_panel_f16(const float* x, size_t C, size_t T,
     uint16_t* drow = reinterpret_cast<uint16_t*>(dst + (t / 32) * K * 64 +
                                                  (t % 32) * 2);
     const long s0 = static_cast<long>(t) - pad_l;
+    if (append_ones_col) drow[Kw * 32] = 0x3C00;
     for (size_t c = 0; c < C; ++c) {
       uint16_t* dp = drow + c * k * 32;
       for (long kk = 0; kk < static_cast<long>(k); ++kk) {
@@ -201,63 +208,72 @@ inline void im2col_to_panel_f16(const float* x, size_t C, size_t T,
   };
   if (dil != 1) {
     for (size_t t = 0; t < T; ++t) write_row_scalar(t);
-    return;
-  }
-  size_t t = 0;
-  // 4 行一组 (仅在完整窗口且不跨 tile 边界时走快径)
-  for (; t + 4 <= T; ) {
-    bool ok = ((t % 32) + 4 <= 32);
-    if (ok) {
-      const long s_lo = static_cast<long>(t) - pad_l;
-      const long s_hi = static_cast<long>(t + 3) - pad_l + static_cast<long>(k);
-      ok = (s_lo >= 0) && (s_hi <= static_cast<long>(T));
-    }
-    if (!ok) {
-      write_row_scalar(t);
-      ++t;
-      continue;
-    }
-    uint8_t* d = dst + (t / 32) * K * 64 + (t % 32) * 2;
-    for (size_t c = 0; c < C; ++c) {
-      // 相邻时间步窗口: 同通道内偏移 +1 (非 +T!)
-      const float* w0 = x + c * T + (t - pad_l);
-      const float* w1 = w0 + 1;
-      const float* w2 = w0 + 2;
-      const float* w3 = w0 + 3;
-      uint16_t* dp = reinterpret_cast<uint16_t*>(d) + c * k * 32;
-      long i = 0;
-      for (; i + 4 <= static_cast<long>(k); i += 4) {
-        const float16x4_t x0 = vcvt_f16_f32(vld1q_f32(w0 + i));
-        const float16x4_t x1 = vcvt_f16_f32(vld1q_f32(w1 + i));
-        const float16x4_t x2 = vcvt_f16_f32(vld1q_f32(w2 + i));
-        const float16x4_t x3 = vcvt_f16_f32(vld1q_f32(w3 + i));
-        float16x4_t o0, o1, o2, o3;
-        const float16x4x2_t a01 = vtrn_f16(x0, x1);
-        const float16x4x2_t a23 = vtrn_f16(x2, x3);
-        const float32x2x2_t b0 = vtrn_f32(
-            vreinterpret_f32_f16(a01.val[0]), vreinterpret_f32_f16(a23.val[0]));
-        const float32x2x2_t b1 = vtrn_f32(
-            vreinterpret_f32_f16(a01.val[1]), vreinterpret_f32_f16(a23.val[1]));
-        o0 = vreinterpret_f16_f32(b0.val[0]);
-        o1 = vreinterpret_f16_f32(b1.val[0]);
-        o2 = vreinterpret_f16_f32(b0.val[1]);
-        o3 = vreinterpret_f16_f32(b1.val[1]);
-        // o_j = [row0..row3 @ col i+j] → 线 p=(c*k+i+j) 的字节 [rr*2,+8)
-        vst1_f16(reinterpret_cast<__fp16*>(dp + (i + 0) * 32), o0);
-        vst1_f16(reinterpret_cast<__fp16*>(dp + (i + 1) * 32), o1);
-        vst1_f16(reinterpret_cast<__fp16*>(dp + (i + 2) * 32), o2);
-        vst1_f16(reinterpret_cast<__fp16*>(dp + (i + 3) * 32), o3);
+  } else {
+    size_t t = 0;
+    // 8 行一组快径: 完整窗口且不跨 tile; 每列 16B 宽存 (8 行 × f16)
+    for (; t + 8 <= T; ) {
+      bool ok = ((t % 32) + 8 <= 32);
+      if (ok) {
+        const long s_lo = static_cast<long>(t) - pad_l;
+        const long s_hi = static_cast<long>(t + 7) - pad_l +
+                          static_cast<long>(k);
+        ok = (s_lo >= 0) && (s_hi <= static_cast<long>(T));
       }
-      for (; i < static_cast<long>(k); ++i) {
-        dp[(i)*32 + 0] = f16_round(w0[i]);
-        dp[(i)*32 + 1] = f16_round(w1[i]);
-        dp[(i)*32 + 2] = f16_round(w2[i]);
-        dp[(i)*32 + 3] = f16_round(w3[i]);
+      if (!ok) {
+        write_row_scalar(t);
+        ++t;
+        continue;
       }
+      uint8_t* d = dst + (t / 32) * K * 64 + (t % 32) * 2;
+      if (append_ones_col)
+        reinterpret_cast<uint16_t*>(d + Kw * 64)[t % 32] = 0x3C00;  // f16 1.0
+      for (size_t c = 0; c < C; ++c) {
+        // 相邻时间步窗口: 同通道内偏移 +1 (非 +T!)
+        const float* w[8];
+        for (size_t r = 0; r < 8; ++r) w[r] = x + c * T + (t - pad_l) + r;
+        uint16_t* dp = reinterpret_cast<uint16_t*>(d) + c * k * 32;
+        long i = 0;
+        for (; i + 4 <= static_cast<long>(k); i += 4) {
+          // 两组 4x4 转置 → 列 j 的低/高半各 4 行 → 拼 16B 宽存
+          float16x4_t lo4[4], hi4[4];
+          for (size_t g = 0; g < 2; ++g) {
+            const float16x4_t x0 = vcvt_f16_f32(vld1q_f32(w[g*4+0] + i));
+            const float16x4_t x1 = vcvt_f16_f32(vld1q_f32(w[g*4+1] + i));
+            const float16x4_t x2 = vcvt_f16_f32(vld1q_f32(w[g*4+2] + i));
+            const float16x4_t x3 = vcvt_f16_f32(vld1q_f32(w[g*4+3] + i));
+            const float16x4x2_t a01 = vtrn_f16(x0, x1);
+            const float16x4x2_t a23 = vtrn_f16(x2, x3);
+            const float32x2x2_t b0 = vtrn_f32(
+                vreinterpret_f32_f16(a01.val[0]),
+                vreinterpret_f32_f16(a23.val[0]));
+            const float32x2x2_t b1 = vtrn_f32(
+                vreinterpret_f32_f16(a01.val[1]),
+                vreinterpret_f32_f16(a23.val[1]));
+            float16x4_t* dst4 = g == 0 ? lo4 : hi4;
+            dst4[0] = vreinterpret_f16_f32(b0.val[0]);
+            dst4[1] = vreinterpret_f16_f32(b1.val[0]);
+            dst4[2] = vreinterpret_f16_f32(b0.val[1]);
+            dst4[3] = vreinterpret_f16_f32(b1.val[1]);
+          }
+          for (size_t j = 0; j < 4; ++j)
+            vst1q_f16(reinterpret_cast<__fp16*>(dp + (i + j) * 32),
+                      vcombine_f16(lo4[j], hi4[j]));
+        }
+        for (; i < static_cast<long>(k); ++i)
+          for (size_t r = 0; r < 8; ++r)
+            dp[(i)*32 + r] = f16_round(w[r][i]);
+      }
+      t += 8;
     }
-    t += 4;
+    for (; t < T; ++t) write_row_scalar(t);
   }
-  for (; t < T; ++t) write_row_scalar(t);
+  // 尾块未用行补零 (AMX 会乘到垃圾; 中间块满 32 行无需处理)
+  const size_t tr = T - (nt - 1) * 32;
+  if (tr < 32) {
+    uint8_t* dlast = dst + (nt - 1) * K * 64;
+    for (size_t pcol = 0; pcol < K; ++pcol)
+      std::memset(dlast + pcol * 64 + tr * 2, 0, 64 - tr * 2);
+  }
 }
 
 inline void load_tensor_f32(const rt::GsvFile& f, std::string_view name,
@@ -270,6 +286,54 @@ inline void load_tensor_f32(const rt::GsvFile& f, std::string_view name,
 }
 
 // ---- debug dump: 与 tools/export_sovits_fixtures.py 同格式的 f32 raw + .shape ----
+
+
+// E6: conv 内部 prep(panel 构建)/GEMM 拆分累计 (画像专用)
+struct ConvSplit {
+  double prep = 0, gemm = 0;
+  size_t n = 0;
+  void reset() { *this = ConvSplit{}; }
+};
+inline ConvSplit& g_conv_split() {
+  static thread_local ConvSplit t;
+  return t;
+}
+// E6: 单调毫秒时钟 (画像用)
+inline double now_ms_e6() {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+// ---- E6: SoVITS 内部画像计时 (GSV_SOVITS_TIMING=1 时每次 run 后 stderr 汇总) ----
+// 计时始终累计 (开销 ~ns 级, 远小于阶段耗时); 报告与清零走 report_and_reset。
+struct StageTimers {
+  double quant = 0, upsample = 0, enc_p = 0, noise = 0, flow = 0, dec = 0;
+  // dec 内部分组
+  double dec_pre = 0, dec_cond = 0, dec_ups = 0, dec_res = 0, dec_post = 0;
+  // res 内部细分
+  double res_conv1 = 0, res_conv2 = 0, res_ew = 0;
+  size_t calls = 0;
+
+  void report_and_reset() {
+    std::fprintf(stderr,
+        "[sovits-timing] n=%zu quant=%.1f up=%.1f enc_p=%.1f noise=%.1f "
+        "flow=%.1f dec=%.1f | dec: pre=%.1f cond=%.1f ups=%.1f res=%.1f "
+        "post=%.1f | res: c1=%.1f c2=%.1f ew=%.1f ms\n",
+        calls, quant, upsample, enc_p, noise, flow, dec,
+        dec_pre, dec_cond, dec_ups, dec_res, dec_post,
+        res_conv1, res_conv2, res_ew);
+    *this = StageTimers{};
+  }
+};
+inline StageTimers& sov_timers() {
+  static thread_local StageTimers t;
+  return t;
+}
+inline bool sov_timing_enabled() {
+  static const bool b = std::getenv("GSV_SOVITS_TIMING") != nullptr;
+  return b;
+}
 class Dumper {
  public:
   void enable(std::string dir) {

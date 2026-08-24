@@ -73,22 +73,33 @@ class Generator {
   void forward(const Tensor2D& z, const Tensor2D& ge, Tensor2D& out,
                const Dumper& dm) const {
     const size_t gT = ge.T;
+    StageTimers& T = sov_timers();
+    const bool prof = sov_timing_enabled();
+    auto tic = [&] { return prof ? now_ms_e6() : 0.0; };
+    double t0;
     Tensor2D x;
+    t0 = tic();
     conv_pre.forward(z, x);
+    if (prof) T.dec_pre += now_ms_e6() - t0;
     dm.dump("dbg_dec_convpre", x);
     // x += cond(ge) (广播 gT==1)
+    t0 = tic();
     Tensor2D cb;
     cond.forward(ge, cb);  // [768, gT]
+    if (prof) T.dec_cond += now_ms_e6() - t0;
     dm.dump("dbg_dec_cond_out", cb);
     for (size_t c = 0; c < 768; ++c) {
       const float cv = cb.d[c * gT];
       for (size_t t = 0; t < x.T; ++t) x.d[c * x.T + t] += cv;
     }
 
-    Tensor2D xu, scratch, sum;
+    // E6: scratch 持久化 (thread_local) — 每 stage 重构造会反复 mmap/缺页零填
+    static thread_local Tensor2D xu, scratch, sum;
     for (size_t i = 0; i < kStages; ++i) {
       leaky_relu_io(x.d.data(), x.d.size(), 0.1f);
+      t0 = tic();
       ups[i].forward(x, xu, scratch);
+      if (prof) T.dec_ups += now_ms_e6() - t0;
       x.d.swap(xu.d);
       x.C = xu.C;
       x.T = xu.T;
@@ -99,39 +110,59 @@ class Generator {
       // torch: xs = Σ_j block_j(x) (块内三对串联卷积, 每对后残差相加,
       // 故 block_j 已含输入 x); x = xs / 3。
       constexpr float kInv = 1.f / static_cast<float>(kResKernels);
-      sum.reset(x.C, x.T);
-      Tensor2D cur, t_in, t_a, t_b;
+      t0 = tic();
+      // E6: 全覆写缓冲免零填 (resize-only), 拷贝走 memcpy
+      sum.C = x.C;
+      sum.T = x.T;
+      sum.d.resize(x.d.size());
+      static thread_local Tensor2D cur, t_in, t_a, t_b;
       bool first = true;
       for (size_t j = 0; j < kResKernels; ++j) {
         const ResBlock1& rb = resblocks[i][j];
-        cur.reset(x.C, x.T);
-        for (size_t k = 0; k < cur.d.size(); ++k) cur.d[k] = x.d[k];
+        cur.C = x.C;
+        cur.T = x.T;
+        cur.d.resize(x.d.size());
+        std::memcpy(cur.d.data(), x.d.data(), x.d.size() * sizeof(float));
         for (size_t jj = 0; jj < 3; ++jj) {
           // torch: xt=lrelu(x); xt=c1(xt); xt=lrelu(xt); xt=c2(xt); x=xt+x
           // (lrelu 不污染残差分支 — 用独立缓冲 t_in)
-          t_in.reset(cur.C, cur.T);
-          for (size_t k = 0; k < cur.d.size(); ++k)
-            t_in.d[k] = cur.d[k] < 0.f ? cur.d[k] * 0.1f : cur.d[k];
+          double te = tic();
+          t_in.C = cur.C;
+          t_in.T = cur.T;
+          t_in.d.resize(cur.d.size());
+          leaky_relu_write(cur.d.data(), t_in.d.data(), cur.d.size(), 0.1f);
+          if (prof) T.res_ew += now_ms_e6() - te;
+          t0 = tic();
           rb.convs1[jj].forward(t_in, t_a);
+          if (prof) T.res_conv1 += now_ms_e6() - t0;
+          te = tic();
           leaky_relu_io(t_a.d.data(), t_a.d.size(), 0.1f);
+          if (prof) T.res_ew += now_ms_e6() - te;
+          t0 = tic();
           rb.convs2[jj].forward(t_a, t_b);
-          for (size_t k = 0; k < cur.d.size(); ++k) cur.d[k] += t_b.d[k];
+          if (prof) T.res_conv2 += now_ms_e6() - t0;
+          te = tic();
+          add_inplace(cur.d.data(), t_b.d.data(), cur.d.size());
+          if (prof) T.res_ew += now_ms_e6() - te;
         }
         if (first) {
-          for (size_t k = 0; k < sum.d.size(); ++k) sum.d[k] = cur.d[k] * kInv;
+          mul_write(sum.d.data(), cur.d.data(), sum.d.size(), kInv);
           first = false;
         } else {
-          for (size_t k = 0; k < sum.d.size(); ++k) sum.d[k] += cur.d[k] * kInv;
+          add_scaled_inplace(sum.d.data(), cur.d.data(), sum.d.size(), kInv);
         }
       }
       x.d.swap(sum.d);
+      if (prof) T.dec_res += now_ms_e6() - t0;
       {
         std::string n = "dbg_dec_res" + std::to_string(i);
         dm.dump(n.c_str(), x);
       }
     }
     leaky_relu_io(x.d.data(), x.d.size(), 0.01f);  // F.leaky_relu 默认 slope
+    t0 = tic();
     conv_post.forward(x, out);
+    if (prof) T.dec_post += now_ms_e6() - t0;
     for (float& v : out.d) v = std::tanh(v);
   }
 };
