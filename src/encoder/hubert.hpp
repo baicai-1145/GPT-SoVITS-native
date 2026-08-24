@@ -17,6 +17,7 @@
 #pragma once
 
 #include "kern/accel.hpp"
+#include "kern/gemv_fmlal.hpp"
 
 #include <cstddef>
 #include <vector>
@@ -73,14 +74,16 @@ class HubertEngine {
   double ln_eps_ = 1e-5;
 
   struct ConvL {
-    std::vector<float> w;  // [out, in*k] im2col 布局
+    const uint16_t* w16 = nullptr;  // [out, in*k] fp16 直读
+    std::vector<float> w;           // 无 f16 段回退(不适用; 保留类型以防)
     bool has_gn = false;
     std::vector<float> gn_g, gn_b;
   };
   ConvL convs_[7];
   Dense proj_;
   std::vector<float> proj_ln_g_, proj_ln_b_;
-  std::vector<float> pos_w_;  // [H, H/G, K] fp32(weight_norm 融合产物)
+  std::vector<float> pos_w_;  // [H, H/G, K] fp32(weight_norm 融合产物, 源仅存 fp32 段)
+  std::vector<uint16_t> pos_w16_;  // 融合产物的一次性 fp16 量化副本(FMLAL 消费, 0.6MB)
   std::vector<float> pos_b_;  // [H] fp32(conv bias)
   std::vector<float> enc_ln_g_, enc_ln_b_;
 
@@ -89,6 +92,8 @@ class HubertEngine {
       ff_, resid_, smax_;
   std::vector<float> proj_o_, l0_, last_;
   size_t cnn_t_ = 0;
+  std::vector<uint16_t> xh_;      // fp16 激活暂存(DenseF16 view FMLAL 前向复用)
+  std::vector<uint16_t> cols16_;  // fp16 im2col 暂存(CNN/pos_conv FMLAL 用)
   // 对拍捕获
   std::vector<float> cap_pos_, cap_encln_, cap_l0attn_, cap_l0ln1_, cap_l0ffn_,
       cap_l0ln2_;

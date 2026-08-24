@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -342,27 +343,30 @@ inline void tokenizeAndMapFull(std::string_view text, const NormTable& nt,
 
 class G2PWConverter {
  public:
+  // fp16 直读视图要求 GsvFile 生命周期覆盖 bert_ —— 由本对象持有(堆上懒开)
+  std::unique_ptr<rt::GsvFile> f_;
+
   bool load(const std::string& gsv_path, const std::string& assets_bin,
             const std::string& vocab_txt, std::string* err) {
     if (!assets_.load(assets_bin, vocab_txt)) {
       *err = "g2pw assets load failed";
       return false;
     }
-    rt::GsvFile f(gsv_path);
+    f_ = std::make_unique<rt::GsvFile>(gsv_path);
     bert_.cfg.hidden = 768;
     bert_.cfg.heads = 12;
     bert_.cfg.layers = 12;
     bert_.cfg.inter = 3072;
     bert_.cfg.ln_eps = 1e-5f;
     bert_.cfg.mask_neg = -10000.f;
-    bert_.load(f);
-    bert::load_tensor_f32(f, "classifier.weight", cls_w_, {1305, 768});
-    bert::load_tensor_f32(f, "classifier.bias", cls_b_, {1305});
-    bert::load_tensor_f32(f, "pos_classifier.weight", pos_w_, {11, 768});
-    bert::load_tensor_f32(f, "pos_classifier.bias", pos_b_, {11});
-    bert::load_tensor_f32(f, "descriptor_bias.weight", desc_bias_, {1, 1305});
-    bert::load_tensor_f32(f, "char_descriptor.weight", char_desc_, {3582, 1305});
-    bert::load_tensor_f32(f, "second_order_descriptor.weight", so_desc_,
+    bert_.load(*f_);
+    bert::load_tensor_f32(*f_, "classifier.weight", cls_w_, {1305, 768});
+    bert::load_tensor_f32(*f_, "classifier.bias", cls_b_, {1305});
+    bert::load_tensor_f32(*f_, "pos_classifier.weight", pos_w_, {11, 768});
+    bert::load_tensor_f32(*f_, "pos_classifier.bias", pos_b_, {11});
+    bert::load_tensor_f32(*f_, "descriptor_bias.weight", desc_bias_, {1, 1305});
+    bert::load_tensor_f32(*f_, "char_descriptor.weight", char_desc_, {3582, 1305});
+    bert::load_tensor_f32(*f_, "second_order_descriptor.weight", so_desc_,
                           {39402, 1305});
     return true;
   }
