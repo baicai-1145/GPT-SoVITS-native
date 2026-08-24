@@ -50,7 +50,8 @@
 | E2-ENC | BERT/RoBERTa/HuBERT 编码栈 fp16 化 | E1 | exec-txt | DONE | task/E2-ENC | view零拷贝+真FMLAL+生命周期修复; 初判REJECTED系误判(短句基线vs长句对照无效): 受控A/B证fp16与fp32输出token级一致(同句均910)且load 4.6s→170ms → 已reapply(f754269); 调节链fp16安全性与AR采样语义问题拆分至E4 |
 | E3 | AR int8 权重+int8 KV (原E2) | E2-AR | 未分配 | TODO | A/B 听感 |
 | E4 | 长单段AR复读环鲁棒性: 对齐python topk_sampling(top_k/top_p/temperature+惩罚,CALIBRATION)或移植early_stop_num | C2 | 未分配 | TODO | 复读事件根因已定位=默认参考文本与参考音频错配(修正为no_prompt_text默认, 910→68 tokens); 本卡降级为低优先级鲁棒性储备 |
-| E5 | AMX 指令直接编程: fp16×fp16→fp32 矩阵协处理器后端(压榨CPU终极手段) | E2-SOV,E2-ENC | exec-ar | CLAIMED | task/E5 | 参考 /Volumes/2T/ref/amx/(corsix/amx含aarch64.h+M4验证+amx-rs); matfp mode3=f16外积f32累加; 目标: 大GEMM反超AMX-fp32 sgemm |
+| E5 | AMX 指令直接编程: fp16×fp16→fp32 矩阵协处理器后端(压榨CPU终极手段) | E2-SOV,E2-ENC | exec-ar | DONE(phase1) | task/E5 | 已合入(main默认OFF,-DGSV_AMX_GEMM=ON); 本机复验bench: amxpp 9/10形状反超sgemm 1.04-2.07x, cos=1.0全PASS; 实锤手写fmlal慢5-10x→E2-SOV的fmlal方案作废 |
+| E5-P2 | AMX接线: sovits conv1d按形状分流(M<64→GEMV, 大块→amx预打包), 权重f16预打包+im2col出f16, --amx运行时开关 | E5 | exec-sov | TODO | task/E5-P2 | 预估dec 2.3s→~1.4-1.8s; 注意AMX/cblas同线程互斥硬约束(专用池隔离); 基于main重做(吸收task/E2-SOV的w_f16单副本存储与融合im2col, 弃其fmlal计算) |
 
 ## 阻塞/风险登记
 
