@@ -1,0 +1,353 @@
+// gemm_f16_amx.cpp — E5 实现 (见 gemm_f16_amx.hpp 契约)
+//
+// Phase 1 内核设计:
+//   tile 32×32 (X lanes = M, Y lanes = N, K 全展开逐 k 外积)
+//   每 tile: K×(LDX+LDY+MATFP), 64×LDZ 清零, 64×STZ 读回散布到 C
+//   panel 预打包: A[mb] 块转置 [K][32] f16 (X 直读布局); B 同构
+//
+// 线程模型 (与任务卡"线程池 worker 各自 AMX_SET"的偏差声明):
+//   不能复用 rt 现有 P 核池 —— 实测 Accelerate BLAS (sgemm) 在调用线程
+//   同样驱动 AMX, 与我们长驻的 AMX_SET 状态互斥 (先 SET 再 cblas → SIGILL;
+//   先 cblas 再 SET → 结果全零)。现有 P 池 worker 会承接 cblas 任务,
+//   因此 AMX 使用专用私有线程池 (AMX-only, 永不触碰 Accelerate), 每个
+//   worker 启动即探测 + AMX_SET 长驻。功能等价且隔离安全。
+#include "kern/gemm_f16_amx.hpp"
+
+#if defined(GSV_AMX_GEMM)
+
+#include "kern/amx.h"
+#include "kern/gemv_fmlal.hpp"
+
+#include <arm_neon.h>
+
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <condition_variable>
+#include <cstring>
+#include <deque>
+#include <functional>
+#include <mutex>
+#include <setjmp.h>
+#include <signal.h>
+#include <sys/sysctl.h>
+#include <thread>
+#include <vector>
+
+namespace gsv::kern {
+
+namespace {
+
+// ---------------- SIGILL 探测 (并发安全) ----------------
+// 处理器全程长驻安装 (首次探测时装, 不再恢复): handler 只服务探测,
+// 且 buf/in_probe 均为 thread_local —— 任意线程 SIGILL 只会跳回自己的
+// 探测点。真 SIGILL (探测外) 不再转发: 保持进程可被默认终止, 便于定位。
+// 所有探测串行化 (全局互斥), 杜绝 install/restore 交叠竞态。
+static thread_local sigjmp_buf* t_probe_jmp = nullptr;  // 当前线程在探测中的 buf
+static std::atomic<bool> g_handler_installed{false};
+static std::mutex g_probe_mu;
+
+void probe_sigill_handler(int) {
+  if (t_probe_jmp) siglongjmp(*t_probe_jmp, 1);
+  // 探测之外的 SIGILL: 交回默认处理
+  struct sigaction sa {};
+  sa.sa_handler = SIG_DFL;
+  sigaction(SIGILL, &sa, nullptr);
+}
+
+// 当前线程探测全套用到的 AMX 指令; 成功后保持 SET 长驻并返回 true。
+bool probe_and_set_amx() {
+  std::lock_guard<std::mutex> lk(g_probe_mu);
+  if (!g_handler_installed.load(std::memory_order_acquire)) {
+    struct sigaction sa {};
+    sa.sa_handler = probe_sigill_handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGILL, &sa, nullptr);
+    g_handler_installed.store(true, std::memory_order_release);
+  }
+  sigjmp_buf jmp;
+  bool ok = false;
+  if (sigsetjmp(jmp, 1) == 0) {
+    t_probe_jmp = &jmp;
+    __attribute__((aligned(64))) uint8_t buf[64] = {0};
+    AMX_SET();
+    AMX_LDX(amx::ld_op(buf, 0));
+    AMX_LDY(amx::ld_op(buf, 0));
+    AMX_LDZ(amx::ld_op(buf, 0));
+    AMX_STZ(amx::ld_op(buf, 0));
+    AMX_MATFP(amx::matfp_f16f32(0, 0));
+    ok = true;  // 探测序列自带 SET, 保持长驻; 探测写入的 Z 零/脏值无碍
+                // —— 业务 tile 前每 tile 都会 LDZ 重置全部 64 行
+  }
+  t_probe_jmp = nullptr;
+  return ok;
+}
+
+// ---------------- AMX 专用线程池 ----------------
+struct AmxPool {
+  std::mutex mu;
+  std::condition_variable cv, done_cv;
+  std::deque<std::function<void()>> tasks;
+  size_t pending = 0;
+  bool stop = false;
+  std::vector<std::thread> threads;
+  std::atomic<int> healthy{0};  // 探测成功的 worker 数
+
+  explicit AmxPool(size_t n) {
+    threads.reserve(n);
+    for (size_t i = 0; i < n; ++i)
+      threads.emplace_back([this] { worker(); });
+  }
+  ~AmxPool() {
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      stop = true;
+    }
+    cv.notify_all();
+    for (auto& t : threads) t.join();
+  }
+  void worker() {
+    if (!probe_and_set_amx()) return;  // 本线程无 AMX → 不接活
+    healthy.fetch_add(1, std::memory_order_release);
+    std::unique_lock<std::mutex> lk(mu);
+    while (true) {
+      cv.wait(lk, [this] { return stop || !tasks.empty(); });
+      if (stop && tasks.empty()) return;
+      auto fn = std::move(tasks.front());
+      tasks.pop_front();
+      lk.unlock();
+      fn();
+      lk.lock();
+      if (--pending == 0 && tasks.empty()) done_cv.notify_all();
+    }
+  }
+  void run_batch(std::vector<std::function<void()>> batch) {
+    const size_t n = batch.size();
+    if (n == 0) return;
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      for (auto& t : batch) tasks.push_back(std::move(t));
+      pending += n;
+    }
+    cv.notify_all();
+    std::unique_lock<std::mutex> lk(mu);
+    done_cv.wait(lk, [this] { return pending == 0; });
+  }
+};
+
+size_t amx_pool_size() {
+  if (const char* e = ::getenv("GSV_AMX_THREADS")) {
+    const long v = std::atol(e);
+    if (v > 0) return (size_t)v;
+  }
+  size_t v = 0, len = sizeof v;
+  if (::sysctlbyname("hw.perflevel0.logicalcpu", &v, &len, nullptr, 0) != 0 ||
+      v == 0) {
+    v = std::thread::hardware_concurrency();
+  }
+  return v ? v : 1;
+}
+
+AmxPool& amx_pool() {
+  static AmxPool pool(amx_pool_size());
+  return pool;
+}
+
+// ---------------- panel 打包 ----------------
+// pack[nt][K][32]: 第 t 块 tile 的 X/Y 直读布局 (每 k 一个 64B 行),
+// 尾块行补零。src [rows,K] f16 行主。
+// 4×4 f16 转置 (NEON): 输入 4 行×4 列, 输出 4 个列向量
+// 依赖 armv8.2 fp16 (项目已要求 apple-m4)
+inline void transpose4x4_f16(float16x4_t x0, float16x4_t x1,
+                             float16x4_t x2, float16x4_t x3,
+                             float16x4_t& o0, float16x4_t& o1,
+                             float16x4_t& o2, float16x4_t& o3) {
+  const float16x4x2_t a01 = vtrn_f16(x0, x1);
+  const float16x4x2_t a23 = vtrn_f16(x2, x3);
+  const float32x2x2_t b0 = vtrn_f32(
+      vreinterpret_f32_f16(a01.val[0]), vreinterpret_f32_f16(a23.val[0]));
+  const float32x2x2_t b1 = vtrn_f32(
+      vreinterpret_f32_f16(a01.val[1]), vreinterpret_f32_f16(a23.val[1]));
+  o0 = vreinterpret_f16_f32(b0.val[0]);
+  o1 = vreinterpret_f16_f32(b1.val[0]);
+  o2 = vreinterpret_f16_f32(b0.val[1]);
+  o3 = vreinterpret_f16_f32(b1.val[1]);
+}
+
+// src [rows,K] f16 行主 → out: nt 个 [K][64B] panel (x[k*64+m*2]=src[r0+m][k])
+// NEON: 4 行 × 8k 一块, 两个 4×4 转置, 8B 列写
+void pack_panel(const uint16_t* src, size_t rows, size_t K,
+                std::vector<uint8_t>& out) {
+  const size_t nt = (rows + 31) / 32;
+  out.assign(nt * K * 64 + 64, 0);
+  const uintptr_t p = (uintptr_t)out.data();
+  const size_t base = (64 - (p & 63)) & 63;
+  uint8_t* dst = out.data() + base;
+  for (size_t t = 0; t < nt; ++t) {
+    const size_t r0 = t * 32;
+    const size_t tr = std::min<size_t>(32, rows - r0);
+    uint8_t* d = dst + t * K * 64;
+    if (tr == 32) {  // 满 tile: 纯 NEON 快路径
+      for (size_t r = 0; r < 32; r += 4) {
+        const uint16_t* s0 = src + (r0 + r) * K;
+        const uint16_t* s1 = s0 + K, *s2 = s0 + 2 * K, *s3 = s0 + 3 * K;
+        size_t k = 0;
+        for (; k + 4 <= K; k += 4) {
+          float16x4_t o0, o1, o2, o3;
+          transpose4x4_f16(vld1_f16((const __fp16*)(s0 + k)),
+                           vld1_f16((const __fp16*)(s1 + k)),
+                           vld1_f16((const __fp16*)(s2 + k)),
+                           vld1_f16((const __fp16*)(s3 + k)), o0, o1, o2, o3);
+          uint8_t* c = d + k * 64 + r * 2;
+          vst1_f16((__fp16*)(c), o0);
+          vst1_f16((__fp16*)(c + 64), o1);
+          vst1_f16((__fp16*)(c + 128), o2);
+          vst1_f16((__fp16*)(c + 192), o3);
+        }
+        for (; k < K; ++k) {  // K 尾
+          uint8_t* c = d + k * 64 + r * 2;
+          *(uint16_t*)(c) = s0[k];
+          *(uint16_t*)(c + 2) = s1[k];
+          *(uint16_t*)(c + 4) = s2[k];
+          *(uint16_t*)(c + 6) = s3[k];
+        }
+      }
+    } else {  // 尾 tile: 标量 (一次性成本, 少见)
+      for (size_t r = 0; r < 32; r += 4) {
+        const size_t nr = r < tr ? std::min<size_t>(4, tr - r) : 0;
+        const uint16_t* s0 = nr > 0 ? src + (r0 + r) * K : nullptr;
+        const uint16_t* s1 = nr > 1 ? s0 + K : nullptr;
+        const uint16_t* s2 = nr > 2 ? s0 + 2 * K : nullptr;
+        const uint16_t* s3 = nr > 3 ? s0 + 3 * K : nullptr;
+        for (size_t k = 0; k < K; ++k) {
+          uint8_t* col = d + k * 64 + r * 2;
+          if (s0) std::memcpy(col, s0 + k, 2); else std::memset(col, 0, 2);
+          if (s1) std::memcpy(col + 2, s1 + k, 2); else std::memset(col + 2, 0, 2);
+          if (s2) std::memcpy(col + 4, s2 + k, 2); else std::memset(col + 4, 0, 2);
+          if (s3) std::memcpy(col + 6, s3 + k, 2); else std::memset(col + 6, 0, 2);
+        }
+      }
+    }
+  }
+}
+
+// ---------------- tile 内核 (worker 线程, 已 SET) ----------------
+void amx_tile(const uint8_t* Xbase, const uint8_t* Ybase, float* C,
+              size_t M, size_t N, size_t K, size_t mb, size_t nb) {
+  static thread_local __attribute__((aligned(64))) uint8_t z64[64] = {0};
+  static thread_local __attribute__((aligned(64))) uint8_t zb[64][64];
+  const size_t tm = std::min<size_t>(32, M - mb * 32);
+  const size_t tn = std::min<size_t>(32, N - nb * 32);
+  const uint8_t* X = Xbase + (mb * K) * 64;  // 块内 panel: [K][64B]
+  const uint8_t* Y = Ybase + (nb * K) * 64;
+  for (int z = 0; z < 64; ++z) AMX_LDZ(amx::ld_op(z64, (uint64_t)z));
+  const uint64_t op = amx::matfp_f16f32(0, 0);
+  for (size_t k = 0; k < K; ++k) {
+    AMX_LDX((uint64_t)(X + k * 64));
+    AMX_LDY((uint64_t)(Y + k * 64));
+    AMX_MATFP(op);
+  }
+  for (int z = 0; z < 64; ++z) AMX_STZ(amx::ld_op(zb[z], (uint64_t)z));
+  float* Crow = C + (mb * 32) * N + nb * 32;
+  for (size_t n = 0; n < tn; ++n) {
+    const uint8_t* fe = zb[n * 2];
+    const uint8_t* fo = zb[n * 2 + 1];
+    for (size_t m2 = 0; m2 < 16; ++m2) {
+      const size_t m = m2 * 2;
+      if (m < tm) std::memcpy(&Crow[m * N + n], fe + m2 * 4, 4);
+      if (m + 1 < tm) std::memcpy(&Crow[(m + 1) * N + n], fo + m2 * 4, 4);
+    }
+  }
+}
+
+// ---------------- 回退 (fmlal 全量) ----------------
+// panel 缓冲复用 (调用方线程; assign 保留容量免反复分配)
+static thread_local std::vector<uint8_t> t_araw, t_braw;
+
+// 预打包版核心: pa/pb 已就绪, 直接分发 tiles。
+// 前置条件: AMX 已可用 (调用方保证), 输入形状已校验。
+void gemm_pp_dispatch(const uint8_t* X, const uint8_t* Y, float* c,
+                      size_t M, size_t N, size_t K) {
+  AmxPool& pool = amx_pool();
+  const int healthy = pool.healthy.load(std::memory_order_acquire);
+  const size_t nmb = (M + 31) / 32, nnb = (N + 31) / 32;
+  const size_t ntiles = nmb * nnb;
+  const size_t grain = (ntiles + (size_t)healthy - 1) / (size_t)healthy;
+  std::vector<std::function<void()>> batch;
+  for (size_t t = 0; t < ntiles; t += grain) {
+    const size_t e = std::min(ntiles, t + grain);
+    batch.emplace_back([&, t, e] {
+      for (size_t i = t; i < e; ++i) {
+        const size_t mb = i / nnb, nb = i % nnb;
+        amx_tile(X, Y, c, M, N, K, mb, nb);
+      }
+    });
+  }
+  pool.run_batch(std::move(batch));
+}
+
+void gemm_f16_amx_impl(const uint16_t* a, const uint16_t* b, float* c,
+                       size_t M, size_t N, size_t K) {
+  if (M == 0 || N == 0) return;
+  if (K == 0) {
+    std::memset(c, 0, M * N * 4);
+    return;
+  }
+  // 小规模: FMLAL 单次分派更省 (打包+池往返不划算)
+  if ((M < 64 && N < 64) || M * N * K < (1u << 18)) {
+    gemm_f16x_fmlal(a, b, c, M, N, K);
+    return;
+  }
+
+  static std::atomic<bool> g_amx_disabled{false};  // 池全部 worker 探测失败
+  AmxPool& pool = amx_pool();
+  const int healthy = pool.healthy.load(std::memory_order_acquire);
+  if (healthy <= 0 || g_amx_disabled.load()) {
+    if (getenv("GSV_AMX_DEBUG")) fprintf(stderr, "[amx] FALLBACK fmlal M=%zu N=%zu K=%zu healthy=%d\n", M, N, K, healthy);
+    gemm_f16x_fmlal(a, b, c, M, N, K);  // 平台无 AMX → 全量回退
+    g_amx_disabled.store(true);
+    return;
+  }
+  if (getenv("GSV_AMX_DEBUG")) fprintf(stderr, "[amx] AMX path M=%zu N=%zu K=%zu healthy=%d\n", M, N, K, healthy);
+
+  pack_panel(a, M, K, t_araw);
+  pack_panel(b, N, K, t_braw);
+  const uint8_t* X =
+      t_araw.data() + ((64 - ((uintptr_t)t_araw.data() & 63)) & 63);
+  const uint8_t* Y =
+      t_braw.data() + ((64 - ((uintptr_t)t_braw.data() & 63)) & 63);
+  gemm_pp_dispatch(X, Y, c, M, N, K);
+}
+
+}  // namespace
+
+bool amx_gemm_available() {
+  // 惰性触发池创建; 池 worker 探测在各自线程完成
+  AmxPool& pool = amx_pool();
+  return pool.healthy.load(std::memory_order_acquire) > 0;
+}
+
+AmxPanel amx_pack(const uint16_t* w, size_t rows, size_t K) {
+  AmxPanel p;
+  p.rows = rows;
+  p.K = K;
+  pack_panel(w, rows, K, p.buf);
+  return p;
+}
+
+void gemm_f16_amx_pp(const AmxPanel& pa, const AmxPanel& pb, float* c,
+                     size_t M, size_t N) {
+  if (pa.rows != M || pb.rows != N || pa.K != pb.K || M == 0 || N == 0) {
+    return;  // 契约违规: 静默不写 (调用方仅 available() 后使用, 形状自证)
+  }
+  gemm_pp_dispatch(pa.data(), pb.data(), c, M, N, pa.K);
+}
+
+void gemm_f16_amx(const uint16_t* a, const uint16_t* b, float* c,
+                  size_t M, size_t N, size_t K) {
+  gemm_f16_amx_impl(a, b, c, M, N, K);
+}
+
+}  // namespace gsv::kern
+
+#endif  // GSV_AMX_GEMM
