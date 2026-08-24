@@ -358,9 +358,9 @@ Feat featurize(const textfront::TextFrontend* tf,
   x.reset(Ln, C);
   for (size_t t = 0; t < Ln; ++t)
     for (size_t c = 0; c < C; ++c)
-      x.d[t * C + c] = bm.word_emb.w[size_t(ids[t]) * C + c] +
-                       bm.pos_emb.w[t * C + c] +
-                       bm.type_emb.w[size_t(tt[t]) * C + c];
+      x.d[t * C + c] = bm.word_emb_w[size_t(ids[t]) * C + c] +
+                       bm.pos_emb_w[t * C + c] +
+                       bm.type_emb_w[size_t(tt[t]) * C + c];
   bm.emb_ln.forward(x);
   std::vector<float> ext(Ln);
   for (size_t j = 0; j < Ln; ++j)

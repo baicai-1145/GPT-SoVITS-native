@@ -128,4 +128,86 @@ void gemv_f16x_fmlal(const uint16_t* w, const uint16_t* xh, float* y,
       }, rt::Qos::UserInitiated);
 }
 
+// ---- E2-ENC: 矩阵版 FMLAL GEMM (C = A·Bᵀ, A/B fp16, C fp32) ----
+namespace {
+
+// 4×N tile: 对 M 行带内 4 行 × 全部 N 列做 FMLAL 累加。
+// 每行 m 持 4 组独立 fp32 lane 累加器(按列分 4 递推, 列尾 marge)。
+// K 主循环 8 元素/步 + 标量尾。
+inline void gemm_f16_tile4(const uint16_t* a, const uint16_t* b, float* c,
+                          size_t M, size_t N, size_t K) {
+  const size_t vec_end = K & ~size_t{7};
+  for (size_t m0 = 0; m0 < M; m0 += 4) {
+    const size_t mcnt = std::min(size_t{4}, M - m0);
+    // 列块 4 步长: 列 n0..n0+3 共 4 列; 每行每列独立 4-lane 累加器
+    for (size_t n0 = 0; n0 < N; n0 += 4) {
+      const size_t ncnt = std::min(size_t{4}, N - n0);
+      float32x4_t acc[4][4];
+      for (size_t i = 0; i < mcnt; ++i)
+        for (size_t j = 0; j < ncnt; ++j) acc[i][j] = vdupq_n_f32(0.f);
+      for (size_t k = 0; k < vec_end; k += 8) {
+        for (size_t i = 0; i < mcnt; ++i) {
+          const float16x8_t av =
+              vld1q_f16(reinterpret_cast<const __fp16*>(a + (m0 + i) * K + k));
+          for (size_t j = 0; j < ncnt; ++j) {
+            const float16x8_t bv =
+                vld1q_f16(reinterpret_cast<const __fp16*>(b + (n0 + j) * K + k));
+            acc[i][j] = vfmlalq_low_f16(acc[i][j], av, bv);
+            acc[i][j] = vfmlalq_high_f16(acc[i][j], av, bv);
+          }
+        }
+      }
+      // 标量尾(K 非 8 倍数): fp16×fp16→fp32 精确, 累加语义与 FMLAL 一致。
+      // 只加到 lane0(vaddvq 求和时单次计入, 不能 vdupq 全 lane 否则重复计)
+      for (size_t k = vec_end; k < K; ++k) {
+        for (size_t i = 0; i < mcnt; ++i) {
+          __fp16 av;
+          std::memcpy(&av, a + (m0 + i) * K + k, sizeof av);
+          const float af = static_cast<float>(av);
+          for (size_t j = 0; j < ncnt; ++j) {
+            __fp16 bv;
+            std::memcpy(&bv, b + (n0 + j) * K + k, sizeof bv);
+            const float prod = af * static_cast<float>(bv);
+            acc[i][j] = vsetq_lane_f32(vgetq_lane_f32(acc[i][j], 0) + prod,
+                                       acc[i][j], 0);
+          }
+        }
+      }
+      for (size_t i = 0; i < mcnt; ++i)
+        for (size_t j = 0; j < ncnt; ++j)
+          c[(m0 + i) * N + (n0 + j)] = vaddvq_f32(acc[i][j]);
+    }
+  }
+}
+
+}  // namespace
+
+void gemm_f16x_fmlal(const uint16_t* a, const uint16_t* b, float* c,
+                     size_t M, size_t N, size_t K) {
+  // 小矩阵单线程; 大矩阵按 M 行带并行(与 gemv 同策略, 4 行对齐块)
+  if (M * N * K < (size_t{1} << 20)) {
+    gemm_f16_tile4(a, b, c, M, N, K);
+    return;
+  }
+  const size_t workers = std::max(rt::p_core_count(), size_t{1});
+  size_t mblock = (M + workers - 1) / workers;
+  mblock = (mblock + 3) & ~size_t{3};  // tile4 行对齐
+  rt::parallel_for(
+      M, mblock,
+      [&](size_t begin, size_t end) {
+        // 行带 [begin,end): A/C 指针带偏移, tile4 内部 m0 从 0 起算局部行
+        gemm_f16_tile4(a + begin * K, b, c + begin * N, end - begin, N, K);
+      },
+      rt::Qos::UserInitiated);
+}
+
+void f32_trans_to_f16(const float* src, uint16_t* dst, size_t R, size_t S) {
+  // src [R,S] 行主 → dst [S,R] 行主 fp16
+  for (size_t s = 0; s < S; ++s)
+    for (size_t r = 0; r < R; ++r) {
+      const __fp16 h = static_cast<__fp16>(src[r * S + s]);
+      std::memcpy(dst + s * R + r, &h, sizeof h);
+    }
+}
+
 }  // namespace gsv::kern

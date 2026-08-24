@@ -45,3 +45,7 @@ target_compile_definitions(c1_run PRIVATE
   GSV_WEIGHTS_DIR="${GSV_WEIGHTS_DIR}"
   C1_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/local/c1_fixtures")
 target_link_libraries(c1_run PRIVATE gsv_encoder)
+
+# ---- task/E2-ENC: fp16 化验收 harness(本地跨分支对照用, 不注册 ctest) ----
+add_executable(e2_enc_dump local/e2_enc_dump.cpp)
+target_link_libraries(e2_enc_dump PRIVATE gsv_rt gsv_kern gsv_encoder)
