@@ -76,6 +76,7 @@ add_library(gsv_textfront STATIC
   src/textfront/en_norm.cpp
   src/textfront/chinese_g2p.cpp
   src/textfront/textfront.cpp
+  src/textfront/polyphone_fix.cpp
   src/textfront/chinese_g2p.cpp
   src/textfront/textfront.cpp
 )
