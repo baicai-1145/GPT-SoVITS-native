@@ -271,4 +271,78 @@ GSV_TEST(rope_matches_both_styles) {
   }
 }
 
+
+// ---- E5: AMX MATFP GEMM 单测 (编译开关 GSV_AMX_GEMM, 平台无 AMX 自动回退) ----
+// 语义与 gemm_f16x_fmlal 相同 (f16 输入, fp32 累加); 累加顺序不同 → 非逐位,
+// 门禁口径同 G1: cos≥0.9999 且 rel=max|a-b|/max|b| ≤ 1e-3。
+// 覆盖: SoVITS dec 真实形状 (768×200×1344, 384×2000×1152/2688/4224)、
+// 尾块形状 (M/N 非 32 倍数)、K 奇数 (k3 conv K=9)、预打包路径一致性。
+#if defined(GSV_AMX_GEMM)
+#include "kern/gemm_f16_amx.hpp"
+GSV_TEST(gemm_f16_amx_matches_fmlal) {
+  if (!gsv::kern::amx_gemm_available()) return;  // 无 AMX 平台: 跳过
+  Rng rng;
+  struct Acc {
+    double dot = 0, na = 0, nb = 0, maxabs = 0, maxref = 0;
+  };
+  for (auto [M, N, K] : {std::tuple{384u, 200u, 1344u},  // conv_pre T200
+                         {384u, 2000u, 1152u},            // res k3
+                         {96u, 2000u, 672u},              // res 深层
+                         {200u, 300u, 512u},              // enc proj 奇 M
+                         {33u, 65u, 96u},                 // 尾块奇形
+                         {96u, 200u, 9u}}) {              // K=9 (3x3 conv)
+    std::vector<uint16_t> a(M * K), b(N * K);
+    for (auto& v : a) {
+      _Float16 h(rng.next() * 0.5f);
+      __builtin_memcpy(&v, &h, 2);
+    }
+    for (auto& v : b) {
+      _Float16 h(rng.next() * 0.5f);
+      __builtin_memcpy(&v, &h, 2);
+    }
+    std::vector<float> ref(M * N), got(M * N);
+    gsv::kern::gemm_f16x_fmlal(a.data(), b.data(), ref.data(), M, N, K);
+    gsv::kern::gemm_f16_amx(a.data(), b.data(), got.data(), M, N, K);
+    Acc s;
+    for (size_t i = 0; i < M * N; ++i) {
+      const double x = got[i], y = ref[i];
+      s.dot += x * y;
+      s.na += x * x;
+      s.nb += y * y;
+      s.maxabs = std::max(s.maxabs, std::fabs(x - y));
+      s.maxref = std::max(s.maxref, std::fabs(y));
+    }
+    const double cos = s.dot / (std::sqrt(s.na) * std::sqrt(s.nb) + 1e-30);
+    const double rel = s.maxabs / (s.maxref + 1e-30);
+    CHECK(cos >= 0.9999);
+    CHECK(rel <= 1e-3);
+  }
+}
+
+// 预打包路径: 与即时路径逐位一致 (同一内核, 同一 tile 划分)
+GSV_TEST(gemm_f16_amx_pp_bitwise_same) {
+  if (!gsv::kern::amx_gemm_available()) return;
+  Rng rng;
+  const size_t M = 384, N = 77, K = 264;  // N/K 全奇形 (77=2*32+13, K=8*33)
+  std::vector<uint16_t> a(M * K), b(N * K);
+  for (auto& v : a) {
+    _Float16 h(rng.next() * 0.5f);
+    __builtin_memcpy(&v, &h, 2);
+  }
+  for (auto& v : b) {
+    _Float16 h(rng.next() * 0.5f);
+    __builtin_memcpy(&v, &h, 2);
+  }
+  std::vector<float> c1(M * N), c2(M * N);
+  gsv::kern::gemm_f16_amx(a.data(), b.data(), c1.data(), M, N, K);
+  auto pa = gsv::kern::amx_pack(a.data(), M, K);
+  auto pb = gsv::kern::amx_pack(b.data(), N, K);
+  gsv::kern::gemm_f16_amx_pp(pa, pb, c2.data(), M, N);
+  size_t diff = 0;
+  for (size_t i = 0; i < M * N; ++i)
+    diff += (std::memcmp(&c1[i], &c2[i], 4) != 0);
+  CHECK_EQ(diff, size_t{0});
+}
+#endif  // GSV_AMX_GEMM
+
 GSV_TEST_MAIN()
