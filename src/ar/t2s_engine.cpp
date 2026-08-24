@@ -119,6 +119,8 @@ void T2SEngine::set_fp16(const Fp16Options& o) { fp16_ = o; }
 
 // y[out] = W16·xh: 激活舍入到 fp16 后走 FMLAL 扩展精度累加 GEMV。
 // xh_ 复用为暂存(调用方串行使用, 无重入)。
+// y[out] = W16·xh: 激活舍入到 fp16 后走 FMLAL 扩展精度累加 GEMV。
+// xh_ 复用为暂存(调用方串行使用, 无重入)。
 void T2SEngine::gemv_fmlal(const std::vector<uint16_t>& w16, const float* x,
                            size_t out, size_t in, float* y) {
   xh_.resize(in);
@@ -126,11 +128,10 @@ void T2SEngine::gemv_fmlal(const std::vector<uint16_t>& w16, const float* x,
   kern::gemv_f16x_fmlal(w16.data(), xh_.data(), y, out, in);
 }
 
+// generate() 内部使用的 logits 投影(尊重 fp16.gemv)
 void T2SEngine::predict_layer_fp(const float* x, float* y) {
-  if (fp16_.gemv)
-    gemv_fmlal(wp16_, x, dims_.vocab, dims_.d_model, y);
-  else
-    wp_.forward(x, 1, y);
+  // Logits 投影层保持 fp32 精度 (DenseF16 升位 sgemm) 以免在 top-1/top-2 微小差异时引起 argmax 翻转
+  wp_.forward(x, 1, y);
 }
 
 // SinePositionalEmbedding.extend_pe 单行同构:
@@ -329,7 +330,7 @@ void T2SEngine::block_decode_impl(size_t l, float* x, size_t pos, size_t len,
   for (size_t i = 0; i < dims_.ffn; ++i) ff_[i] += L.b1[i];
   gsv::kern::relu(ff_.data(), ff_.data(), dims_.ffn);
   if constexpr (GEMV16)
-    gemv_fmlal(L.w216, ff_.data(), D, dims_.ffn, xb);
+    L.w2.forward(ff_.data(), 1, xb);  // W2 走 fp32 sgemm/升位
   else
     L.w2.forward(ff_.data(), 1, xb);
   for (size_t i = 0; i < D; ++i) xb[i] += L.b2[i];
