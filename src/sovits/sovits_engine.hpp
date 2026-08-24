@@ -22,7 +22,10 @@ namespace gsv::sovits {
 
 class SovitsEngine {
  public:
-  void load(const std::string& gsv_path) {
+  // use_amx: E5-P2 — 装载时预打包 AMX 权重 panel (--amx 开关; 默认关)。
+  // 运行时无 AMX 硬件时自动回退 sgemm (见 conv1d.hpp 分流逻辑)。
+  void load(const std::string& gsv_path, bool use_amx = false) {
+    sovits::amx_enabled() = use_amx;
     rt::GsvFile f(gsv_path);
     quant_.load(f, /*codebook*/ 1024, /*dim*/ 768);
     enc_p_.load(f);

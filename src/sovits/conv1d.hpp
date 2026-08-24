@@ -1,23 +1,50 @@
-// conv1d.hpp — SoVITS 用卷积原语 (全 fp32 计算)
-//   Conv1dF32:      same-padding (含 dilation) 卷积, im2col → accel::sgemm
-//   ConvT1dF32:     ConvTranspose1d(k, stride=u, pad=(k-u)/2), 相位分解 GEMM + scatter
-// 权重布局与 torch 一致: weight[out][in][k] 连续 = [out, in*k] 行主; bias[out]。
+// conv1d.hpp — SoVITS 卷积原语 (E5-P2: w_f16 单副本 + AMX/sgemm 计算分流)
+//   Conv1d:  same-padding (含 dilation), im2col → AMX pp 或 sgemm 升位
+//   ConvT1d: ConvTranspose1d(k, stride=u, pad=(k-u)/2), 相位分解 GEMM + scatter
+//
+// 权重纪律: 仅存 w_f16 位型单副本 (E2-SOV 采纳成果); 无 fp32 常驻副本。
+//
+// 计算分流 (运行时 --amx, 编译期 -DGSV_AMX_GEMM):
+//   大块 (out_c ≥ kAmxMinOutC=64) 且 AMX 可用:
+//     权重 AmxPanel 装载时预打包一次; 激活每调用打包 (col_T f16 已就绪);
+//     kern::gemm_f16_amx_pp — 内部落 AMX 专用线程池, 与 cblas 线程互斥隔离。
+//   其余 (GEMV 形 out_c<64 / --amx 关 / 无 AMX 硬件):
+//     sgemm 升位路径 — w_f16 即时升 f32 (thread_local), im2col fp32,
+//     数值与现网 fp32 链路同构 (差异仅权重一次 fp16 舍入, golden 门禁口径覆盖)。
 #pragma once
 
 #include "kern/accel.hpp"
 #include "sovits/sovits_types.hpp"
+#if defined(GSV_AMX_GEMM)
+#include "kern/gemm_f16_amx.hpp"
+#endif
 
 #include <cmath>
 #include <vector>
 
 namespace gsv::sovits {
 
-class Conv1dF32 {
+// AMX 分流的 M 下界: conv_post (Co=1 GEMV 形) 打包开销不抵收益 → sgemm;
+// 实测 M≥24 全形状反超 (tile 32 行, M=24 填充率已 75%)。
+constexpr size_t kAmxMinOutC = 24;
+
+// 进程级 AMX 使能 (--amx 开关; 默认关)。须在 engine load 前设置:
+// 决定装载时是否预打包权重 panel。
+inline bool& amx_enabled() {
+  static bool b = false;
+  return b;
+}
+
+class Conv1d {
  public:
-  // k=1 的卷积即逐点 GEMM
   size_t out_c = 0, in_c = 0, k = 0, dilation = 1;
-  std::vector<float> w;  // [out,in,k]
-  std::vector<float> b;  // [out]
+  std::vector<uint16_t> w_f16;  // [out,in,k] 位型存储 (唯一权重副本)
+  std::vector<float> b;         // [out]
+
+#if defined(GSV_AMX_GEMM)
+  kern::AmxPanel panel_;  // [out, K=in*k] 预打包 (仅 amx_enabled 且大块时)
+#endif
+  bool has_panel_ = false;
 
   void load(const rt::GsvFile& f, std::string_view prefix, size_t o, size_t i,
             size_t kk, size_t dil = 1) {
@@ -26,14 +53,21 @@ class Conv1dF32 {
     k = kk;
     dilation = dil;
     std::string p(prefix);
-    if (!w.empty()) return;  // 已加载
-    load_tensor_f32(f, p + ".weight", w, {o, i, kk});
+    if (!w_f16.empty()) return;  // 已加载
+    load_tensor_f16(f, p + ".weight", w_f16, {o, i, kk});
     const auto* tb = f.tensor(p + ".bias");
     if (tb) {
       load_tensor_f32(f, p + ".bias", b);
     } else {
       b.assign(o, 0.f);  // conv_post 无 bias (is_bias=False)
     }
+#if defined(GSV_AMX_GEMM)
+    // 预打包仅限大块且非逐点卷积: k==1 的 GEMV/点积形 pack+cast 开销不抵收益
+    if (amx_enabled() && out_c >= kAmxMinOutC && k > 1) {
+      panel_ = kern::amx_pack(w_f16.data(), out_c, in_c * k);
+      has_panel_ = true;
+    }
+#endif
   }
 
   // y[C_out, T] = conv(x[C_in, T]) ; same padding, 输出长度 == T
@@ -49,18 +83,43 @@ class Conv1dF32 {
     }
     const Tensor2D& x = x_in;
     const size_t T = x.T;
+    const size_t K = in_c * k;
+#if defined(GSV_AMX_GEMM)
+    // ---- AMX 路径: 仅 k>1 大块; im2col 直接写 panel 布局 (零中间趟) ----
+    if (has_panel_ && k > 1 && dilation == 1 &&
+        T >= 64 && kern::amx_gemm_available()) {
+      // GEMM 全量覆写输出, 免 memset
+      y.C = out_c;
+      y.T = T;
+      y.d.resize(out_c * T);
+      thread_local std::vector<uint8_t> act_panel;
+      im2col_to_panel_f16(x.d.data(), in_c, T, k, dilation, act_panel);
+      kern::AmxPanel pb;
+      pb.rows = T;
+      pb.K = K;
+      pb.buf = std::move(act_panel);
+      kern::gemm_f16_amx_pp(panel_, pb, y.d.data(), out_c, T);
+      add_bias(y);
+      return;
+    }
+#endif
+    // ---- sgemm 升位路径 (回退安全: 无 AMX/--amx 关/GEMV 形) ----
+    // w_f16 即时升位 (thread_local 复用容量; 权重仍单副本)
+    thread_local std::vector<float> wf;
+    wf.resize(w_f16.size());
+    kern::accel::f16_to_f32(w_f16.data(), wf.data(), w_f16.size());
     y.reset(out_c, T);
     if (k == 1 && dilation == 1) {
-      // 逐点: y = W[out, in] · x[in, T]; 行主序 ld 均为行长度
+      // 逐点: y = W[out, in] · x[in, T]
       kern::accel::sgemm('N', 'N', static_cast<int>(out_c),
-                   static_cast<int>(T), static_cast<int>(in_c), 1.f,
-                   w.data(), static_cast<int>(in_c), x.d.data(),
-                   static_cast<int>(T), 0.f, y.d.data(),
-                   static_cast<int>(T));
+                         static_cast<int>(T), static_cast<int>(in_c), 1.f,
+                         wf.data(), static_cast<int>(in_c), x.d.data(),
+                         static_cast<int>(T), 0.f, y.d.data(),
+                         static_cast<int>(T));
     } else {
-      // im2col: col[in*k, T]
+      // im2col: col[in*k, T] (fp32, 与现网 main 同构)
       thread_local std::vector<float> col;
-      col.resize(in_c * k * T);
+      col.resize(K * T);
       const int pad_l = static_cast<int>((k - 1) * dilation) / 2;
       for (size_t i = 0; i < in_c; ++i) {
         const float* xr = x.row(i);
@@ -75,9 +134,9 @@ class Conv1dF32 {
       }
       // y[out,T] = W[out, in*k] · col[in*k, T]
       kern::accel::sgemm('N', 'N', static_cast<int>(out_c), static_cast<int>(T),
-                   static_cast<int>(in_c * k), 1.f, w.data(),
-                   static_cast<int>(in_c * k), col.data(), static_cast<int>(T),
-                   0.f, y.d.data(), static_cast<int>(T));
+                         static_cast<int>(K), 1.f, wf.data(),
+                         static_cast<int>(K), col.data(), static_cast<int>(T),
+                         0.f, y.d.data(), static_cast<int>(T));
     }
     add_bias(y);
   }
@@ -92,13 +151,18 @@ class Conv1dF32 {
 };
 
 // ConvTranspose1d: out_len = T*u ; weight [in, out, k] (torch 布局!), bias[out]
-// 等价散射: y[:, j*u+d-pad] += Σ_i W[i,o,d]·x[:,j], d∈[0,k)
-// 实现: 对每个 d 做一次 GEMM(tmp[o,T] = Wd[o,in]·x[in,T]) 后按相位 scatter。
-class ConvT1dF32 {
+// 相位分解: y[:, j*u+d-pad] += Σ_i W[i,o,d]·x[:,j], d∈[0,k)
+// 每相位一次 GEMM(tmp[o,T] = Wd[o,in]·x[in,T]) 后按相位 scatter。
+class ConvT1d {
  public:
   size_t out_c = 0, in_c = 0, k = 0, stride_u = 1;
-  std::vector<float> w;  // [in,out,k] — 注意 torch ConvTranspose1d 布局
-  std::vector<float> b;
+  std::vector<uint16_t> w_f16;  // [k][out,in] 相位切片位型 (装载时预抽取)
+  std::vector<float> b;         // [out]
+
+#if defined(GSV_AMX_GEMM)
+  std::vector<kern::AmxPanel> panels_;  // 每 d 一个 [out,in] panel
+#endif
+  bool has_panels_ = false;
 
   void load(const rt::GsvFile& f, std::string_view prefix, size_t i, size_t o,
             size_t kk, size_t u) {
@@ -107,15 +171,30 @@ class ConvT1dF32 {
     k = kk;
     stride_u = u;
     std::string p(prefix);
-    load_tensor_f32(f, p + ".weight", w, {i, o, kk});  // torch ConvT: [in,out,k]
+    std::vector<uint16_t> raw;  // torch [in,out,k]
+    load_tensor_f16(f, p + ".weight", raw, {i, o, kk});
+    w_f16.resize(k * o * i);
+    for (size_t d = 0; d < k; ++d)
+      for (size_t oo = 0; oo < o; ++oo)
+        for (size_t ii = 0; ii < i; ++ii)
+          w_f16[(d * o + oo) * i + ii] = raw[(ii * o + oo) * k + d];
     const auto* tb = f.tensor(p + ".bias");
     if (tb)
       load_tensor_f32(f, p + ".bias", b);
     else
       b.assign(o, 0.f);
+#if defined(GSV_AMX_GEMM)
+    if (amx_enabled() && out_c >= kAmxMinOutC) {
+      panels_.reserve(k);
+      for (size_t d = 0; d < k; ++d)
+        panels_.push_back(
+            kern::amx_pack(w_f16.data() + d * o * i, o, i));
+      has_panels_ = true;
+    }
+#endif
   }
 
-  // 允许 &x == &y
+  // 允许 &x == &y ; scratch 由调用方复用 (Generator 提供)
   void forward(const Tensor2D& x_in, Tensor2D& y, Tensor2D& scratch) const {
     if (&x_in == &y) {
       Tensor2D tmp;
@@ -129,34 +208,59 @@ class ConvT1dF32 {
     const size_t T = x.T;
     const long long pad = static_cast<long long>((k - stride_u) / 2);
     const size_t Tout = T * stride_u;
-    y.reset(out_c, Tout);
-    scratch.reset(out_c, T);
-
-    // w_d[o, in] : 提取 kernel 切片 d
-    thread_local std::vector<float> wd;
-    wd.resize(out_c * in_c);
-    for (size_t d = 0; d < k; ++d) {
-      for (size_t o = 0; o < out_c; ++o)
-        for (size_t i = 0; i < in_c; ++i)
-          wd[o * in_c + i] = w[(i * out_c + o) * k + d];
-      // tmp[o,T] = wd[o,in] · x[in,T]
-      kern::accel::sgemm('N', 'N', static_cast<int>(out_c), static_cast<int>(T),
-                   static_cast<int>(in_c), 1.f, wd.data(), static_cast<int>(in_c),
-                   x.d.data(), static_cast<int>(T), 0.f, scratch.d.data(),
-                   static_cast<int>(T));
-      // scatter 到 strided 输出位置
-      for (size_t j = 0; j < T; ++j) {
-        long long opos = static_cast<long long>(j) * stride_u +
-                         static_cast<long long>(d) - pad;
-        if (opos < 0 || opos >= static_cast<long long>(Tout)) continue;
-        size_t op = static_cast<size_t>(opos);
-        for (size_t o = 0; o < out_c; ++o) y.row(o)[op] += scratch.row(o)[j];
+    y.reset(out_c, Tout);  // scatter 用 +=, 需要零起点
+#if defined(GSV_AMX_GEMM)
+    if (has_panels_ && kern::amx_gemm_available()) {
+      // 激活 panel 每调用打包一次, 所有相位复用 (buffer 容量复用免反复分配);
+      // k=1 时 im2col_to_panel 退化为 cast_transpose 直写 panel 布局
+      thread_local std::vector<uint8_t> pb_buf;
+      im2col_to_panel_f16(x.d.data(), in_c, T, 1, 1, pb_buf);
+      thread_local kern::AmxPanel pb;
+      pb.rows = T;
+      pb.K = in_c;
+      pb.buf = std::move(pb_buf);
+      scratch.C = out_c;  // GEMM 全量覆写, 免 memset
+      scratch.T = T;
+      scratch.d.resize(out_c * T);
+      for (size_t d = 0; d < k; ++d) {
+        kern::gemm_f16_amx_pp(panels_[d], pb, scratch.d.data(), out_c, T);
+        scatter_phase(scratch, y, T, Tout, pad, d);
+      }
+      pb_buf = std::move(pb.buf);  // 归还容量供下次复用
+    } else
+#endif
+    {
+      // sgemm 升位路径: 每相位即时升位 wd (thread_local)
+      thread_local std::vector<float> wd;
+      wd.resize(out_c * in_c);
+      scratch.reset(out_c, T);
+      for (size_t d = 0; d < k; ++d) {
+        kern::accel::f16_to_f32(w_f16.data() + d * out_c * in_c, wd.data(),
+                                out_c * in_c);
+        kern::accel::sgemm('N', 'N', static_cast<int>(out_c),
+                           static_cast<int>(T), static_cast<int>(in_c), 1.f,
+                           wd.data(), static_cast<int>(in_c), x.d.data(),
+                           static_cast<int>(T), 0.f, scratch.d.data(),
+                           static_cast<int>(T));
+        scatter_phase(scratch, y, T, Tout, pad, d);
       }
     }
     for (size_t c = 0; c < out_c; ++c) {
       float* yr = y.row(c);
       const float bc = b[c];
       for (size_t t = 0; t < Tout; ++t) yr[t] += bc;
+    }
+  }
+
+ private:
+  void scatter_phase(const Tensor2D& scratch, Tensor2D& y, size_t T,
+                     size_t Tout, long long pad, size_t d) const {
+    for (size_t j = 0; j < T; ++j) {
+      long long opos = static_cast<long long>(j) * stride_u +
+                       static_cast<long long>(d) - pad;
+      if (opos < 0 || opos >= static_cast<long long>(Tout)) continue;
+      const size_t op = static_cast<size_t>(opos);
+      for (size_t o = 0; o < out_c; ++o) y.row(o)[op] += scratch.row(o)[j];
     }
   }
 };

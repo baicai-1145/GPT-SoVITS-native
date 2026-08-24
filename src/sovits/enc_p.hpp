@@ -12,14 +12,14 @@ namespace gsv::sovits {
 
 class TextEncoder {
  public:
-  Conv1dF32 ssl_proj;      // 768 → 192 (k1)
+  Conv1d ssl_proj;      // 768 → 192 (k1)
   Encoder encoder_ssl;     // 192, heads2, 3 层
   Encoder encoder_text;    // 192, heads2, 6 层
   Encoder encoder2;        // 192, heads2, 3 层
   std::vector<float> text_embedding;  // [732, 192]
   size_t n_symbols = 0;
   MRTE mrte;
-  Conv1dF32 proj;          // 192 → 384 (k1)
+  Conv1d proj;          // 192 → 384 (k1)
 
   void load(const rt::GsvFile& f) {
     ssl_proj.load(f, "enc_p.ssl_proj", 192, 768, 1);
