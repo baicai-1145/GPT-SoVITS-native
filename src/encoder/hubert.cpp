@@ -210,7 +210,8 @@ size_t HubertEngine::run(const float* waveform, size_t n) {
     const size_t P = static_cast<size_t>(K) / 2;
     const size_t Tp = T + 1;  // (T+2P-K+1)
     const size_t KK = static_cast<size_t>(cg) * K;
-    cols16_.resize(Tp * static_cast<size_t>(G) * cg * K);
+    // 按组连续布局: 组 g 的 [Tp,KK] 块紧排(gemm_f16x_fmlal 的 B 侧行 stride=KK)
+    cols16_.resize(static_cast<size_t>(G) * Tp * KK);
     pos_w16_.resize(static_cast<size_t>(hidden_) * cg * K);  // 融合产物→fp16 一次性量化
     kern::f32_to_f16(pos_w_.data(), pos_w16_.data(), pos_w16_.size());
     for (int g = 0; g < G; ++g)
@@ -224,17 +225,17 @@ size_t HubertEngine::run(const float* waveform, size_t n) {
                     : 0.f;
             const __fp16 h = static_cast<__fp16>(v);
             std::memcpy(cols16_.data() +
-                            (static_cast<size_t>(t) * G * cg +
-                             static_cast<size_t>(g) * cg + j) * K + kk,
+                            (static_cast<size_t>(g) * Tp + t) * KK +
+                             static_cast<size_t>(j) * K + kk,
                         &h, sizeof h);
           }
     pos_out_.resize(Tp * hidden_);
-    tmp_.resize(static_cast<size_t>(cg) * Tp);  // [cg, Tp] 行主 FMLAL 输出中转
+    tmp_.resize(static_cast<size_t>(cg) * Tp);  // [cg, Tp] 通道主 gemm 直出中转
     for (int g = 0; g < G; ++g) {
       const uint16_t* wg = pos_w16_.data() + static_cast<size_t>(g) * cg * cg * K;
-      kern::gemm_f16x_fmlal(wg, cols16_.data() + static_cast<size_t>(g) * cg * K,
+      kern::gemm_f16x_fmlal(wg, cols16_.data() + static_cast<size_t>(g) * Tp * KK,
                             tmp_.data(), cg, Tp, KK);
-      // 转置写入行主 [Tp, hidden] 槽位 g*cg..g*cg+cg
+      // 通道主 [cg,Tp] → 行主 [Tp,hidden] 槽位(消费端布局)
       for (size_t t = 0; t < Tp; ++t)
         for (int i = 0; i < cg; ++i)
           pos_out_[t * hidden_ + static_cast<size_t>(g) * cg + i] =

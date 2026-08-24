@@ -44,13 +44,19 @@ SvEngine::Bn load_bn(const GsvFile& f, const std::string& p) {
   return bn;
 }
 
-// 卷积权重: fp16 直读(零静态转换膨胀); 调用方在 conv2d_f16 / Aff::apply 内按需转 fp32 scratch
-const uint16_t* load_conv_w(const GsvFile& f, const std::string& name) {
+// 卷积/AFF 权重: 优先 f16 段零拷贝直读; 无 f16 段的小权重(fp32 段存储, 如
+// local_att.3) 一次性量化到 own 常驻副本(fp16, 内存减半) —— 前向仍全 FMLAL。
+const uint16_t* load_conv_w(const GsvFile& f, const std::string& name,
+                           std::vector<uint16_t>* own = nullptr) {
   const TensorView* t = f.tensor(name);
   if (!t) throw std::runtime_error("sv 缺张量: " + name);
-  if (!t->has_f16())
-    throw std::runtime_error("sv conv 权重应为 fp16 直读: " + name);
-  return t->data_f16_raw();
+  if (t->has_f16()) return t->data_f16_raw();
+  if (!own) throw std::runtime_error("sv conv 权重无 f16 段且未提供量化副本槽: " + name);
+  own->resize(t->numel());
+  std::vector<float> wf(t->numel());
+  std::memcpy(wf.data(), t->data_f32(), wf.size() * sizeof(float));
+  kern::f32_to_f16(wf.data(), own->data(), wf.size());
+  return own->data();
 }
 
 }  // namespace
@@ -144,17 +150,13 @@ void SvEngine::Aff::apply(const float* x, const float* ds, float* out, int h, in
   std::memcpy(cat_.data() + static_cast<size_t>(ch) * s, ds,
               static_cast<size_t>(ch) * s * sizeof(float));
   att_.resize(static_cast<size_t>(inter) * s);
-  // gemm1: att[inter,S] = W1[inter,2ch]·cat[2ch,S]。收缩维 2ch 在 cat 的行向 ——
-  // 转置量化 cat→[S,2ch]fp16 后 gemm(C[S,inter]=catᵀ·W1ᵀ) 再转回通道主。
+  // gemm1: att[inter,S] = W1[inter,2ch]·cat[2ch,S]。收缩维 2ch 在 cat 行向 ——
+  // 转置量化 cat→[S,2ch]fp16 后 gemm(A=W1, B=catᵀ) 直接得通道主 att[inter,S]。
   if (xh.size() < 2 * static_cast<size_t>(ch) * s) xh.resize(2 * static_cast<size_t>(ch) * s);
-  kern::f32_trans_to_f16(cat_.data(), xh.data(), 2 * ch, s);  // [2ch,S]→[S,2ch]fp16
-  att_t_.resize(static_cast<size_t>(inter) * s);  // 暂存 attᵀ [S,inter]
-  kern::gemm_f16x_fmlal(xh.data(), w1, att_t_.data(), s,
-                        static_cast<size_t>(inter), 2 * static_cast<size_t>(ch));
-  for (size_t ss = 0; ss < s; ++ss)
-    for (int e = 0; e < inter; ++e)
-      att_[static_cast<size_t>(e) * s + ss] =
-          att_t_[ss * static_cast<size_t>(inter) + static_cast<size_t>(e)];
+  kern::f32_trans_to_f16(cat_.data(), xh.data(), 2 * ch, s);
+  kern::gemm_f16x_fmlal(w1, xh.data(), att_.data(),
+                        static_cast<size_t>(inter), s,
+                        2 * static_cast<size_t>(ch));
 #ifdef C1_TRACE
   std::fprintf(stderr, "    [aff gemm1 done]\n");
 #endif
@@ -166,16 +168,12 @@ void SvEngine::Aff::apply(const float* x, const float* ds, float* out, int h, in
   bn1.apply(att_.data(), inter, s);
   gsv::kern::silu(att_.data(), att_.data(), att_.size());
   att_t_.resize(static_cast<size_t>(ch) * s);
-  // gemm2 同构: att_t[ch,S] = W2[ch,inter]·att[inter,S] → 转置量化 + gemm + 转回
+  // gemm2 同构: att_t[ch,S] = W2[ch,inter]·att[inter,S] → 转置量化 + gemm 直出通道主
   if (xh2.size() < static_cast<size_t>(inter) * s) xh2.resize(static_cast<size_t>(inter) * s);
   kern::f32_trans_to_f16(att_.data(), xh2.data(), inter, s);  // [inter,S]→[S,inter]fp16
-  cat_.resize(static_cast<size_t>(ch) * s);  // 复用 cat_ 暂存 gemm2 输出ᵀ [S,ch]
-  kern::gemm_f16x_fmlal(xh2.data(), w2, cat_.data(), s,
-                        static_cast<size_t>(ch), static_cast<size_t>(inter));
-  for (size_t ss = 0; ss < s; ++ss)
-    for (int e = 0; e < ch; ++e)
-      att_t_[static_cast<size_t>(e) * s + ss] =
-          cat_[ss * static_cast<size_t>(ch) + static_cast<size_t>(e)];
+  kern::gemm_f16x_fmlal(w2, xh2.data(), att_t_.data(),
+                        static_cast<size_t>(ch), s,
+                        static_cast<size_t>(inter));
 #ifdef C1_TRACE
   std::fprintf(stderr, "    [aff gemm2 done]\n");
 #endif
@@ -204,20 +202,17 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
   // 注意: in 可能就是 eng.tmp_(调用方把主缓冲喂进来) —— 必须写入另一缓冲防别名。
   int h = h_in, w = w_in;
   if (stride == 1) {
-    // 1x1 s1: 零 im2col。通道主 [c_in,S]·Wᵀ[co1,c_in] —— 转置量化激活后 FMLAL:
-    //   nxt[co1,S] = W·inᵀ → 先算 [S,co1]=inᵀ·Wᵀ 再转回通道主。
+    // 1x1 s1: 零 im2col。in 通道主 [c_in,S] → 转置量化 xh_[S,c_in];
+    // gemm(A=W[co1,c_in], B=xh) 直接得通道主 nxt_[co1,S] —— 不经 tmp_
+    // (in 可能别名 eng.tmp_, 不得写回)。
     const size_t s = static_cast<size_t>(h) * w;
     if (eng.xh_.size() < static_cast<size_t>(c_in) * s)
       eng.xh_.resize(static_cast<size_t>(c_in) * s);
-    kern::f32_trans_to_f16(in, eng.xh_.data(), c_in, s);  // [c_in,S]→[S,c_in]fp16
-    eng.tmp_.resize(static_cast<size_t>(co1) * s);        // 暂存 [S,co1]
-    kern::gemm_f16x_fmlal(eng.xh_.data(), conv1_w, eng.tmp_.data(), s,
-                          static_cast<size_t>(co1), static_cast<size_t>(c_in));
+    kern::f32_trans_to_f16(in, eng.xh_.data(), c_in, s);
     eng.nxt_.resize(static_cast<size_t>(co1) * s);
-    for (size_t ss = 0; ss < s; ++ss)
-      for (int e = 0; e < co1; ++e)
-        eng.nxt_[static_cast<size_t>(e) * s + ss] =
-            eng.tmp_[ss * static_cast<size_t>(co1) + static_cast<size_t>(e)];
+    kern::gemm_f16x_fmlal(conv1_w, eng.xh_.data(), eng.nxt_.data(),
+                          static_cast<size_t>(co1), s,
+                          static_cast<size_t>(c_in));
   } else {
     eng.conv2d_f16(in, c_in, h, w, conv1_w, co1, 1, 1, stride, 0, eng.cols_, eng.nxt_);
     h = (h - 1) / stride + 1;
@@ -322,7 +317,7 @@ void SvEngine::load_block(int l, int i, bool expect_aff) {
           f_->tensor((fp + "0.weight").c_str())->dims[0]);  // [inter, 2*width,1,1]
       a.ch = blk.width;
       a.w1 = load_conv_w(*f_, fp + "0.weight");
-      a.w2 = load_conv_w(*f_, fp + "3.weight");
+      a.w2 = load_conv_w(*f_, fp + "3.weight", &a.w2_own);  // 可能无 f16 段→量化副本
       a.b1 = vec_any(*f_, fp + "0.bias");   // Conv2d 默认 bias=True!
       a.b2 = vec_any(*f_, fp + "3.bias");
       a.bn1 = load_bn(*f_, fp + "1");
@@ -362,7 +357,7 @@ SvEngine::SvEngine(const GsvFile& f) : f_(&f) {
   fuse34_.ch =
       static_cast<int>(f.tensor("fuse34.local_att.3.weight")->dims[0]);  // 2048
   fuse34_.w1 = load_conv_w(f, "fuse34.local_att.0.weight");
-  fuse34_.w2 = load_conv_w(f, "fuse34.local_att.3.weight");
+  fuse34_.w2 = load_conv_w(f, "fuse34.local_att.3.weight", &fuse34_.w2_own);
   fuse34_.b1 = vec_any(f, "fuse34.local_att.0.bias");
   fuse34_.b2 = vec_any(f, "fuse34.local_att.3.bias");
   fuse34_.bn1 = load_bn(f, "fuse34.local_att.1");

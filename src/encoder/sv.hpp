@@ -46,6 +46,7 @@ class SvEngine {
   struct Aff {  // fusion.AFF: local_att(cat[x,ds]) → 门控融合
     const uint16_t* w1 = nullptr;  // [inter,2C] 1x1 卷积权重(fp16 直读)
     const uint16_t* w2 = nullptr;  // [C,inter] 1x1 卷积权重(fp16 直读)
+    std::vector<uint16_t> w2_own;  // 无 f16 段时的一次性量化副本(fp16 常驻, 拥有权)
     std::vector<float> b1, b2;  // 两个 1x1 卷积的 bias(local_att Conv2d bias=True!)
     Bn bn1, bn2;
     int inter = 0, ch = 0;

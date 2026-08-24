@@ -173,21 +173,21 @@ bool Pipeline::load(const std::string& weightsDir, const std::string& dataDir,
     if (!tok_.load(joinPath(dataDir, "roberta_vocab.txt"), err)) return false;
 
     bert_.cfg = bert::BertConfig{};  // roberta-wwm-ext-large 默认即此
-    bert_.load(rt::GsvFile(joinPath(weightsDir, "roberta_wwm_ext_large.gsv")),
-               "bert");
+    fBert_ = std::make_unique<rt::GsvFile>(
+        joinPath(weightsDir, "roberta_wwm_ext_large.gsv"));
+    bert_.load(*fBert_, "bert");
 
-    ar_ = std::make_unique<ar::T2SEngine>(
-        rt::GsvFile(joinPath(weightsDir, "ar_s1v3.gsv")));
+    fAr_ = std::make_unique<rt::GsvFile>(joinPath(weightsDir, "ar_s1v3.gsv"));
+    ar_ = std::make_unique<ar::T2SEngine>(*fAr_);
     sovits_ = std::make_unique<sovits::SovitsEngine>();
-    sovits_->load(joinPath(weightsDir, "sovits_v2ProPlus.gsv"));
-    {
-      rt::GsvFile sovF(joinPath(weightsDir, "sovits_v2ProPlus.gsv"));
-      cond_.load(sovF);
-      hubert_ = std::make_unique<encoder::HubertEngine>(
-          rt::GsvFile(joinPath(weightsDir, "hubert_base.gsv")));
-      sv_ = std::make_unique<encoder::SvEngine>(
-          rt::GsvFile(joinPath(weightsDir, "eres2netv2_sv.gsv")));
-    }
+    fSov_ = std::make_unique<rt::GsvFile>(joinPath(weightsDir, "sovits_v2ProPlus.gsv"));
+    sovits_->load(fSov_->path());
+    cond_.load(*fSov_);
+    fHub_ = std::make_unique<rt::GsvFile>(joinPath(weightsDir, "hubert_base.gsv"));
+    hubert_ = std::make_unique<encoder::HubertEngine>(*fHub_);
+    fSv_ = std::make_unique<rt::GsvFile>(
+        joinPath(weightsDir, "eres2netv2_sv.gsv"));
+    sv_ = std::make_unique<encoder::SvEngine>(*fSv_);
   } catch (const std::exception& e) {
     if (err) *err = e.what();
     return false;
@@ -586,9 +586,9 @@ bool Pipeline::synthesize(const std::string& utf8Text,
         seg.tf_ms = nowMs() - t0;
         seg.norm_text = ain.normText;
         seg.phones = ain.phonesSeg;
-        SegSovIn sin = stageAr(ain, out->prompt_semantic);
+            SegSovIn sin = stageAr(ain, out->prompt_semantic);
         stageVoc(sin, &seg, out->cond);
-        if (!seg.audio.empty()) noteFirstPacket(nowMs() - tSynth);
+            if (!seg.audio.empty()) noteFirstPacket(nowMs() - tSynth);
         appendSeg(std::move(seg));
       }
     } else {
