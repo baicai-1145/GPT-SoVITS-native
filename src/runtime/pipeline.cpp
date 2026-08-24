@@ -167,27 +167,53 @@ bool Pipeline::load(const std::string& weightsDir, const std::string& dataDir,
     }
   }
 
+  // ---- E7: load 段分阶段画像 (GSV_LOAD_PROFILE=1 时 stderr 输出各阶段耗时) ----
+  const bool profileLoad = ::getenv("GSV_LOAD_PROFILE") != nullptr;
+  auto profMark = [profileLoad](const char* stage, double* t) {
+    const double now = nowMs();
+    if (profileLoad)
+      std::fprintf(stderr, "[load-profile] %-22s %8.1f ms\n", stage, now - *t);
+    *t = now;
+  };
+  double tStage = nowMs();
+
   try {
+    // ---- E7 画像结论: 权重在 USB 外接盘 (~73MB/s) ----
+    // 跨文件同时预取实测有害 (USB 寻道抖动, 冷态反而 16s→77s), 已撤销。
+    // 保留逐文件 F_RDADVISE 能力 (GsvFile::prefetch / prefetch_file) 供
+    // 单文件流内聚簇使用; 真正的冷态治理见 gsv_tool --slim (去 f32 冗余段,
+    // 文件体积 -67%, 页缓存压力同比降)。
+    if (profileLoad) profMark("prefetch_issue(异步,不阻塞)", &tStage);
+
     if (!tf_.load(trieP, pinyinP, err, cmuP, haveG2pw ? &g2pwOpt : nullptr))
       return false;
+    profMark("textfront(含G2PW)", &tStage);
     if (!tok_.load(joinPath(dataDir, "roberta_vocab.txt"), err)) return false;
+    profMark("tokenizer_vocab", &tStage);
 
     bert_.cfg = bert::BertConfig{};  // roberta-wwm-ext-large 默认即此
     fBert_ = std::make_unique<rt::GsvFile>(
         joinPath(weightsDir, "roberta_wwm_ext_large.gsv"));
+    fBert_->prefetch();  // GsvFile 内映射续期 WILLNEED (幂等)
     bert_.load(*fBert_, "bert");
+    profMark("bert_load(1.9GB)", &tStage);
 
     fAr_ = std::make_unique<rt::GsvFile>(joinPath(weightsDir, "ar_s1v3.gsv"));
     ar_ = std::make_unique<ar::T2SEngine>(*fAr_);
+    profMark("ar_load(444MB)", &tStage);
     sovits_ = std::make_unique<sovits::SovitsEngine>();
     fSov_ = std::make_unique<rt::GsvFile>(joinPath(weightsDir, "sovits_v2ProPlus.gsv"));
     sovits_->load(fSov_->path(), opt.sovits_amx);
+    profMark("sovits_load(460MB+pack)", &tStage);
     cond_.load(*fSov_);
+    profMark("cond_load", &tStage);
     fHub_ = std::make_unique<rt::GsvFile>(joinPath(weightsDir, "hubert_base.gsv"));
     hubert_ = std::make_unique<encoder::HubertEngine>(*fHub_);
+    profMark("hubert_load(531MB)", &tStage);
     fSv_ = std::make_unique<rt::GsvFile>(
         joinPath(weightsDir, "eres2netv2_sv.gsv"));
     sv_ = std::make_unique<encoder::SvEngine>(*fSv_);
+    profMark("sv_load(306MB)", &tStage);
   } catch (const std::exception& e) {
     if (err) *err = e.what();
     return false;

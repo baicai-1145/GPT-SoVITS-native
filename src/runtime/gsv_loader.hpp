@@ -64,6 +64,10 @@ class GsvFile {
   // 按名查找; 不存在返回 nullptr
   const TensorView* tensor(std::string_view name) const;
 
+  // E7: 异步预读全文件进页缓存 (madvise WILLNEED, 内核后台 IO, 不阻塞)。
+  // 在 load 流程最早处对全部权重文件调用, 让磁盘读取与各引擎 CPU 转换重叠。
+  void prefetch() const;
+
  private:
   void open_and_parse();
   void close();
@@ -76,5 +80,9 @@ class GsvFile {
   json::JValue config_;
   std::vector<TensorView> tensors_;
 };
+
+// E7: 路径版预读 (临时 open+mmap+madvise+munmap, 不解析目录)。用于引擎外
+// 的附属大文件 (如 g2pw_bert.gsv 由 textfront 内部才打开) 的提前预热。
+void prefetch_file(const std::string& path);
 
 }  // namespace gsv::rt

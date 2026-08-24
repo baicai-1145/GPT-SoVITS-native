@@ -84,9 +84,17 @@ void parse_gsv_directory(const uint8_t* base, uint64_t file_size,
 
     const size_t numel = t.numel();
     if (numel > kMaxNumel) bail("numel 超限");
-    if (t.f32_nbytes != numel * 4) bail("fp32 段字节数与形状不符");
+    // E7: 允许双布局张量省略 f32 冗余段 (slim 文件, f32_nbytes==0):
+    // src_dtype=fp16 的张量其 f32 母本恒等于 f16 升位, 引擎一律走 f16 路径。
+    if (t.has_f16()) {
+      if (t.f32_nbytes != 0 && t.f32_nbytes != numel * 4)
+        bail("fp32 段字节数与形状不符");
+    } else if (t.f32_nbytes != numel * 4) {
+      bail("fp32 段字节数与形状不符");
+    }
     if (t.has_f16() && t.f16_nbytes != numel * 2) bail("fp16 段字节数与形状不符");
-    if (t.f32_offset % kAlign != 0 || t.f32_offset + t.f32_nbytes > file_size)
+    if (t.f32_nbytes != 0 &&
+        (t.f32_offset % kAlign != 0 || t.f32_offset + t.f32_nbytes > file_size))
       bail("fp32 段未 64B 对齐或越界");
     if (t.has_f16() && (t.f16_offset % kAlign != 0 || t.f16_offset + t.f16_nbytes > file_size))
       bail("fp16 段未 64B 对齐或越界");
@@ -146,6 +154,30 @@ const TensorView* GsvFile::tensor(std::string_view name) const {
   for (const auto& t : tensors_)
     if (t.name == name) return &t;
   return nullptr;
+}
+
+// E7: 内核异步预读。注意: macOS 的 madvise(MADV_WILLNEED) 实测为同步页入
+// (阻塞至读完), 不能用; 正确原语是 fcntl(F_RDADVISE) —— 入队后台 IO 立即
+// 返回。失败静默 (预读只是优化, 不影响正确性)。
+void GsvFile::prefetch() const {
+  if (fd_ < 0 || size_ == 0) return;
+  struct radvisory ra{};
+  ra.ra_offset = 0;
+  ra.ra_count = size_;
+  ::fcntl(fd_, F_RDADVISE, &ra);
+}
+
+void prefetch_file(const std::string& path) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return;  // 预读是优化: 文件缺失由后续正式加载报错
+  struct stat st {};
+  if (::fstat(fd, &st) == 0 && st.st_size > 0) {
+    struct radvisory ra{};
+    ra.ra_offset = 0;
+    ra.ra_count = (uint64_t)st.st_size;
+    ::fcntl(fd, F_RDADVISE, &ra);
+  }
+  ::close(fd);
 }
 
 void GsvFile::close() {
