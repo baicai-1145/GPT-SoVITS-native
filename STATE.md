@@ -45,7 +45,10 @@
 | D1 | bench harness(powermetrics/吃满率采样) | C2 | exec-txt | DONE | task/B5 | bench三脚本+reporter已就绪; 待安静窗口执行正式定标 |
 | D2 | 流水线重叠(AR‖SoVITS 双缓冲)+线程调优 | D1 | exec-ar(原exec-txt prep) | DONE | task/D2 | AR‖SoVITS三阶段重叠调度+QoS线程分簇; 串行/重叠逐样本一致; M5 达成 |
 | E1 | KV fp16 开关评估 | C2 | exec-sov | DONE | task/B34 | 裁决B: --fp16默认=kv-only(与fp32逐位一致,G1 65/65); FMLAL gemv为实验开关(62/65,激活舍入雪崩归M6); 抽测1.77×待安静窗口定标 |
-| E2 | AR int8 权重+int8 KV | E1 | 未分配 | TODO | A/B 听感 |
+| E2-AR | AR Decode 全 GEMV fp16 化数值对齐 (解决4/65雪崩) | E1 | exec-ar | CLAIMED | task/E2-AR | 消除激活舍入雪崩; 目标 65/65 pairs G1/G2 全通 |
+| E2-SOV | SoVITS (enc_p/flow/dec) 端到端 fp16 特征流与算子 | E1 | exec-sov | CLAIMED | task/E2-SOV | 特征流/卷积fp16化; 目标 G3 mel_rel≤1e-4 |
+| E2-ENC | BERT/RoBERTa/HuBERT 编码栈 fp16 化 | E1 | exec-txt | CLAIMED | task/E2-ENC | 编码器前向fp16化; 目标 cos≥0.9999 |
+| E3 | AR int8 权重+int8 KV (原E2) | E2-AR | 未分配 | TODO | A/B 听感 |
 
 ## 阻塞/风险登记
 
