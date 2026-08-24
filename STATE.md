@@ -46,8 +46,8 @@
 | D2 | 流水线重叠(AR‖SoVITS 双缓冲)+线程调优 | D1 | exec-ar(原exec-txt prep) | DONE | task/D2 | AR‖SoVITS三阶段重叠调度+QoS线程分簇; 串行/重叠逐样本一致; M5 达成 |
 | E1 | KV fp16 开关评估 | C2 | exec-sov | DONE | task/B34 | 裁决B: --fp16默认=kv-only(与fp32逐位一致,G1 65/65); FMLAL gemv为实验开关(62/65,激活舍入雪崩归M6); 抽测1.77×待安静窗口定标 |
 | E2-AR | AR Decode 全 GEMV fp16 化数值对齐 (解决4/65雪崩) | E1 | exec-ar | DONE | task/E2-AR | 混合精度: WQKV/WOut/FFN-W1走FMLAL, Logits/FFN-W2保fp32; --fp16-all下65/65 B12全过(含1500步雪崩对); 真fp16计算 |
-| E2-SOV | SoVITS (enc_p/flow/dec) 端到端 fp16 特征流与算子 | E1 | exec-sov | IN_PROGRESS | task/E2-SOV | 退回重做: 初版仅fp16存储+升位sgemm(零fp16计算且双倍内存); 现改真FMLAL fp16 GEMM(conv/dec), Norm/统计保fp32 |
-| E2-ENC | BERT/RoBERTa/HuBERT 编码栈 fp16 化 | E1 | exec-txt | IN_PROGRESS | task/E2-ENC | 修正: view_f16内存优化保留, 计算改真FMLAL fp16 GEMM(禁升位sgemm); 目标 cos≥0.9999 |
+| E2-SOV | SoVITS 端到端 fp16 算子(真FMLAL GEMM) | E1 | exec-sov | REVIEW | task/E2-SOV | 重做达标: 真fp16计算/RSS-36%/G3过(mel_rel≤0.0144); 但手写FMLAL比AMX sgemm慢2.9x→待裁决: 仅可作--sovits-fp16选装开关合入, 默认保持fp32 |
+| E2-ENC | BERT/RoBERTa/HuBERT 编码栈 fp16 化 | E1 | exec-txt | REJECTED | task/E2-ENC | 实现合格(view零拷贝+真FMLAL内核+生命周期修复)但端到端回归: fp16 RoBERTa特征致AR贪心雪崩(同句tokens 72→893, 音频3.2s→36s); cos≥0.9999不足以保证调节链位级稳定 → 已revert(main 9e6ae28); 决策: 调节链(RoBERTa/HuBERT/SV)永久保fp32 |
 | E3 | AR int8 权重+int8 KV (原E2) | E2-AR | 未分配 | TODO | A/B 听感 |
 
 ## 阻塞/风险登记
