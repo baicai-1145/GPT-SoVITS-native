@@ -41,6 +41,13 @@ add_library(gsv_kern STATIC
   src/kern/gemv_fmlal.cpp
   src/kern/accel.cpp
 )
+# ---- E5: AMX GEMM 实验后端 (默认关; -DGSV_AMX_GEMM=ON 开启) ----
+option(GSV_AMX_GEMM "Enable experimental Apple AMX fp16 GEMM backend" OFF)
+if(GSV_AMX_GEMM)
+  target_sources(gsv_kern PRIVATE src/kern/gemm_f16_amx.cpp)
+  target_compile_definitions(gsv_kern PUBLIC GSV_AMX_GEMM)
+  message(STATUS "E5: AMX GEMM experimental backend ENABLED")
+endif()
 target_link_libraries(gsv_kern PUBLIC "-framework Accelerate")
 
 # ---- AR/T2S 引擎 (task/B12) ----
@@ -85,6 +92,12 @@ add_library(gsv_textfront STATIC
 # ---- CLI 工具 ----
 add_executable(gsv_tool src/runtime/gsv_tool.cpp)
 target_link_libraries(gsv_tool PRIVATE gsv_rt)
+
+# ---- E5: AMX 三方基准 (仅当 AMX 后端开启时编入, tools 域) ----
+if(GSV_AMX_GEMM)
+  add_executable(amx_bench tools/amx_bench.cpp)
+  target_link_libraries(amx_bench PRIVATE gsv_kern gsv_rt)
+endif()
 
 # ---- 全链路 CLI (task/C2) ----
 add_executable(gsv_native
