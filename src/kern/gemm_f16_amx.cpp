@@ -501,16 +501,18 @@ void amx_batch_run(const AmxBatchNode* nodes, size_t n) {
         tiles, std::max<size_t>(1, size_t(healthy) * 2 /
                                        std::max<size_t>(nodes_per_phase[size_t(nd.phase)], 1)));
     const size_t chunk = (tiles + nchunk - 1) / nchunk;
-    auto* pa_data = nd.pa->data();
-    auto* pb_data = nd.pb->data();
     float* c = nd.c;
     const size_t M = nd.M, N = nd.N, K = nd.pa->K;
     const size_t nnb = (N + 31) / 32;
+    // 注意: pa/pb 的 data() 在任务执行时才取 —— prepare 可能刚填完 pb.buf
+    // (assign 后容量稳定, 但 data() 基址须以执行时为准)
     for (size_t t0 = 0; t0 < tiles; t0 += chunk) {
       const size_t t1 = std::min(tiles, t0 + chunk);
       ex[i].chunks.push_back(AmxPool::Task{
           nd.phase,
-          [pa_data, pb_data, c, M, N, K, nnb, t0, t1] {
+          [&nd, c, M, N, K, nnb, t0, t1] {
+            const uint8_t* pa_data = nd.pa->data();
+            const uint8_t* pb_data = nd.pb->data();
             for (size_t t = t0; t < t1; ++t)
               amx_tile(pa_data, pb_data, c, M, N, K, t / nnb, t % nnb);
           },
