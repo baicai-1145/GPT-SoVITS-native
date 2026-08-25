@@ -63,13 +63,18 @@ class MultiHeadAttention {
                const std::vector<uint8_t>& mask, Tensor2D& out, Tensor2D& qb,
                Tensor2D& kb, Tensor2D& vb, Tensor2D& scores,
                const Dumper* dbg = nullptr) const {
+    const bool prof = sov_timing_enabled();
+    StageTimers& Tm = sov_timers();
+    const double t0 = prof ? now_ms_e6() : 0.0;
     const size_t Tq = q_in.T, Tk = kv_in.T;
     conv_q.forward(q_in, qb);
     conv_k.forward(kv_in, kb);
     conv_v.forward(kv_in, vb);
+    if (prof) Tm.mha_proj += now_ms_e6() - t0;
 
     const float scale = 1.f / std::sqrt(static_cast<float>(dk));
     scores.reset(heads * Tq, Tk);
+    const double ts = prof ? now_ms_e6() : 0.0;
     for (size_t h = 0; h < heads; ++h)
       for (size_t t = 0; t < Tq; ++t) {
         float* sr = &scores.d[(h * Tq + t) * Tk];
@@ -81,6 +86,7 @@ class MultiHeadAttention {
           sr[s] = acc * scale;
         }
       }
+    if (prof) Tm.mha_scores += now_ms_e6() - ts;
     if (dbg) {
       dbg->dump("mha_q", qb);
       dbg->dump("mha_k", kb);
@@ -88,6 +94,7 @@ class MultiHeadAttention {
       dbg->dump("mha_scores_core", scores);
     }
 
+    const double tr0 = has_rel() ? (prof ? now_ms_e6() : 0.0) : 0.0;
     thread_local std::vector<float> usedk_buf, usedv_buf;
     if (has_rel()) {
       const size_t L = Tq;
@@ -145,8 +152,10 @@ class MultiHeadAttention {
         dbg->dump("mha_rel_abs", ra_tmp);
       }
     }
+    if (has_rel()) Tm.mha_rel_pre += now_ms_e6() - tr0;
 
     // mask → -1e4, softmax over s
+    const double tsm = prof ? now_ms_e6() : 0.0;
     for (size_t h = 0; h < heads; ++h)
       for (size_t t = 0; t < Tq; ++t) {
         float* sr = &scores.d[(h * Tq + t) * Tk];
@@ -154,9 +163,11 @@ class MultiHeadAttention {
           if (!mask[t * Tk + s]) sr[s] = -1e4f;
         softmax_row_inplace(sr, Tk);
       }
+    if (prof) Tm.mha_soft += now_ms_e6() - tsm;
     if (dbg) dbg->dump("mha_p_attn", scores);
 
     // out = Σ_s p·v
+    const double to = prof ? now_ms_e6() : 0.0;
     out.reset(channels, Tq);
     for (size_t h = 0; h < heads; ++h)
       for (size_t t = 0; t < Tq; ++t) {
@@ -169,6 +180,8 @@ class MultiHeadAttention {
             op[d * Tq] += p * vb.d[(h * dk + d) * Tk + s];
         }
       }
+    if (prof) Tm.mha_out += now_ms_e6() - to;
+    const double tr = has_rel() ? (prof ? now_ms_e6() : 0.0) : 0.0;
     if (has_rel()) {
       const size_t L = Tq;
       // p_rel[h,i,mrel]: _absolute_position_to_relative_position 索引同构:
@@ -195,7 +208,11 @@ class MultiHeadAttention {
         dbg->dump("mha_attn_out", ao_tmp);
       }
     }
+    if (has_rel()) Tm.mha_rel += now_ms_e6() - tr;
+
+    const double tco = prof ? now_ms_e6() : 0.0;
     conv_o.forward(out, out);
+    if (prof) Tm.mha_conv_o += now_ms_e6() - tco;
   }
 };
 

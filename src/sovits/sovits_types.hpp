@@ -318,6 +318,9 @@ struct StageTimers {
   double dec_pre = 0, dec_cond = 0, dec_ups = 0, dec_res = 0, dec_post = 0;
   // res 内部细分
   double res_conv1 = 0, res_conv2 = 0, res_ew = 0;
+  // mha 内部细分 (E10-dec-pool-analysis → step #5: MHA 接入 AMX)
+  double mha_proj = 0, mha_scores = 0, mha_soft = 0, mha_out = 0,
+         mha_rel_pre = 0, mha_rel = 0, mha_conv_o = 0;
   size_t calls = 0;
 
   void report_and_reset() {
@@ -328,6 +331,9 @@ struct StageTimers {
         calls, quant, upsample, enc_p, noise, flow, dec,
         dec_pre, dec_cond, dec_ups, dec_res, dec_post,
         res_conv1, res_conv2, res_ew);
+    std::fprintf(stderr,
+        "[mha-timing] proj=%.1f scores=%.1f softmax=%.1f attn_out=%.1f rel_pre=%.1f rel=%.1f conv_o=%.1f ms\n",
+        mha_proj, mha_scores, mha_soft, mha_out, mha_rel_pre, mha_rel, mha_conv_o);
     *this = StageTimers{};
   }
 };
