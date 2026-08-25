@@ -77,6 +77,28 @@ struct AmxBatchNode {
 // 调用返回前 pa/pb/c 必须保持有效。
 void amx_batch_run(const AmxBatchNode* nodes, size_t n);
 
+// ---- E10-K: 按链调度 DAG 派发 (消除 phase barrier) ----
+// 取代 amx_batch_run 的 phase-屏障模型: 节点间依赖仅限同一 chain_id
+// 内 depth-1 → depth (单条链内串行, 跨链并行), 节点就绪(前驱完成)即刻
+// 入队执行, 不等待同深度的其他链 —— 消除 amx_batch_run 的全局 barrier
+// 浪费 ( profiling: math 96ms / prepare 32ms / barrier 94ms )。
+//
+// AmxChainLink 与 AmxBatchNode 同构 (pa/pb/c/M/N/prepare), 以 chain_id+depth
+// 取代 phase。语义: 同 chain_id 者按 depth 顺序串行 (depth d 依赖 d-1 完毕),
+// 不同 chain_id 者无依赖。数值序与 amx_batch_run 完全一致 (同内核同 tile 划分)。
+// 不可用时回退 amx_batch_run (含 fmlal 回退), 语义不变。
+struct AmxChainLink {
+  int chain_id = 0;      // 链ID: 同链内串行, 0≤depth<max_depth
+  int depth = 0;         // 深度: 依赖同链 depth-1 节点
+  const AmxPanel* pa = nullptr;
+  const AmxPanel* pb = nullptr;
+  float* c = nullptr;
+  size_t M = 0, N = 0;
+  std::function<void()> prepare;
+};
+
+void amx_chain_run(const AmxChainLink* nodes, size_t n);
+
 // C[M,N] = A·Bᵀ; 不可用时内部回退 gemm_f16x_fmlal。 (即时打包, 通用路径)
 void gemm_f16_amx(const uint16_t* a, const uint16_t* b, float* c,
                   size_t M, size_t N, size_t K);

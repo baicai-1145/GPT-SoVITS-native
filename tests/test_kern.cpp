@@ -404,4 +404,63 @@ GSV_TEST(amx_batch_matches_sequential) {
 }
 #endif  // GSV_AMX_GEMM
 
+
+#if defined(GSV_AMX_GEMM)
+#include "kern/gemm_f16_amx.hpp"
+// E10-K: amx_chain_run (按 chain DAG, 无 barrier) 与 amx_batch_run
+// (phase 屏障) 结果逐位一致 (同内核同 tile 划分, 仅调度拓扑不同)
+GSV_TEST(amx_chain_matches_batch) {
+  if (!gsv::kern::amx_gemm_available()) return;
+  Rng rng;
+  struct Spec {
+    size_t M, N, K;
+  };
+  const Spec specs[] = {{384, 2000, 1152}, {96, 777, 672}, {65, 33, 9}};
+  constexpr int kChains = 3, kDepths = 3;
+  const int kNodes = kChains * kDepths;  // 9 节点
+  std::vector<gsv::kern::AmxPanel> pas, pbs;
+  std::vector<std::vector<float>> c_batch, c_chain;
+  std::vector<gsv::kern::AmxBatchNode> bn;
+  std::vector<gsv::kern::AmxChainLink> cn;
+  pas.reserve(kNodes); pbs.reserve(kNodes);
+  c_batch.reserve(kNodes); c_chain.reserve(kNodes);
+  bn.reserve(kNodes); cn.reserve(kNodes);
+  // 节点布局: i%3 选 shape, i/3 做 chain depth / batch phase
+  // → node i 在 batch 与 chain 下形状一致, 便于逐位对比
+  for (int i = 0; i < kNodes; ++i) {
+    const Spec& s = specs[i % 3];
+    const size_t M = s.M, N = s.N, K = s.K;
+    std::vector<uint16_t> wa(M * K), wb(N * K);
+    for (auto& v : wa) {
+      _Float16 h(rng.next() * 0.5f);
+      __builtin_memcpy(&v, &h, 2);
+    }
+    for (auto& v : wb) {
+      _Float16 h(rng.next() * 0.5f);
+      __builtin_memcpy(&v, &h, 2);
+    }
+    pas.push_back(gsv::kern::amx_pack(wa.data(), M, K));
+    pbs.emplace_back();
+    gsv::kern::amx_pack_into(wb.data(), N, K, pbs.back().buf);
+    pbs.back().rows = N;
+    pbs.back().K = K;
+    c_batch.emplace_back(M * N, 0.f);
+    c_chain.emplace_back(M * N, 0.f);
+    // batch: phase = depth
+    bn.push_back(gsv::kern::AmxBatchNode{i / kChains, &pas.back(),
+                                         &pbs.back(),
+                                         c_batch.back().data(), M, N, {}});
+    // chain: chain_id = i%3, depth = i/3
+    cn.push_back(gsv::kern::AmxChainLink{i % kChains, i / kChains,
+                                         &pas.back(), &pbs.back(),
+                                         c_chain.back().data(), M, N, {}});
+  }
+  gsv::kern::amx_batch_run(bn.data(), bn.size());
+  gsv::kern::amx_chain_run(cn.data(), cn.size());
+  for (size_t i = 0; i < c_batch.size(); ++i)
+    CHECK(std::memcmp(c_batch[i].data(), c_chain[i].data(),
+                      c_batch[i].size() * sizeof(float)) == 0);
+}
+#endif  // GSV_AMX_GEMM
+
 GSV_TEST_MAIN()
