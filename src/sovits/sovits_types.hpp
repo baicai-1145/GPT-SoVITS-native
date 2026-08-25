@@ -207,7 +207,81 @@ inline void im2col_to_panel_f16(const float* x, size_t C, size_t T,
     }
   };
   if (dil != 1) {
-    for (size_t t = 0; t < T; ++t) write_row_scalar(t);
+    // E6: dil>1 快径 (8 行一组, 4×4 transpose 写) —— 标量路径每个 stride
+    // 访存 + 标量 store 拖慢 K=1056/dil=3 形状 4× (19ms vs 1.84ms dil=1, K=288);
+    // 8 行内 4×4 块同 c 的 stride 访存经预取器带起 (每行 stride 跨步 3/5 读
+    // 24 个连续 T 位置 = cache friendly), 向量化 4×4 写减少 f16 store 指令 16×。
+    // 边界 (s_lo<0 或 s_hi>T) 回标量保证 bitwise 一致。
+    size_t t = 0;
+    for (; t + 8 <= T; ) {
+      const long s_lo = static_cast<long>(t) - pad_l;
+      const long s_hi = s_lo + 7 + static_cast<long>(k - 1) * static_cast<long>(dil);
+      bool ok = ((t % 32) + 8 <= 32);
+      if (ok) {
+        ok = (s_lo >= 0) && (s_hi <= static_cast<long>(T));
+      }
+      if (!ok) {
+        write_row_scalar(t);
+        ++t;
+        continue;
+      }
+      uint8_t* d = dst + (t / 32) * K * 64 + (t % 32) * 2;
+      if (append_ones_col) {
+        // 8 行 + ones: 同 dil=1, 须从 tile 头写避免双重行偏移
+        uint16_t* ones = reinterpret_cast<uint16_t*>(dst + (t / 32) * K * 64 +
+                                                    Kw * 64);
+        for (size_t r = 0; r < 8; ++r) ones[(t % 32) + r] = 0x3C00;
+      }
+      for (size_t c = 0; c < C; ++c) {
+        // 8 行指针: w[r] = &x[c*T + s_lo + r*dil] (per-kk 需加 kk*dil)
+        // 注意: dil>1 同行 8 个时间步 stride-dil 间隔; 不可共用 w[r]+kk 简单偏移
+        // 简化: 每次 kk 步进重算 w 数组 (避免 stride 错位)
+        uint16_t* dp = reinterpret_cast<uint16_t*>(d) + c * k * 32;
+        long i = 0;
+        for (; i + 4 <= static_cast<long>(k); i += 4) {
+          float16x4_t lo4[4], hi4[4];
+          for (size_t g = 0; g < 2; ++g) {
+            // 4 行 stride load: 同行内 4 个连续时间点 stride-dil 步进
+            // 8 行 = 2 组 4, 每组内 4 行 r 连续 4 个 stride-dil 位置
+            const float* wr = x + c * T + s_lo +
+                              static_cast<long>(g * 4) * static_cast<long>(dil);
+            const float16x4_t x0 = vcvt_f16_f32(
+                vld1q_f32(wr + 0 * static_cast<long>(dil) + i * static_cast<long>(dil)));
+            const float16x4_t x1 = vcvt_f16_f32(
+                vld1q_f32(wr + 1 * static_cast<long>(dil) + i * static_cast<long>(dil)));
+            const float16x4_t x2 = vcvt_f16_f32(
+                vld1q_f32(wr + 2 * static_cast<long>(dil) + i * static_cast<long>(dil)));
+            const float16x4_t x3 = vcvt_f16_f32(
+                vld1q_f32(wr + 3 * static_cast<long>(dil) + i * static_cast<long>(dil)));
+            const float16x4x2_t a01 = vtrn_f16(x0, x1);
+            const float16x4x2_t a23 = vtrn_f16(x2, x3);
+            const float32x2x2_t b0 = vtrn_f32(
+                vreinterpret_f32_f16(a01.val[0]),
+                vreinterpret_f32_f16(a23.val[0]));
+            const float32x2x2_t b1 = vtrn_f32(
+                vreinterpret_f32_f16(a01.val[1]),
+                vreinterpret_f32_f16(a23.val[1]));
+            float16x4_t* dst4 = g == 0 ? lo4 : hi4;
+            dst4[0] = vreinterpret_f16_f32(b0.val[0]);
+            dst4[1] = vreinterpret_f16_f32(b1.val[0]);
+            dst4[2] = vreinterpret_f16_f32(b0.val[1]);
+            dst4[3] = vreinterpret_f16_f32(b1.val[1]);
+          }
+          for (size_t j = 0; j < 4; ++j)
+            vst1q_f16(reinterpret_cast<__fp16*>(dp + (i + j) * 32),
+                      vcombine_f16(lo4[j], hi4[j]));
+        }
+        for (; i < static_cast<long>(k); ++i) {
+          // 尾 kk: 标量回写 (8 行 × 1 个 stride 位置)
+          const float* wr = x + c * T + s_lo;
+          for (size_t r = 0; r < 8; ++r)
+            dp[i * 32 + r] = f16_round(
+                wr[r * static_cast<long>(dil) + i * static_cast<long>(dil)]);
+        }
+      }
+      t += 8;
+    }
+    for (; t < T; ++t) write_row_scalar(t);
   } else {
     size_t t = 0;
     // 8 行一组快径: 完整窗口且不跨 tile; 每列 16B 宽存 (8 行 × f16)
