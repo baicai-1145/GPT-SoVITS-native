@@ -99,6 +99,8 @@ if(GSV_AMX_GEMM)
   target_link_libraries(amx_bench PRIVATE gsv_kern gsv_rt)
   add_executable(amx_batch_bench tools/amx_batch_bench.cpp)
   target_link_libraries(amx_batch_bench PRIVATE gsv_kern gsv_rt)
+  add_executable(s2_tile_chain_bench tools/s2_tile_chain_bench.cpp)
+  target_link_libraries(s2_tile_chain_bench PRIVATE gsv_kern gsv_rt)
 endif()
 
 # ---- 全链路 CLI (task/C2) ----
