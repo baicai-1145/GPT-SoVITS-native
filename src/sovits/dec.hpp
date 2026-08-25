@@ -315,8 +315,9 @@ class Generator {
       if (prof) t_tanh = now_ms_e6() - te;
     }
     if (prof) {
-      const double total = T.dec_pre + T.dec_cond + t_cond_ew + T.dec_ups +
-                           T.dec_res + T.dec_post + t_final_ew + t_tanh;
+      double total = T.dec_pre + T.dec_cond + t_cond_ew + T.dec_ups +
+                     T.dec_post + t_final_ew + t_tanh;
+      for (size_t i = 0; i < kStages; ++i) total += stage_res_t[i];
       const auto pct = [&](double v) { return total > 0 ? v / total * 100.0 : 0; };
       std::fprintf(stderr,
           "[sovits-dec-timing] total=%.1fms (prof=%s)\n"
