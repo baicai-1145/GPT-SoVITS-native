@@ -7,11 +7,16 @@
 #pragma once
 
 #include <cmath>
+#include <cstring>
+#include <functional>
 #include <string>
 #include <vector>
 
 #include "sovits/conv1d.hpp"
 #include "sovits/nn_ops.hpp"
+#if defined(GSV_AMX_GEMM)
+#include "kern/gemm_f16_amx.hpp"
+#endif
 
 namespace gsv::sovits {
 
@@ -69,6 +74,116 @@ class Generator {
     conv_post.load(f, "dec.conv_post", 1, 24, 7);
   }
 
+ private:
+#if defined(GSV_AMX_GEMM)
+  // E10: resblock stage 批量图执行 —— 3链×6卷积 = 18 节点、6 相位一次派发。
+  // im2col/lrelu/残差加全部放进 prepare 钩子在池 worker 内执行, 与同相位
+  // 兄弟链的 AMX 数学重叠。三链 sum 累加留主线程 (单飞, 阻塞式 amx_batch_run)。
+  // 数值序与串行路径完全一致: 链内算子序列不变, sum 累加按 j 序。
+  struct ResBatchScratch {
+    Tensor2D cur[3], tin[3], tA[3][2], tB[3][2];
+    kern::AmxPanel pb[3][6];
+  };
+
+  // batch_ms 输出本次批量派发耗时 (含 prepare+gemm)。
+  // 返回 false = 不满足批量条件 (调用方回退串行循环)。
+  bool res_forward_batched(size_t stage, const Tensor2D& x,
+                           Tensor2D& sum, double* batch_ms) const {
+    if (!kern::amx_gemm_available()) return false;
+    const size_t C = x.C, Tn = x.T;
+    const size_t nn = C * Tn;
+    if (Tn < 64 || nn == 0) return false;
+    for (size_t j = 0; j < kResKernels; ++j)
+      for (size_t m = 0; m < 3; ++m)
+        if (!resblocks[stage][j].convs1[m].amx_ready() ||
+            !resblocks[stage][j].convs2[m].amx_ready())
+          return false;
+
+    // 单飞安全: SoVITS stage 为单线程 FIFO, amx_batch_run 阻塞至完成;
+    // 静态存活使 pb/张量容量跨调用复用 (免 prepare 内分配)。
+    static ResBatchScratch s;
+    auto ensure = [](Tensor2D& t, size_t c, size_t tt) {
+      t.C = c; t.T = tt; t.d.resize(c * tt);
+    };
+    for (size_t j = 0; j < kResKernels; ++j) {
+      ensure(s.cur[j], C, Tn);
+      ensure(s.tin[j], C, Tn);
+      for (int h = 0; h < 2; ++h) {
+        ensure(s.tA[j][h], C, Tn);
+        ensure(s.tB[j][h], C, Tn);
+      }
+    }
+
+    const float* xn = x.d.data();
+    const float kInv = 1.f / static_cast<float>(kResKernels);
+    std::vector<kern::AmxBatchNode> nodes;
+    nodes.reserve(kResKernels * 6);
+    for (size_t j = 0; j < kResKernels; ++j) {
+      const ResBlock1& rb = resblocks[stage][j];
+      for (size_t p = 0; p < 6; ++p) {
+        const size_t m = p / 2;
+        const bool even = (p % 2) == 0;
+        const Conv1d& cv = even ? rb.convs1[m] : rb.convs2[m];
+        // MUST set rows/K before node creation: amx_batch_run validates
+        // pb->rows==N && pa->K==pb->K before prepare hook runs.
+        kern::AmxPanel& pb = s.pb[j][p];
+        pb.rows = Tn;
+        pb.K = cv.in_c * cv.k + 1;
+        float* outp = even ? s.tA[j][m & 1].d.data()
+                           : s.tB[j][m & 1].d.data();
+        kern::AmxBatchNode nd;
+        nd.phase = static_cast<int>(p);
+        nd.pa = &cv.amx_panel();
+        nd.pb = &pb;
+        nd.c = outp;
+        nd.M = cv.out_c;
+        nd.N = Tn;
+        nd.prepare = [j, p, m, even, Tn, nn, xn, cvl = &cv]() {
+          kern::AmxPanel& pbl = s.pb[j][p];
+          if (even) {
+            // cur 初始化/累加, 然后 lrelu(cur) → tin, im2col → panel
+            if (m == 0) {
+              std::memcpy(s.cur[j].d.data(), xn, nn * sizeof(float));
+            } else {
+              add_inplace(s.cur[j].d.data(),
+                          s.tB[j][(m - 1) & 1].d.data(), nn);
+            }
+            leaky_relu_write(s.cur[j].d.data(), s.tin[j].d.data(), nn, 0.1f);
+            im2col_to_panel_f16(s.tin[j].d.data(), cvl->in_c, Tn,
+                                cvl->k, cvl->dilation, pbl.buf, true);
+          } else {
+            // tA 就地 lrelu 后产 panel (与串行序一致)
+            leaky_relu_io(s.tA[j][m & 1].d.data(), nn, 0.1f);
+            im2col_to_panel_f16(s.tA[j][m & 1].d.data(), cvl->in_c, Tn,
+                                cvl->k, cvl->dilation, pbl.buf, true);
+          }
+        };
+        nodes.push_back(std::move(nd));
+      }
+    }
+
+    const double tb = now_ms_e6();
+    kern::amx_batch_run(nodes.data(), nodes.size());
+    *batch_ms = now_ms_e6() - tb;
+
+    // 三链 sum 累加 (主线程): cur += convs2[2] 输出; sum += cur/3
+    for (size_t j = 0; j < kResKernels; ++j) {
+      add_inplace(s.cur[j].d.data(), s.tB[j][0].d.data(), nn);
+      if (j == 0) {
+        mul_write(sum.d.data(), s.cur[j].d.data(), nn, kInv);
+      } else {
+        add_scaled_inplace(sum.d.data(), s.cur[j].d.data(), nn, kInv);
+      }
+    }
+    return true;
+  }
+#else
+  bool res_forward_batched(size_t, const Tensor2D&, Tensor2D&, double*) const {
+    return false;
+  }
+#endif
+
+ public:
   // z[192,T] → wav [1, T*640], 值域 [-1,1]
   void forward(const Tensor2D& z, const Tensor2D& ge, Tensor2D& out,
                const Dumper& dm) const {
@@ -110,50 +225,58 @@ class Generator {
       // torch: xs = Σ_j block_j(x) (块内三对串联卷积, 每对后残差相加,
       // 故 block_j 已含输入 x); x = xs / 3。
       constexpr float kInv = 1.f / static_cast<float>(kResKernels);
-      t0 = tic();
       // E6: 全覆写缓冲免零填 (resize-only), 拷贝走 memcpy
       sum.C = x.C;
       sum.T = x.T;
       sum.d.resize(x.d.size());
-      static thread_local Tensor2D cur, t_in, t_a, t_b;
-      bool first = true;
-      for (size_t j = 0; j < kResKernels; ++j) {
-        const ResBlock1& rb = resblocks[i][j];
-        cur.C = x.C;
-        cur.T = x.T;
-        cur.d.resize(x.d.size());
-        std::memcpy(cur.d.data(), x.d.data(), x.d.size() * sizeof(float));
-        for (size_t jj = 0; jj < 3; ++jj) {
-          // torch: xt=lrelu(x); xt=c1(xt); xt=lrelu(xt); xt=c2(xt); x=xt+x
-          // (lrelu 不污染残差分支 — 用独立缓冲 t_in)
-          double te = tic();
-          t_in.C = cur.C;
-          t_in.T = cur.T;
-          t_in.d.resize(cur.d.size());
-          leaky_relu_write(cur.d.data(), t_in.d.data(), cur.d.size(), 0.1f);
-          if (prof) T.res_ew += now_ms_e6() - te;
-          t0 = tic();
-          rb.convs1[jj].forward(t_in, t_a);
-          if (prof) T.res_conv1 += now_ms_e6() - t0;
-          te = tic();
-          leaky_relu_io(t_a.d.data(), t_a.d.size(), 0.1f);
-          if (prof) T.res_ew += now_ms_e6() - te;
-          t0 = tic();
-          rb.convs2[jj].forward(t_a, t_b);
-          if (prof) T.res_conv2 += now_ms_e6() - t0;
-          te = tic();
-          add_inplace(cur.d.data(), t_b.d.data(), cur.d.size());
-          if (prof) T.res_ew += now_ms_e6() - te;
+      // E10: resblock stage 批量图执行 — 3链×6卷积=18 节点, 按链深分 6 相位
+      // 一次 amx_batch_run 派发 (im2col/lrelu/residual-add 放进 prepare 钩子,
+      // 与同相位兄弟链 AMX 数学重叠)。不满足条件(T<64/无panel/AMX不可用)回退。
+      double batch_ms = 0.0;
+      t0 = tic();
+      if (res_forward_batched(i, x, sum, &batch_ms)) {
+        if (prof) T.dec_res += batch_ms;
+      } else {
+        static thread_local Tensor2D cur, t_in, t_a, t_b;
+        bool first = true;
+        for (size_t j = 0; j < kResKernels; ++j) {
+          const ResBlock1& rb = resblocks[i][j];
+          cur.C = x.C;
+          cur.T = x.T;
+          cur.d.resize(x.d.size());
+          std::memcpy(cur.d.data(), x.d.data(), x.d.size() * sizeof(float));
+          for (size_t jj = 0; jj < 3; ++jj) {
+            // torch: xt=lrelu(x); xt=c1(xt); xt=lrelu(xt); xt=c2(xt); x=xt+x
+            // (lrelu 不污染残差分支 — 用独立缓冲 t_in)
+            double te = tic();
+            t_in.C = cur.C;
+            t_in.T = cur.T;
+            t_in.d.resize(cur.d.size());
+            leaky_relu_write(cur.d.data(), t_in.d.data(), cur.d.size(), 0.1f);
+            if (prof) T.res_ew += now_ms_e6() - te;
+            t0 = tic();
+            rb.convs1[jj].forward(t_in, t_a);
+            if (prof) T.res_conv1 += now_ms_e6() - t0;
+            te = tic();
+            leaky_relu_io(t_a.d.data(), t_a.d.size(), 0.1f);
+            if (prof) T.res_ew += now_ms_e6() - te;
+            t0 = tic();
+            rb.convs2[jj].forward(t_a, t_b);
+            if (prof) T.res_conv2 += now_ms_e6() - t0;
+            te = tic();
+            add_inplace(cur.d.data(), t_b.d.data(), cur.d.size());
+            if (prof) T.res_ew += now_ms_e6() - te;
+          }
+          if (first) {
+            mul_write(sum.d.data(), cur.d.data(), sum.d.size(), kInv);
+            first = false;
+          } else {
+            add_scaled_inplace(sum.d.data(), cur.d.data(), sum.d.size(), kInv);
+          }
         }
-        if (first) {
-          mul_write(sum.d.data(), cur.d.data(), sum.d.size(), kInv);
-          first = false;
-        } else {
-          add_scaled_inplace(sum.d.data(), cur.d.data(), sum.d.size(), kInv);
-        }
+        if (prof) T.dec_res += now_ms_e6() - t0;
       }
       x.d.swap(sum.d);
-      if (prof) T.dec_res += now_ms_e6() - t0;
       {
         std::string n = "dbg_dec_res" + std::to_string(i);
         dm.dump(n.c_str(), x);
