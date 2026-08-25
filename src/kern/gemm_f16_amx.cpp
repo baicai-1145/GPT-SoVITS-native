@@ -101,6 +101,15 @@ struct AmxPool {
   std::atomic<int> healthy{0};   // 探测成功的 worker 数
   std::atomic<int> probed{0};    // 已完成探测的 worker 数 (含失败)
 
+  // E10-K: 按-chain DAG 调度状态 (amx_chain_run 使用)
+  // dag_mode 开启时, finish_task 用 dag_remaining/dag_succs 代替
+  // phase_left/future_phases, 实现节点就绪立即执行 (无全局 barrier)。
+  bool dag_mode = false;
+  std::vector<int> dag_deps;           // 每节点剩余前驱未完成数
+  std::vector<int> dag_remaining;      // 每节点剩余任务 chunk 数
+  std::vector<std::vector<int>> dag_succs;  // 每节点的后继节点索引列表
+  std::vector<std::deque<Task>> dag_init_tasks;  // 节点解锁时入队的初始任务
+
   explicit AmxPool(size_t n) {
     threads.reserve(n);
     for (size_t i = 0; i < n; ++i)
@@ -127,15 +136,34 @@ struct AmxPool {
 
   // mu 已持: 任务完成记账; 相位清空则解锁下一相位
   void finish_task(int phase) {
-    const size_t p = size_t(phase);
-    if (p < phase_left.size() && --phase_left[p] == 0 &&
-        p + 1 < future_phases.size()) {
-      auto& nx = future_phases[p + 1];
-      while (!nx.empty()) {
-        ready.push_back(std::move(nx.front()));
-        nx.pop_front();
+    if (dag_mode) {
+      // E10-K: 按-chain DAG 调度 —— 仅当本节点所有 chunks 完成时,
+      // 才解锁其后继节点 (而非等待整个 phase). idx = node_idx。
+      const size_t idx = size_t(phase);
+      if (idx < dag_remaining.size() && --dag_remaining[idx] == 0) {
+        for (int succ : dag_succs[idx]) {
+          if (succ >= 0 && size_t(succ) < dag_deps.size() &&
+              --dag_deps[succ] == 0) {
+            auto& q = dag_init_tasks[succ];
+            while (!q.empty()) {
+              ready.push_back(std::move(q.front()));
+              q.pop_front();
+            }
+          }
+        }
+        cv.notify_all();
       }
-      cv.notify_all();
+    } else {
+      const size_t p = size_t(phase);
+      if (p < phase_left.size() && --phase_left[p] == 0 &&
+          p + 1 < future_phases.size()) {
+        auto& nx = future_phases[p + 1];
+        while (!nx.empty()) {
+          ready.push_back(std::move(nx.front()));
+          nx.pop_front();
+        }
+        cv.notify_all();
+      }
     }
     if (--pending == 0) done_cv.notify_all();
   }
@@ -217,6 +245,46 @@ struct AmxPool {
     }
     std::unique_lock<std::mutex> lk(mu);
     done_cv.wait(lk, [this] { return pending == 0; });
+  }
+  // E10-K: 按-chain DAG 图提交。deps[i] = 节点 i 的前驱未完成数;
+  // succs[i] = 节点 i 的后继列表; remaining[i] = 节点 i 的总任务块数;
+  // init_tasks[i] = 节点 i 解锁时入队的初始任务 (prepare 或 tiles)。
+  // 与 submit_graph 异同: 不按 phase 屏障, 而按节点依赖图就绪即入队。
+  void submit_dag(const std::vector<int>& deps,
+                  const std::vector<std::vector<int>>& succs,
+                  const std::vector<int>& remaining,
+                  std::vector<std::deque<Task>> init_tasks) {
+    size_t n = deps.size();
+    size_t total = 0;
+    for (size_t i = 0; i < n; ++i) total += remaining[i];
+    if (total == 0) return;
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      dag_mode = true;
+      dag_deps = deps;
+      dag_succs = succs;
+      dag_remaining = remaining;
+      dag_init_tasks = std::move(init_tasks);
+      pending += total;
+      // 初始解锁: deps==0 的节点, 入队其 init_tasks
+      for (size_t i = 0; i < n; ++i) {
+        if (dag_deps[i] == 0) {
+          auto& q = dag_init_tasks[i];
+          while (!q.empty()) {
+            ready.push_back(std::move(q.front()));
+            q.pop_front();
+          }
+        }
+      }
+      cv.notify_all();
+    }
+    std::unique_lock<std::mutex> lk(mu);
+    done_cv.wait(lk, [this] { return pending == 0; });
+    dag_mode = false;
+    dag_init_tasks.clear();
+    dag_deps.clear();
+    dag_succs.clear();
+    dag_remaining.clear();
   }
 };
 
@@ -538,6 +606,107 @@ void amx_batch_run(const AmxBatchNode* nodes, size_t n) {
     }
   }
   pool.submit_graph(np, totals.data(), byphase);
+}
+
+// ---------------- E10-K: 按-chain DAG 调度消 barrier ----------------
+// 与 amx_batch_run 同构, 差异仅在依赖模型:
+//   amx_batch_run: 同 phase (depth) 节点并行, 异 phase 串行 (全局 barrier);
+//   amx_chain_run: 同 chain_id 内 depth 串行, 异 chain_id 并行 (无 barrier)。
+//     —— node (c,d) 仅依赖 node (c,d-1), 不等待其他链。
+// 数值序完全一致 (同内核、同 tile 划分、同 prepare 钩子顺序), 故逐位相同。
+// profiling 目标: 消除 phase barrier 浪费 (math 96ms + prepare 32ms → ≤100ms)。
+void amx_chain_run(const AmxChainLink* nodes, size_t n) {
+  if (nodes == nullptr || n == 0) return;
+  AmxPool& pool = amx_pool();
+  const int healthy = pool.healthy.load(std::memory_order_acquire);
+  if (healthy <= 0) {
+    // 无 AMX: 退化为串行 amx_batch_run (回退 fmlal)
+    for (size_t i = 0; i < n; ++i)
+      gemm_f16_amx_pp(*nodes[i].pa, *nodes[i].pb, nodes[i].c, nodes[i].M,
+                      nodes[i].N);
+    return;
+  }
+
+  // ---- 构建 chain 依赖图: node (c,d) 依赖同链 (c,d-1) ----
+  // O(n²) 枚举 (n≤18, 忽略不计); 支持多前驱(同链多节点同 depth).
+  std::vector<int> deps(n, 0);
+  std::vector<std::vector<int>> succs(n);
+  for (size_t i = 0; i < n; ++i)
+    for (size_t j = 0; j < n; ++j)
+      if (i != j && nodes[j].chain_id == nodes[i].chain_id &&
+          nodes[j].depth + 1 == nodes[i].depth) {
+        ++deps[i];
+        succs[j].push_back(static_cast<int>(i));
+      }
+
+  // ---- 逐节点构建 tile chunk + prepare hook (沿用 amx_batch_run 模式) ----
+  struct NodeExec {
+    std::deque<AmxPool::Task> chunks;
+    int heads_left = 0;
+    bool launched = false;
+  };
+  std::vector<NodeExec> ex(n);
+  std::vector<int> remaining(n, 0);       // 每节点总任务数 (prepare + tiles)
+  std::vector<std::deque<AmxPool::Task>> init_tasks(n);  // 解锁时入队
+
+  auto launch_node = [&](size_t i) {  // mu 已持
+    auto& e = ex[i];
+    if (e.launched || --e.heads_left > 0) return;
+    e.launched = true;
+    while (!e.chunks.empty()) {
+      pool.ready.push_back(std::move(e.chunks.front()));
+      e.chunks.pop_front();
+    }
+    pool.cv.notify_all();
+  };
+
+  for (size_t i = 0; i < n; ++i) {
+    const AmxChainLink& nd = nodes[i];
+    if (!nd.pa || !nd.pb || !nd.c || nd.M == 0 || nd.N == 0 ||
+        nd.pa->rows != nd.M || nd.pb->rows != nd.N || nd.pa->K != nd.pb->K)
+      continue;  // 非法节点静默跳过
+    const size_t M = nd.M, N = nd.N, K = nd.pa->K;
+    const size_t tiles = ((M + 31) / 32) * ((N + 31) / 32);
+    // 单节点内 tile 均分: 目标 ~2×worker
+    const size_t nnb = (N + 31) / 32;
+    const size_t nchunk = std::min(
+        tiles, std::max<size_t>(1, size_t(healthy) * 2));
+    const size_t chunk = tiles == 0 ? 1 : (tiles + nchunk - 1) / nchunk;
+    const int idx = static_cast<int>(i);
+    float* c = nd.c;
+    // 注意: pa/pb data() 在任务执行时才取 —— prepare 可能刚填完 pb.buf
+    for (size_t t0 = 0; t0 < tiles; t0 += chunk) {
+      const size_t t1 = std::min(tiles, t0 + chunk);
+      ex[i].chunks.push_back(AmxPool::Task{
+          idx,
+          [&nd, c, M, N, K, nnb, t0, t1] {
+            const uint8_t* pa_data = nd.pa->data();
+            const uint8_t* pb_data = nd.pb->data();
+            for (size_t t = t0; t < t1; ++t)
+              amx_tile(pa_data, pb_data, c, M, N, K, t / nnb, t % nnb);
+          },
+          nullptr});
+      ++remaining[i];
+    }
+
+    if (nd.prepare) {  // head: prepare 完成后放行本节点 tile 块
+      ex[i].heads_left = 1;
+      auto* pp = const_cast<std::function<void()>*>(&nd.prepare);
+      init_tasks[i].push_back(AmxPool::Task{
+          idx,
+          [pp]() { (*pp)(); },
+          [launch_node, i]() { launch_node(i); }});
+      ++remaining[i];
+    } else {
+      // 无前置: tile 块直接作为 init tasks (解锁时入队)
+      while (!ex[i].chunks.empty()) {
+        init_tasks[i].push_back(std::move(ex[i].chunks.front()));
+        ex[i].chunks.pop_front();
+      }
+    }
+  }
+
+  pool.submit_dag(deps, succs, remaining, std::move(init_tasks));
 }
 
 }  // namespace gsv::kern

@@ -77,9 +77,10 @@ class Generator {
 
  private:
 #if defined(GSV_AMX_GEMM)
-  // E10: resblock stage 批量图执行 —— 3链×6卷积 = 18 节点、6 相位一次派发。
-  // im2col/lrelu/残差加全部放进 prepare 钩子在池 worker 内执行, 与同相位
-  // 兄弟链的 AMX 数学重叠。三链 sum 累加留主线程 (单飞, 阻塞式 amx_batch_run)。
+  // E10-K: resblock stage 按-chain DAG 调度 —— 3链×6卷积 = 18 节点。
+  // 依赖仅限同 chain 内 depth-1→depth (跨链无 barrier)。im2col/lrelu/残差加
+  // 放进 prepare 钩子在池 worker 内执行, 与同 chain 其他节点的数学重叠。
+  // 三链 sum 累加留主线程 (单飞, 阻塞式 amx_chain_run)。
   // 数值序与串行路径完全一致: 链内算子序列不变, sum 累加按 j 序。
   struct ResBatchScratch {
     Tensor2D cur[3], tin[3], tA[3][2], tB[3][2];
@@ -117,7 +118,7 @@ class Generator {
 
     const float* xn = x.d.data();
     const float kInv = 1.f / static_cast<float>(kResKernels);
-    std::vector<kern::AmxBatchNode> nodes;
+    std::vector<kern::AmxChainLink> nodes;
     nodes.reserve(kResKernels * 6);
     for (size_t j = 0; j < kResKernels; ++j) {
       const ResBlock1& rb = resblocks[stage][j];
@@ -125,15 +126,16 @@ class Generator {
         const size_t m = p / 2;
         const bool even = (p % 2) == 0;
         const Conv1d& cv = even ? rb.convs1[m] : rb.convs2[m];
-        // MUST set rows/K before node creation: amx_batch_run validates
+        // MUST set rows/K before node creation: amx_chain_run validates
         // pb->rows==N && pa->K==pb->K before prepare hook runs.
         kern::AmxPanel& pb = s.pb[j][p];
         pb.rows = Tn;
         pb.K = cv.in_c * cv.k + 1;
         float* outp = even ? s.tA[j][m & 1].d.data()
                            : s.tB[j][m & 1].d.data();
-        kern::AmxBatchNode nd;
-        nd.phase = static_cast<int>(p);
+        kern::AmxChainLink nd;
+        nd.chain_id = static_cast<int>(j);
+        nd.depth = static_cast<int>(p);
         nd.pa = &cv.amx_panel();
         nd.pb = &pb;
         nd.c = outp;
@@ -164,7 +166,7 @@ class Generator {
     }
 
     const double tb = now_ms_e6();
-    kern::amx_batch_run(nodes.data(), nodes.size());
+    kern::amx_chain_run(nodes.data(), nodes.size());
     *batch_ms = now_ms_e6() - tb;
 
     // 三链 sum 累加 (主线程): cur += convs2[2] 输出; sum += cur/3
@@ -247,9 +249,9 @@ class Generator {
       sum.C = x.C;
       sum.T = x.T;
       sum.d.resize(x.d.size());
-      // E10: resblock stage 批量图执行 — 3链×6卷积=18 节点, 按链深分 6 相位
-      // 一次 amx_batch_run 派发 (im2col/lrelu/residual-add 放进 prepare 钩子,
-      // 与同相位兄弟链 AMX 数学重叠)。不满足条件(T<64/无panel/AMX不可用)回退。
+      // E10-K: resblock stage 按-chain DAG 调度 — 3链×6卷积=18 节点,
+      // chain_id=j/depth=p, 同 chain 串行异 chain 并行 (无 phase barrier)。
+      // im2col/lrelu/residual-add 放进 prepare 钩子, 与同 chain 数学重叠。
       double batch_ms = 0.0;
       double t_res = tic();
       t0 = tic();

@@ -33,3 +33,13 @@
   **SoVITS ≈ 620ms (77%) ← 当前主瓶颈**
 - 热缓存真实 RTF ≈ 0.28（此前报告的 0.508 系冷缓存/负载污染值, 作废重标）
 - 已知噪声: load 段 150ms~16s 波动(panel/缓存重建+系统争用), 定标须多轮取 min
+
+## 2026-08-25 马拉松 Phase 0: SoVITS 硬件理论地板 (/tmp/sov_floor.cpp, 实测)
+
+- AMX gemm_f16_amx_pp 实测吞吐 (当前环境): 大形状 ~1000 GMAC/s (2 TFLOP/s);
+  M=24 → 345; enc_p 小K → 260-470 (tile 填充率限制)
+- 长句(5.5s音频) SoVITS 总 MACs ≈ 48 GMAC (30个resblock conv+ups+pre/post)
+- **计算地板 = Σ(MACs_i/实测吞吐_i) ≈ 63 ms**
+- 带宽地板: 激活流量 0.6-1GB @25-47GB/s ≈ 15-40 ms (非瓶颈)
+- 当前实测 1280 ms → **距计算地板 20×**; AMX 池 88% 空转证实瓶颈为流水线结构
+- 靶心: SoVITS 段 ≤ 1.3×63 ≈ 82ms 视为达线
