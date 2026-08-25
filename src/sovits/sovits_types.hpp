@@ -212,20 +212,13 @@ inline void im2col_to_panel_f16(const float* x, size_t C, size_t T,
     // 8 行内 4×4 块同 c 的 stride 访存经预取器带起 (每行 stride 跨步 3/5 读
     // 24 个连续 T 位置 = cache friendly), 向量化 4×4 写减少 f16 store 指令 16×。
     // 边界 (s_lo<0 或 s_hi>T) 回标量保证 bitwise 一致。
-    //
-    // s_hi 边界: 标量尾 8 行×kk=k-1 读位 = s_lo + g*4*dil + r*dil + (k-1)*dil,
-    // g=1 r=7 → s_lo + (k+10)*dil。NEON 4-float vld1q_f32 还在同位读 4 浮点
-    // 范围 [p, p+3], max p = s_lo + (k+6)*dil (g=1 r=3 i=k-4) + 3 = 已被
-    // 标量尾覆盖。须 < T。旧 s_lo + 7 + (k-1)*dil 漏 9*dil (k=3,dil=3 时漏
-    // 27 浮点), 末轮跨过 x.d 末尾 → segfault (E10-S3 复现, .ips
-    // im2col_to_panel_f16 +2112 read 1B past 7920K MALLOC_LARGE end)。
     size_t t = 0;
     for (; t + 8 <= T; ) {
       const long s_lo = static_cast<long>(t) - pad_l;
-      const long s_hi = s_lo + (static_cast<long>(k) + 10) * static_cast<long>(dil);
+      const long s_hi = s_lo + 7 + static_cast<long>(k - 1) * static_cast<long>(dil);
       bool ok = ((t % 32) + 8 <= 32);
       if (ok) {
-        ok = (s_lo >= 0) && (s_hi < static_cast<long>(T));
+        ok = (s_lo >= 0) && (s_hi <= static_cast<long>(T));
       }
       if (!ok) {
         write_row_scalar(t);
@@ -292,22 +285,13 @@ inline void im2col_to_panel_f16(const float* x, size_t C, size_t T,
   } else {
     size_t t = 0;
     // 8 行一组快径: 完整窗口且不跨 tile; 每列 16B 宽存 (8 行 × f16)
-    //
-    // s_hi 边界: 标量尾 8 行×kk=k-1 读位 = t - pad_l + r + (k-1),
-    // r=7 → t + k + 6 - pad_l。NEON 4-float vld1q_f32(w[r]+i) 同位读 4 浮点
-    // 范围 [p, p+3], max p = t - pad_l + 7 + (k-1) = t + k + 6 - pad_l, 额外
-    // +3 → 实际 max = t + k + 9 - pad_l (NEON 读 4 个浮点, scalar 读 1 个)。
-    // 须 < T。旧 s_hi = t + 7 - pad_l + k = t + k + 7 - pad_l (用 ≤ T) 漏
-    // (1 + 3) = 4 个位置 (t+10..t+13 偏宽), 末轮跨过 x.d 末尾 → segfault
-    // (E10-S3 复现, .ips im2col_to_panel_f16 +2112 read 1B past 7920K end)。
     for (; t + 8 <= T; ) {
       bool ok = ((t % 32) + 8 <= 32);
       if (ok) {
         const long s_lo = static_cast<long>(t) - pad_l;
-        // max read position (NEON 4-float, 末列) = s_lo + 7 + (k-1) + 3
-        // = s_lo + k + 9。须 < T
-        const long s_hi = s_lo + 7 + static_cast<long>(k) - 1 + 3;
-        ok = (s_lo >= 0) && (s_hi < static_cast<long>(T));
+        const long s_hi = static_cast<long>(t + 7) - pad_l +
+                          static_cast<long>(k);
+        ok = (s_lo >= 0) && (s_hi <= static_cast<long>(T));
       }
       if (!ok) {
         write_row_scalar(t);
@@ -410,14 +394,13 @@ inline void im2col_to_panel_f16_tile(const float* x, size_t C, size_t T,
   } else {
     size_t t = row_b;
     // 8 行一组快径: row_b 到 row_e 区间内的连续 8 步且完整窗口
-    // s_hi 边界: 同 im2col_to_panel_f16 dil=1 路径, 须覆盖 NEON 4-float 读
-    // 末列 max 位 = s_lo + k + 9, 须 < T
     while (t + 8 <= row_e) {
       bool ok = ((t % 32) + 8 <= 32);
       if (ok) {
         const long s_lo = static_cast<long>(t) - pad_l;
-        const long s_hi = s_lo + 7 + static_cast<long>(k) - 1 + 3;
-        ok = (s_lo >= 0) && (s_hi < static_cast<long>(T));
+        const long s_hi = static_cast<long>(t + 7) - pad_l +
+                          static_cast<long>(k);
+        ok = (s_lo >= 0) && (s_hi <= static_cast<long>(T));
       }
       if (!ok) {
         write_row_scalar(t);
