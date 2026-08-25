@@ -53,7 +53,8 @@
 | E9 | kern 批量多GEMM单次派发 API(amx_batch_run, phase-图调度, prepare钩子就地im2col) | E6 | exec-ar | DONE | task/E9 | amx_batch_run+AmxBatchNode+prepare钩子实现; bench: C场景prep流水1.10x, bitwise_diff=0; test amx_batch_matches_sequential PASS |
 | E7 | 加载方差治理: 根因=USB盘73MB/s+双布局冗余63%+页缓存挤占; --slim(-63%字节,wav逐位一致)+RDADVISE预读 | E5-P2 | exec-ar | DONE | task/E7 | 已合并; slim权重已部署内置NVMe ~/gsv-weights(load 380ms达标); 后续: convert.py直产slim(C方案)归M0工具链 |
 | E10-MHA | MHA batched sgemm(320→58ms实测) — 已合入 | E9 | exec-sov-b35 | DONE | task/E6 | 热态配对-9%; 剩余attn_out 29+rel 24标量路径低优先 |
-| E10-S2 | S2 resblock 3.73×地板异常排查修复(靶≤2×) | E10-MHA | exec-sov-b37 | IN_PROGRESS | task/E6 | S2=224.5ms vs 地板60.2; 全局res 2.30× |
+| E10-S2 | S2排查一轮DONE合入: im2col dil>1 NEON化(100→25ms), 全局voc 900→~770ms; S2 224→157ms | E10-MHA | exec-sov-b37 | DONE(一轮) | task/E6 | 确诊根因=per-node prepare依赖; 后续在E10-K2 |
+| E10-K2 | kern amx_chain_run per-tile prepare依赖(行波推进, math/prepare overlap) | E10-S2 | exec-ar-b36 | IN_PROGRESS | task/E10-K2 | S2靶≤110ms; b37随后接线dec侧 |
 | E8 | encoder DenseF16→AMX后端切换(bert.ffn形状bench 2.07x; 当前仅66ms, 低优先级) | E5 | 未分配 | TODO | | 待E6后视余量 |
 | E4 | 长单段AR复读环鲁棒性: 对齐python topk_sampling(top_k/top_p/temperature+惩罚,CALIBRATION)或移植early_stop_num | C2 | 未分配 | TODO | 复读事件根因已定位=默认参考文本与参考音频错配(修正为no_prompt_text默认, 910→68 tokens); 本卡降级为低优先级鲁棒性储备 |
 | E5 | AMX 指令直接编程: fp16×fp16→fp32 矩阵协处理器后端(压榨CPU终极手段) | E2-SOV,E2-ENC | exec-ar | DONE(phase1) | task/E5 | 已合入(main默认OFF,-DGSV_AMX_GEMM=ON); 本机复验bench: amxpp 9/10形状反超sgemm 1.04-2.07x, cos=1.0全PASS; 实锤手写fmlal慢5-10x→E2-SOV的fmlal方案作废 |
