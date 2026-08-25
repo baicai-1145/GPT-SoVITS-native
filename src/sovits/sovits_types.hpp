@@ -281,6 +281,112 @@ inline void im2col_to_panel_f16(const float* x, size_t C, size_t T,
   }
 }
 
+// E10-K2: im2col 按 tile 切片 — 仅处理 [row_b, row_e) 时间步区间, 写入 panel
+// 对应 tile 段。与全量 im2col_to_panel_f16 位级一致: 布局/转置/ones列/尾块
+// 补零逻辑完全相同。供 amx_tile_chain_run 的 prepare 钩子调用, 实现
+// per-tile prepare 与 per-tile math 的解耦调度。row_b 必须 32 对齐, row_e
+// 不能越过 N; 区间长度 <=32 (单个 32 步 tile)。out 必须已 resize 到完整
+// 容量 (nt * K * 64 + 64), 由调用方 (dec.hpp) 持有并传入。
+inline void im2col_to_panel_f16_tile(const float* x, size_t C, size_t T,
+                                     size_t k, size_t dil, size_t row_b,
+                                     size_t row_e,
+                                     std::vector<uint8_t>& out,
+                                     bool append_ones_col = false) {
+  const size_t K = C * k + (append_ones_col ? 1 : 0);
+  const size_t Kw = C * k;
+  const uintptr_t pbase = (uintptr_t)out.data();
+  uint8_t* dst = out.data() + ((64 - (pbase & 63)) & 63);
+  const long pad_l = static_cast<long>((k - 1) * dil) / 2;
+  auto src_at = [&](size_t c, long s) {
+    return f16_round(x[c * T + static_cast<size_t>(s)]);
+  };
+  // 标量写入 (边界/单步)
+  auto write_row_scalar = [&](size_t t) {
+    uint16_t* drow = reinterpret_cast<uint16_t*>(dst + (t / 32) * K * 64 +
+                                                 (t % 32) * 2);
+    const long s0 = static_cast<long>(t) - pad_l;
+    if (append_ones_col) drow[Kw * 32] = 0x3C00;
+    for (size_t c = 0; c < C; ++c) {
+      uint16_t* dp = drow + c * k * 32;
+      for (long kk = 0; kk < static_cast<long>(k); ++kk) {
+        const long s = s0 + kk * static_cast<long>(dil);
+        dp[kk * 32] =
+            (s >= 0 && s < static_cast<long>(T)) ? src_at(c, s) : 0;
+      }
+    }
+  };
+  if (dil != 1) {
+    for (size_t t = row_b; t < row_e; ++t) write_row_scalar(t);
+  } else {
+    size_t t = row_b;
+    // 8 行一组快径: row_b 到 row_e 区间内的连续 8 步且完整窗口
+    while (t + 8 <= row_e) {
+      bool ok = ((t % 32) + 8 <= 32);
+      if (ok) {
+        const long s_lo = static_cast<long>(t) - pad_l;
+        const long s_hi = static_cast<long>(t + 7) - pad_l +
+                          static_cast<long>(k);
+        ok = (s_lo >= 0) && (s_hi <= static_cast<long>(T));
+      }
+      if (!ok) {
+        write_row_scalar(t);
+        ++t;
+        continue;
+      }
+      uint8_t* d = dst + (t / 32) * K * 64 + (t % 32) * 2;
+      if (append_ones_col) {
+        uint16_t* ones = reinterpret_cast<uint16_t*>(dst + (t / 32) * K * 64 +
+                                                    Kw * 64);
+        for (size_t r = 0; r < 8; ++r) ones[(t % 32) + r] = 0x3C00;
+      }
+      for (size_t c = 0; c < C; ++c) {
+        const float* w[8];
+        for (size_t r = 0; r < 8; ++r) w[r] = x + c * T + (t - pad_l) + r;
+        uint16_t* dp = reinterpret_cast<uint16_t*>(d) + c * k * 32;
+        long i = 0;
+        for (; i + 4 <= static_cast<long>(k); i += 4) {
+          float16x4_t lo4[4], hi4[4];
+          for (size_t g = 0; g < 2; ++g) {
+            const float16x4_t x0 = vcvt_f16_f32(vld1q_f32(w[g*4+0] + i));
+            const float16x4_t x1 = vcvt_f16_f32(vld1q_f32(w[g*4+1] + i));
+            const float16x4_t x2 = vcvt_f16_f32(vld1q_f32(w[g*4+2] + i));
+            const float16x4_t x3 = vcvt_f16_f32(vld1q_f32(w[g*4+3] + i));
+            const float16x4x2_t a01 = vtrn_f16(x0, x1);
+            const float16x4x2_t a23 = vtrn_f16(x2, x3);
+            const float32x2x2_t b0 = vtrn_f32(
+                vreinterpret_f32_f16(a01.val[0]),
+                vreinterpret_f32_f16(a23.val[0]));
+            const float32x2x2_t b1 = vtrn_f32(
+                vreinterpret_f32_f16(a01.val[1]),
+                vreinterpret_f32_f16(a23.val[1]));
+            float16x4_t* dst4 = g == 0 ? lo4 : hi4;
+            dst4[0] = vreinterpret_f16_f32(b0.val[0]);
+            dst4[1] = vreinterpret_f16_f32(b1.val[0]);
+            dst4[2] = vreinterpret_f16_f32(b0.val[1]);
+            dst4[3] = vreinterpret_f16_f32(b1.val[1]);
+          }
+          for (size_t j = 0; j < 4; ++j)
+            vst1q_f16(reinterpret_cast<__fp16*>(dp + (i + j) * 32),
+                      vcombine_f16(lo4[j], hi4[j]));
+        }
+        for (; i < static_cast<long>(k); ++i)
+          for (size_t r = 0; r < 8; ++r)
+            dp[(i)*32 + r] = f16_round(w[r][i]);
+      }
+      t += 8;
+    }
+    for (; t < row_e; ++t) write_row_scalar(t);
+  }
+  // 尾块 (row_e 为 tile 末行 <= 32) 未用行补零
+  if (row_e == T && (T % 32) != 0) {
+    const size_t tr = T - ((T - 1) / 32) * 32;
+    const size_t last_tile = (T - 1) / 32;
+    uint8_t* dlast = dst + last_tile * K * 64;
+    for (size_t pcol = 0; pcol < K; ++pcol)
+      std::memset(dlast + pcol * 64 + tr * 2, 0, 64 - tr * 2);
+  }
+}
+
 inline void load_tensor_f32(const rt::GsvFile& f, std::string_view name,
                             std::vector<float>& dst,
                             std::initializer_list<size_t> expect_dims) {

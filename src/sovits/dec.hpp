@@ -76,11 +76,15 @@ class Generator {
 
  private:
 #if defined(GSV_AMX_GEMM)
-  // E10-K: resblock stage 按-chain DAG 调度 —— 3链×6卷积 = 18 节点。
-  // 依赖仅限同 chain 内 depth-1→depth (跨链无 barrier)。im2col/lrelu/残差加
-  // 放进 prepare 钩子在池 worker 内执行, 与同 chain 其他节点的数学重叠。
-  // 三链 sum 累加留主线程 (单飞, 阻塞式 amx_chain_run)。
-  // 数值序与串行路径完全一致: 链内算子序列不变, sum 累加按 j 序。
+  // E10-K2: resblock stage 按-tile DAG 调度 — 3链×6卷积×nmb×nnb 个 tile。
+  // amx_tile_chain_run 内部将同 (c,d,mb) 内连续 nb 合并为 chunk (调度节点),
+  // 以 ~32*healthy tile/chunk 为粒度。依赖模型 (chunk 级):
+  //   跨深度 (c,d,chunk) → (c,d-1,chunk)
+  //   同行列 (c,d,chunk) → (c,d,chunk-1)
+  //   左边界 (c,d,chunk) → (c,d-1,chunk-1)  (im2col 窗口跨 chunk 边界)
+  // prepare 钩子仅处理 tile 行区间 [row_b, row_e) — 池内 im2col 切片
+  // 与同 chain 后续 chunk 数学重叠, 消除 ~25ms 全局 prepare 串行。
+  // 数值序与 E10-K amx_chain_run 一致: 链内算子序列不变, sum 累加按 j 序。
   struct ResBatchScratch {
     Tensor2D cur[3], tin[3], tA[3][2], tB[3][2];
     kern::AmxPanel pb[3][6];
@@ -100,7 +104,7 @@ class Generator {
             !resblocks[stage][j].convs2[m].amx_ready())
           return false;
 
-    // 单飞安全: SoVITS stage 为单线程 FIFO, amx_batch_run 阻塞至完成;
+    // 单飞安全: SoVITS stage 为单线程 FIFO, amx_tile_chain_run 阻塞至完成;
     // 静态存活使 pb/张量容量跨调用复用 (免 prepare 内分配)。
     static ResBatchScratch s;
     auto ensure = [](Tensor2D& t, size_t c, size_t tt) {
@@ -117,55 +121,73 @@ class Generator {
 
     const float* xn = x.d.data();
     const float kInv = 1.f / static_cast<float>(kResKernels);
-    std::vector<kern::AmxChainLink> nodes;
-    nodes.reserve(kResKernels * 6);
+    // tile 网格
+    const size_t nmb = (C + 31) / 32, nnb = (Tn + 31) / 32;
+    std::vector<kern::AmxTileChainLink> nodes;
+    nodes.reserve(kResKernels * 6 * nmb * nnb);
     for (size_t j = 0; j < kResKernels; ++j) {
       const ResBlock1& rb = resblocks[stage][j];
       for (size_t p = 0; p < 6; ++p) {
         const size_t m = p / 2;
         const bool even = (p % 2) == 0;
         const Conv1d& cv = even ? rb.convs1[m] : rb.convs2[m];
-        // MUST set rows/K before node creation: amx_chain_run validates
-        // pb->rows==N && pa->K==pb->K before prepare hook runs.
         kern::AmxPanel& pb = s.pb[j][p];
         pb.rows = Tn;
         pb.K = cv.in_c * cv.k + 1;
         float* outp = even ? s.tA[j][m & 1].d.data()
                            : s.tB[j][m & 1].d.data();
-        kern::AmxChainLink nd;
-        nd.chain_id = static_cast<int>(j);
-        nd.depth = static_cast<int>(p);
-        nd.pa = &cv.amx_panel();
-        nd.pb = &pb;
-        nd.c = outp;
-        nd.M = cv.out_c;
-        nd.N = Tn;
-        nd.prepare = [j, p, m, even, Tn, nn, xn, cvl = &cv]() {
-          kern::AmxPanel& pbl = s.pb[j][p];
-          if (even) {
-            // cur 初始化/累加, 然后 lrelu(cur) → tin, im2col → panel
-            if (m == 0) {
-              std::memcpy(s.cur[j].d.data(), xn, nn * sizeof(float));
-            } else {
-              add_inplace(s.cur[j].d.data(),
-                          s.tB[j][(m - 1) & 1].d.data(), nn);
-            }
-            leaky_relu_write(s.cur[j].d.data(), s.tin[j].d.data(), nn, 0.1f);
-            im2col_to_panel_f16(s.tin[j].d.data(), cvl->in_c, Tn,
-                                cvl->k, cvl->dilation, pbl.buf, true);
-          } else {
-            // tA 就地 lrelu 后产 panel (与串行序一致)
-            leaky_relu_io(s.tA[j][m & 1].d.data(), nn, 0.1f);
-            im2col_to_panel_f16(s.tA[j][m & 1].d.data(), cvl->in_c, Tn,
-                                cvl->k, cvl->dilation, pbl.buf, true);
+        for (size_t mb = 0; mb < nmb; ++mb) {
+          for (size_t nb = 0; nb < nnb; ++nb) {
+            kern::AmxTileChainLink nd;
+            nd.chain_id = static_cast<int>(j);
+            nd.depth = static_cast<int>(p);
+            nd.tile_mb = mb;
+            nd.tile_nb = nb;
+            nd.pa = &cv.amx_panel();
+            nd.pb = &pb;
+            nd.c = outp;
+            nd.M = cv.out_c;
+            nd.N = Tn;
+            // prepare 钩子: 处理 tile 行区间 [row_b, row_e)
+            nd.prepare = [j, p, m, even, Tn, C, xn, cvl = &cv](size_t row_b,
+                                                           size_t row_e) {
+              const size_t tile_len = row_e - row_b;
+              kern::AmxPanel& pbl = s.pb[j][p];
+              if (even) {
+                if (m == 0) {
+                  for (size_t c = 0; c < C; ++c)
+                    std::memcpy(s.cur[j].d.data() + c * Tn + row_b,
+                                xn + c * Tn + row_b, tile_len * sizeof(float));
+                } else {
+                  for (size_t c = 0; c < C; ++c)
+                    add_inplace(s.cur[j].d.data() + c * Tn + row_b,
+                                s.tB[j][(m - 1) & 1].d.data() + c * Tn + row_b,
+                                tile_len);
+                }
+                for (size_t c = 0; c < C; ++c)
+                  leaky_relu_write(s.cur[j].d.data() + c * Tn + row_b,
+                                   s.tin[j].d.data() + c * Tn + row_b,
+                                   tile_len, 0.1f);
+                im2col_to_panel_f16_tile(s.tin[j].d.data(), C, Tn, cvl->k,
+                                          cvl->dilation, row_b, row_e, pbl.buf,
+                                          true);
+              } else {
+                for (size_t c = 0; c < C; ++c)
+                  leaky_relu_io(s.tA[j][m & 1].d.data() + c * Tn + row_b,
+                                tile_len, 0.1f);
+                im2col_to_panel_f16_tile(s.tA[j][m & 1].d.data(), C, Tn,
+                                          cvl->k, cvl->dilation, row_b, row_e,
+                                          pbl.buf, true);
+              }
+            };
+            nodes.push_back(std::move(nd));
           }
-        };
-        nodes.push_back(std::move(nd));
+        }
       }
     }
 
     const double tb = now_ms_e6();
-    kern::amx_chain_run(nodes.data(), nodes.size());
+    kern::amx_tile_chain_run(nodes.data(), nodes.size());
     *batch_ms = now_ms_e6() - tb;
 
     // 三链 sum 累加 (主线程): cur += convs2[2] 输出; sum += cur/3

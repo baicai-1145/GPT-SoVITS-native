@@ -99,6 +99,30 @@ struct AmxChainLink {
 
 void amx_chain_run(const AmxChainLink* nodes, size_t n);
 
+// ---- E10-K2: per-tile (32×32) prepare 依赖消除 prepare↔math 全局互锁 ----
+// 在 amx_chain_run 的 per-node prepare 依赖之上, 把 prepare 步拆到 tile
+// 粒度: (c,d,tile) 的 prepare 只需等 (c,d-1,tile) 的数学完成, 即可在
+// 池内与 (c,d-1,tile+1) 的数学重叠执行, 把 ~25ms 的 im2col 从全局串行
+// 解放为 tile-by-tile 流水。AmxTileChainLink 与 AmxChainLink 同构, 差异
+// 仅在 prepare 签名: prepare 接收 tile 行区间 [row_b, row_e), 内部只产
+// 激活 panel 的对应 tile 段 (dec 端 im2col 按 32 步切片)。与 amx_chain_run
+// 的数值序完全一致: 同内核同 tile 划分, 仅调度拓扑更细。
+struct AmxTileChainLink {
+  int chain_id = 0;     // 链ID: 同链内串行, 0≤depth<max_depth
+  int depth = 0;        // 深度: 依赖同链 depth-1 节点
+  size_t tile_mb = 0;   // tile 行号 (M 维 32 步)
+  size_t tile_nb = 0;   // tile 列号 (N 维 32 步)
+  const AmxPanel* pa = nullptr;
+  const AmxPanel* pb = nullptr;
+  float* c = nullptr;
+  size_t M = 0, N = 0;
+  // prepare 接收 [row_b, row_e) 时间步区间, 内部只产该区间对应 panel tile。
+  // 调用方保证 row_b%32==0 且 row_e<=N, row_e-row_b<=32 (单个 32 步 tile)。
+  std::function<void(size_t row_b, size_t row_e)> prepare;
+};
+
+void amx_tile_chain_run(const AmxTileChainLink* nodes, size_t n);
+
 // C[M,N] = A·Bᵀ; 不可用时内部回退 gemm_f16x_fmlal。 (即时打包, 通用路径)
 void gemm_f16_amx(const uint16_t* a, const uint16_t* b, float* c,
                   size_t M, size_t N, size_t K);

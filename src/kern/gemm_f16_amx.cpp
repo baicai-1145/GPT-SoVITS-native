@@ -20,6 +20,7 @@
 
 #include <arm_neon.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -704,6 +705,189 @@ void amx_chain_run(const AmxChainLink* nodes, size_t n) {
         ex[i].chunks.pop_front();
       }
     }
+  }
+
+  pool.submit_dag(deps, succs, remaining, std::move(init_tasks));
+}
+
+// ---------------- E10-K2: per-tile prepare 依赖解耦调度 ----------------
+// 在 amx_chain_run 基础上把 prepare 拆到 tile 粒度。AmxTileChainLink 代表
+// 一个 32×32 AMX tile; 为避免 73,980 个 std::function 堆分配, 内部将同
+// (c,d,mb) 内的连续 nb 合并为 chunk (~healthy 个 tile/chunk), 以 chunk
+// 为 DAG 节点调度, 上层 API 仍为 per-tile。
+//
+// 依赖模型 (chunk 级):
+//   * 跨深度 (c,d,chunk) → (c,d-1,chunk): prepare 需同 chunk 上一深度数学
+//   * 同行列 (c,d,chunk) → (c,d,chunk-1): 同一深度内 chunk 顺序
+//   * 边界 (c,d,chunk) → (c,d-1,chunk-1): im2col 窗口跨 chunk, 需上一
+//     深度上一 chunk 数学也完成才能取到边界源数据
+//
+// profiling 目标: S2 ≤110ms (per-tile prepare 跨链重叠消除 ~25ms im2col
+// 全局串行)。数值序与 amx_chain_run 一致 (同内核同 tile 划分, 仅调度更细)。
+void amx_tile_chain_run(const AmxTileChainLink* nodes, size_t n) {
+  if (nodes == nullptr || n == 0) return;
+  AmxPool& pool = amx_pool();
+  const int healthy = pool.healthy.load(std::memory_order_acquire);
+  if (healthy <= 0) {
+    for (size_t i = 0; i < n; ++i) {
+      const auto& nd = nodes[i];
+      if (!nd.pa || !nd.pb || !nd.c) continue;
+      gemm_f16_amx_pp(*nd.pa, *nd.pb, nd.c, nd.M, nd.N);
+    }
+    return;
+  }
+
+  // ---- 阶段 1: 按 (chain_id, depth, tile_mb, tile_nb) 排序并分 chunk ----
+  std::vector<size_t> ord(n);
+  for (size_t i = 0; i < n; ++i) ord[i] = i;
+  std::sort(ord.begin(), ord.end(), [&](size_t a, size_t b) {
+    if (nodes[a].chain_id != nodes[b].chain_id)
+      return nodes[a].chain_id < nodes[b].chain_id;
+    if (nodes[a].depth != nodes[b].depth)
+      return nodes[a].depth < nodes[b].depth;
+    if (nodes[a].tile_mb != nodes[b].tile_mb)
+      return nodes[a].tile_mb < nodes[b].tile_mb;
+    return nodes[a].tile_nb < nodes[b].tile_nb;
+  });
+
+  // chunk 元信息: 每个 chunk 覆盖 (c,d,mb) 下一段连续 nb
+  struct ChunkInfo {
+    int chain_id, depth;
+    size_t tile_mb;
+    size_t nb_begin, nb_end;  // tile_nb 范围 [b,e)
+  };
+  std::vector<ChunkInfo> chunks;
+  for (size_t p = 0; p < n; ) {
+    const AmxTileChainLink& hd = nodes[ord[p]];
+    size_t q = p;
+    while (q < n) {
+      const AmxTileChainLink& cur = nodes[ord[q]];
+      if (cur.chain_id != hd.chain_id || cur.depth != hd.depth ||
+          cur.tile_mb != hd.tile_mb) break;
+      ++q;
+    }
+    const size_t tot = q - p;
+    // chunk 大小: 32*healthy tiles/chunk (与 E9 batch_run 同口径)
+    // — 足够多 tile 抩平调度开销, 又不会过度打包造成并行不足
+    const size_t cs = std::max<size_t>(32, size_t(healthy) * 32);
+    const size_t nchunk = std::max<size_t>(1, (tot + cs - 1) / cs);
+    const size_t step = (tot + nchunk - 1) / nchunk;
+    for (size_t s = 0; s < tot; s += step) {
+      const size_t e = std::min(tot, s + step);
+      ChunkInfo ci;
+      ci.chain_id = hd.chain_id;
+      ci.depth = hd.depth;
+      ci.tile_mb = hd.tile_mb;
+      ci.nb_begin = nodes[ord[p + s]].tile_nb;
+      ci.nb_end = nodes[ord[p + e - 1]].tile_nb + 1;
+      chunks.push_back(ci);
+    }
+    p = q;
+  }
+  const int nch = static_cast<int>(chunks.size());
+
+  // ---- 阶段 2: 构建 chunk-level DAG ----
+  struct ChunkKey {
+    int chain_id, depth;
+    size_t tile_mb;
+    bool operator==(const ChunkKey& o) const {
+      return chain_id == o.chain_id && depth == o.depth &&
+             tile_mb == o.tile_mb;
+    }
+  };
+  struct ChunkKeyHash {
+    size_t operator()(const ChunkKey& k) const {
+      return std::hash<int>()(k.chain_id) ^ std::hash<int>()(k.depth) ^
+             std::hash<size_t>()(k.tile_mb);
+    }
+  };
+  std::unordered_map<ChunkKey, std::vector<int>, ChunkKeyHash> by_key;
+  for (int ci = 0; ci < nch; ++ci) {
+    const auto& c = chunks[ci];
+    by_key[{c.chain_id, c.depth, c.tile_mb}].push_back(ci);
+  }
+  std::vector<int> deps(nch, 0);
+  std::vector<std::vector<int>> succs(nch);
+  for (int ci = 0; ci < nch; ++ci) {
+    const auto& c = chunks[ci];
+    const auto& lst = by_key[{c.chain_id, c.depth, c.tile_mb}];
+    int local_idx = 0;
+    for (size_t k = 0; k < lst.size(); ++k) {
+      if (lst[k] == ci) { local_idx = static_cast<int>(k); break; }
+    }
+    if (c.depth > 0) {  // 跨深度同 chunk
+      const auto& prev_lst = by_key[{c.chain_id, c.depth - 1, c.tile_mb}];
+      if (local_idx < int(prev_lst.size())) {
+        ++deps[ci];
+        succs[prev_lst[local_idx]].push_back(ci);
+      }
+    }
+    if (local_idx > 0) {  // 同行列上一 chunk
+      ++deps[ci];
+      succs[lst[local_idx - 1]].push_back(ci);
+    }
+    if (c.depth > 0 && local_idx > 0) {  // 边界依赖
+      const auto& prev_lst = by_key[{c.chain_id, c.depth - 1, c.tile_mb}];
+      if (local_idx - 1 < int(prev_lst.size())) {
+        ++deps[ci];
+        succs[prev_lst[local_idx - 1]].push_back(ci);
+      }
+    }
+  }
+
+  // ---- 阶段 3: 逐 chunk 构建 task: prepare + 所有 tile math ----
+  // chunk 内 tile 共享 pa/pb/c (调用方约定: 同 c/d/mb 的 tile 共享 panel 与输出)
+  struct TileRef {
+    size_t mb, nb;
+    float* c;
+    const AmxPanel* pa;
+    const AmxPanel* pb;
+    std::function<void(size_t, size_t)>* prep;
+    size_t M, N, K;
+  };
+  std::vector<int> remaining(nch, 0);
+  std::vector<std::deque<AmxPool::Task>> init_tasks(nch);
+  for (int ci = 0; ci < nch; ++ci) {
+    const auto& ch = chunks[ci];
+    std::vector<TileRef> tiles;
+    size_t row_b = 0, row_e = 0;
+    for (size_t p2 = 0; p2 < n; ++p2) {
+      const AmxTileChainLink& nd = nodes[ord[p2]];
+      if (int(nd.chain_id) != ch.chain_id) continue;
+      if (int(nd.depth) != ch.depth) continue;
+      if (nd.tile_mb != ch.tile_mb) continue;
+      if (nd.tile_nb < ch.nb_begin || nd.tile_nb >= ch.nb_end) continue;
+      if (!nd.pa || !nd.pb || !nd.c || nd.M == 0 || nd.N == 0 ||
+          nd.pa->rows != nd.M || nd.pb->rows != nd.N || nd.pa->K != nd.pb->K)
+        continue;
+      TileRef tr;
+      tr.mb = nd.tile_mb;
+      tr.nb = nd.tile_nb;
+      tr.c = nd.c;
+      tr.pa = nd.pa;
+      tr.pb = nd.pb;
+      tr.prep = const_cast<std::function<void(size_t, size_t)>*>(&nd.prepare);
+      tr.M = nd.M; tr.N = nd.N; tr.K = nd.pa->K;
+      if (tiles.empty()) {
+        row_b = ch.nb_begin * 32;
+        row_e = std::min(ch.nb_end * 32, nd.N);
+      }
+      tiles.push_back(tr);
+    }
+    if (tiles.empty()) continue;
+    init_tasks[ci].push_back(AmxPool::Task{
+        ci,
+        [tiles, row_b, row_e]() {
+          if (tiles[0].prep && *tiles[0].prep) (*tiles[0].prep)(row_b, row_e);
+          const uint8_t* pa_data = tiles[0].pa->data();
+          const uint8_t* pb_data = tiles[0].pb->data();
+          float* c0 = tiles[0].c;
+          for (const auto& t : tiles) {
+            amx_tile(pa_data, pb_data, c0, t.M, t.N, t.K, t.mb, t.nb);
+          }
+        },
+        nullptr});
+    ++remaining[ci];
   }
 
   pool.submit_dag(deps, succs, remaining, std::move(init_tasks));

@@ -459,7 +459,79 @@ GSV_TEST(amx_chain_matches_batch) {
   gsv::kern::amx_chain_run(cn.data(), cn.size());
   for (size_t i = 0; i < c_batch.size(); ++i)
     CHECK(std::memcmp(c_batch[i].data(), c_chain[i].data(),
-                      c_batch[i].size() * sizeof(float)) == 0);
+                      c_chain[i].size() * sizeof(float)) == 0);
+}
+
+// E10-K2: amx_tile_chain_run (per-tile DAG) 与 amx_chain_run (per-node
+// DAG) 结果逐位一致。同内核同 tile 划分, 仅调度粒度更细 (tile 级 vs
+// node 级)。验证 per-tile prepare 不改变数学序; prepare 钩子将面板仅填
+// 目标 tile 段, 跨 tile 顺序由 DAG (c,d,t-1) 锁定保序。
+GSV_TEST(amx_tile_chain_matches_chain) {
+  if (!gsv::kern::amx_gemm_available()) return;
+  Rng rng;
+  struct Spec { size_t M, N, K; };
+  const Spec specs[] = {{96, 128, 9}, {96, 96, 9}, {64, 64, 3}};
+  constexpr int kChains = 2, kDepths = 2;
+  // 总节点数: 每个 AmxChainLink 1 节点, 每个 AmxTileChainLink (M/32)*(N/32) 节点
+  // 按 (chain, depth, mb, nb) 全组合生成。形状选奇形 (N 非 32 倍) 覆尾 tile。
+  const Spec& sa = specs[0];  // M=96, N=128
+  const size_t nmb = (sa.M + 31) / 32, nnb = (sa.N + 31) / 32;
+  const size_t ntiles = nmb * nnb;
+  const size_t total_chain = kChains * kDepths;
+  const size_t total_tile = total_chain * ntiles;
+  std::vector<gsv::kern::AmxPanel> pas, pbs;
+  pas.reserve(total_chain); pbs.reserve(total_tile);
+  std::vector<std::vector<float>> c_chain, c_tile;
+  c_chain.reserve(total_chain); c_tile.reserve(total_chain);
+  std::vector<gsv::kern::AmxChainLink> cn;
+  std::vector<gsv::kern::AmxTileChainLink> tn;
+  cn.reserve(total_chain); tn.reserve(total_tile);
+  // 随机 weight + 随机 raw b (prepare 打包到 panel)
+  for (size_t ci = 0; ci < total_chain; ++ci) {
+    const Spec& s = specs[ci % 3];
+    std::vector<uint16_t> wa(s.M * s.K);
+    for (auto& v : wa) { _Float16 h(rng.next() * 0.5f); __builtin_memcpy(&v, &h, 2); }
+    pas.push_back(gsv::kern::amx_pack(wa.data(), s.M, s.K));
+    // chain_node 共享一个 pb (prepare 一次性填满)
+    pbs.emplace_back();
+    std::vector<uint16_t> wb(s.N * s.K);
+    for (auto& v : wb) { _Float16 h(rng.next() * 0.5f); __builtin_memcpy(&v, &h, 2); }
+    gsv::kern::amx_pack_into(wb.data(), s.N, s.K, pbs.back().buf);
+    pbs.back().rows = s.N; pbs.back().K = s.K;
+    c_chain.emplace_back(s.M * s.N, 0.f);
+    c_tile.emplace_back(s.M * s.N, 0.f);
+    cn.push_back(gsv::kern::AmxChainLink{static_cast<int>(ci % kChains),
+                                          static_cast<int>(ci / kChains),
+                                          &pas.back(), &pbs.back(),
+                                          c_chain.back().data(), s.M, s.N, {}});
+  }
+  // tile 节点: 每个 (ci, mb, nb) 一个 AmxTileChainLink, 共享 pa & pbs[ci]
+  // prepare 钩子不做事 (pbs 已填好), 验证纯调度结果一致
+  for (size_t ci = 0; ci < total_chain; ++ci) {
+    const Spec& s = specs[ci % 3];
+    const size_t nmb_s = (s.M + 31) / 32, nnb_s = (s.N + 31) / 32;
+    for (size_t mb = 0; mb < nmb_s; ++mb)
+      for (size_t nb = 0; nb < nnb_s; ++nb) {
+        gsv::kern::AmxTileChainLink nd;
+        nd.chain_id = static_cast<int>(ci % kChains);
+        nd.depth = static_cast<int>(ci / kChains);
+        nd.tile_mb = mb;
+        nd.tile_nb = nb;
+        nd.pa = &pas[ci];
+        nd.pb = &pbs[ci];
+        nd.c = c_tile[ci].data();
+        nd.M = s.M;
+        nd.N = s.N;
+        // 空 prepare: 验证无 prepare 路径下 per-tile 与 per-node 一致
+        nd.prepare = nullptr;
+        tn.push_back(nd);
+      }
+  }
+  gsv::kern::amx_chain_run(cn.data(), cn.size());
+  gsv::kern::amx_tile_chain_run(tn.data(), tn.size());
+  for (size_t i = 0; i < c_chain.size(); ++i)
+    CHECK(std::memcmp(c_chain[i].data(), c_tile[i].data(),
+                      c_chain[i].size() * sizeof(float)) == 0);
 }
 #endif  // GSV_AMX_GEMM
 
