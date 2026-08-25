@@ -225,8 +225,13 @@ inline void im2col_to_panel_f16(const float* x, size_t C, size_t T,
         continue;
       }
       uint8_t* d = dst + (t / 32) * K * 64 + (t % 32) * 2;
-      if (append_ones_col)
-        reinterpret_cast<uint16_t*>(d + Kw * 64)[t % 32] = 0x3C00;  // f16 1.0
+      if (append_ones_col) {
+        // 快径一次处理 8 行, ones 列必须写满整组。注意: 基址须从 tile 头算起
+        // (d 已含首行行偏移, 再加行号会双重计数写错行 —— E6 二轮回归根因)
+        uint16_t* ones = reinterpret_cast<uint16_t*>(dst + (t / 32) * K * 64 +
+                                                    Kw * 64);
+        for (size_t r = 0; r < 8; ++r) ones[(t % 32) + r] = 0x3C00;
+      }
       for (size_t c = 0; c < C; ++c) {
         // 相邻时间步窗口: 同通道内偏移 +1 (非 +T!)
         const float* w[8];

@@ -11,12 +11,30 @@
 //   其余 (GEMV 形 out_c<64 / --amx 关 / 无 AMX 硬件):
 //     sgemm 升位路径 — w_f16 即时升 f32 (thread_local), im2col fp32,
 //     数值与现网 fp32 链路同构 (差异仅权重一次 fp16 舍入, golden 门禁口径覆盖)。
+//
+// 重要: 同一进程内 amx_batch_run 与 gemm_f16_amx_pp 不可混用 (专用池状态会
+// 被两种派发路径搅乱, 实测表现成错乱/崩溃)。本模块统一只经 amx_batch_run
+// 单节点封装 (amx_gemm_1) 派发, 杜绝混用。
 #pragma once
 
 #include "kern/accel.hpp"
 #include "sovits/sovits_types.hpp"
 #if defined(GSV_AMX_GEMM)
 #include "kern/gemm_f16_amx.hpp"
+
+// 统一经 amx_batch_run 单节点派发, 避免与 gemm_f16_amx_pp 混用 (见文件头注释)。
+// 不可用时 amx_batch_run 内部自动回退 gemm_f16_amx_pp (同样不混用)。
+inline void amx_gemm_1(const gsv::kern::AmxPanel& pa, const gsv::kern::AmxPanel& pb,
+                      float* c, size_t M, size_t N) {
+  gsv::kern::AmxBatchNode nd;
+  nd.phase = 0;
+  nd.pa = &pa;
+  nd.pb = &pb;
+  nd.c = c;
+  nd.M = M;
+  nd.N = N;
+  gsv::kern::amx_batch_run(&nd, 1);
+}
 #endif
 
 #include <cmath>
@@ -112,7 +130,7 @@ class Conv1d {
       pb.K = K + 1;
       pb.buf = std::move(act_panel);
       const double tg0 = prof ? now_ms_e6() : 0.0;
-      kern::gemm_f16_amx_pp(panel_, pb, y.d.data(), out_c, T);
+      amx_gemm_1(panel_, pb, y.d.data(), out_c, T);
       if (prof) {
         g_conv_split().gemm += now_ms_e6() - tg0;
         ++g_conv_split().n;
@@ -136,7 +154,7 @@ class Conv1d {
       pb.K = K + 1;
       pb.buf = std::move(act_panel);
       const double tg1 = prof ? now_ms_e6() : 0.0;
-      kern::gemm_f16_amx_pp(panel_, pb, y.d.data(), out_c, T);
+      amx_gemm_1(panel_, pb, y.d.data(), out_c, T);
       if (prof) {
         g_conv_split().gemm += now_ms_e6() - tg1;
         ++g_conv_split().n;
@@ -262,14 +280,49 @@ class ConvT1d {
       pb.rows = T;
       pb.K = in_c;
       pb.buf = std::move(pb_buf);
-      scratch.C = out_c;  // GEMM 全量覆写, 免 memset
-      scratch.T = T;
-      scratch.d.resize(out_c * T);
-      for (size_t d = 0; d < k; ++d) {
-        kern::gemm_f16_amx_pp(panels_[d], pb, scratch.d.data(), out_c, T);
-        scatter_phase(scratch, y, T, Tout, pad, d);
+      // E9 批量派发: 相位间无依赖, 分块一次提交 (节点输出不得重叠)。
+      // 小形状 (M<64 或 MNK<2^18) 不进 batch, 逐发 (同样走 amx_batch_run 封装,
+      // 全程不混用 gemm_f16_amx_pp, 见文件头注释)。
+      const bool small_shape =
+          out_c < 64 || out_c * in_c * T < (size_t{1} << 18);
+      if (!small_shape && k > 1) {
+        // 分块约束: 单块 scratch ≤ 64MB (节点输出不重叠, 每块一次派发)
+        const size_t ph = std::max<size_t>(
+            1, std::min<size_t>(k, (64u << 20) / (out_c * T * 4 + 1)));
+        static thread_local Tensor2D chunk;
+        static thread_local std::vector<kern::AmxBatchNode> nodes;
+        for (size_t d0 = 0; d0 < k; d0 += ph) {
+          const size_t nd = std::min(ph, k - d0);
+          chunk.C = nd * out_c;
+          chunk.T = T;
+          chunk.d.resize(nd * out_c * T);  // 全覆写免 memset
+          nodes.clear();
+          for (size_t i = 0; i < nd; ++i) {
+            kern::AmxBatchNode nd_node;
+            nd_node.phase = 0;  // 相位间无依赖, 同批并行
+            nd_node.pa = &panels_[d0 + i];
+            nd_node.pb = &pb;
+            nd_node.c = chunk.d.data() + i * out_c * T;
+            nd_node.M = out_c;
+            nd_node.N = T;
+            nodes.push_back(nd_node);
+          }
+          kern::amx_batch_run(nodes.data(), nodes.size());
+          for (size_t i = 0; i < nd; ++i)
+            scatter_raw(chunk.d.data() + i * out_c * T, out_c, T, y, Tout,
+                        pad, d0 + i);
+        }
+        pb_buf = std::move(pb.buf);
+      } else {
+        scratch.C = out_c;  // GEMM 全量覆写, 免 memset
+        scratch.T = T;
+        scratch.d.resize(out_c * T);
+        for (size_t d = 0; d < k; ++d) {
+          amx_gemm_1(panels_[d], pb, scratch.d.data(), out_c, T);
+          scatter_phase(scratch, y, T, Tout, pad, d);
+        }
+        pb_buf = std::move(pb.buf);  // 归还容量供下次复用
       }
-      pb_buf = std::move(pb.buf);  // 归还容量供下次复用
     } else
 #endif
     {
@@ -298,12 +351,19 @@ class ConvT1d {
  private:
   void scatter_phase(const Tensor2D& scratch, Tensor2D& y, size_t T,
                      size_t Tout, long long pad, size_t d) const {
-    for (size_t j = 0; j < T; ++j) {
-      long long opos = static_cast<long long>(j) * stride_u +
-                       static_cast<long long>(d) - pad;
-      if (opos < 0 || opos >= static_cast<long long>(Tout)) continue;
-      const size_t op = static_cast<size_t>(opos);
-      for (size_t o = 0; o < out_c; ++o) y.row(o)[op] += scratch.row(o)[j];
+    scatter_raw(scratch.d.data(), out_c, T, y, Tout, pad, d);
+  }
+  void scatter_raw(const float* scratch, size_t oc, size_t T, Tensor2D& y,
+                   size_t Tout, long long pad, size_t d) const {
+    for (size_t o = 0; o < oc; ++o) {
+      const float* sr = scratch + o * T;
+      float* yr = y.row(o);
+      for (size_t j = 0; j < T; ++j) {
+        long long opos = static_cast<long long>(j) * stride_u +
+                         static_cast<long long>(d) - pad;
+        if (opos < 0 || opos >= static_cast<long long>(Tout)) continue;
+        yr[static_cast<size_t>(opos)] += sr[j];
+      }
     }
   }
 };
