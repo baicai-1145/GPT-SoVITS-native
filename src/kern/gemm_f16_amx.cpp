@@ -87,16 +87,27 @@ bool probe_and_set_amx() {
 struct AmxPool {
   std::mutex mu;
   std::condition_variable cv, done_cv;
-  std::deque<std::function<void()>> tasks;
-  size_t pending = 0;
+  struct Task {
+    int phase;
+    std::function<void()> fn;
+    std::function<void()> on_done;  // mu 持有下于完成后执行 (可入队后续任务)
+  };
+  std::deque<Task> ready;
+  std::vector<std::deque<Task>> future_phases;  // 未解锁相位 (任务自带相位)
+  std::vector<size_t> phase_left;                                 // 各相位未完数
+  size_t pending = 0;  // 全部未完成任务数 (含未解锁相位)
   bool stop = false;
   std::vector<std::thread> threads;
-  std::atomic<int> healthy{0};  // 探测成功的 worker 数
+  std::atomic<int> healthy{0};   // 探测成功的 worker 数
+  std::atomic<int> probed{0};    // 已完成探测的 worker 数 (含失败)
 
   explicit AmxPool(size_t n) {
     threads.reserve(n);
     for (size_t i = 0; i < n; ++i)
       threads.emplace_back([this] { worker(); });
+    // E9: 等全部 worker 完成探测再返回, 保证 available()/派发时结论就绪
+    while (probed.load(std::memory_order_acquire) < int(n))
+      std::this_thread::yield();
   }
   ~AmxPool() {
     {
@@ -106,30 +117,104 @@ struct AmxPool {
     cv.notify_all();
     for (auto& t : threads) t.join();
   }
+
+ private:
+  // mu 已持: 入队就绪任务
+  void push_ready(int phase, std::function<void()> fn,
+                  std::function<void()> on_done = nullptr) {
+    ready.push_back(Task{phase, std::move(fn), std::move(on_done)});
+  }
+
+  // mu 已持: 任务完成记账; 相位清空则解锁下一相位
+  void finish_task(int phase) {
+    const size_t p = size_t(phase);
+    if (p < phase_left.size() && --phase_left[p] == 0 &&
+        p + 1 < future_phases.size()) {
+      auto& nx = future_phases[p + 1];
+      while (!nx.empty()) {
+        ready.push_back(std::move(nx.front()));
+        nx.pop_front();
+      }
+      cv.notify_all();
+    }
+    if (--pending == 0) done_cv.notify_all();
+  }
+
+ public:
   void worker() {
-    if (!probe_and_set_amx()) return;  // 本线程无 AMX → 不接活
+    if (!probe_and_set_amx()) {  // 本线程无 AMX → 不接活
+      probed.fetch_add(1, std::memory_order_release);
+      return;
+    }
     healthy.fetch_add(1, std::memory_order_release);
+    probed.fetch_add(1, std::memory_order_release);
     std::unique_lock<std::mutex> lk(mu);
     while (true) {
-      cv.wait(lk, [this] { return stop || !tasks.empty(); });
-      if (stop && tasks.empty()) return;
-      auto fn = std::move(tasks.front());
-      tasks.pop_front();
+      cv.wait(lk, [this] { return stop || !ready.empty(); });
+      if (stop && ready.empty()) return;
+      Task t = std::move(ready.front());
+      ready.pop_front();
       lk.unlock();
-      fn();
+      t.fn();
       lk.lock();
-      if (--pending == 0 && tasks.empty()) done_cv.notify_all();
+      if (t.on_done) t.on_done();  // 可能向 ready 入队后续任务
+      finish_task(t.phase);
     }
   }
-  void run_batch(std::vector<std::function<void()>> batch) {
-    const size_t n = batch.size();
+  // E9: 多相位批执行。phases[p] 的任务仅在相位 p-1 全部完成后入队;
+  // 同相位任务被全部 worker 抢占并行。调用方阻塞一次至全完成。
+  void run_phased(std::vector<std::vector<std::function<void()>>> phases) {
+    size_t n = 0;
+    for (auto& p : phases) n += p.size();
     if (n == 0) return;
     {
       std::lock_guard<std::mutex> lk(mu);
-      for (auto& t : batch) tasks.push_back(std::move(t));
-      pending += n;
+      future_phases.clear();
+      future_phases.resize(phases.size());
+      phase_left.assign(phases.size(), 0);
+      size_t total = 0;
+      for (size_t p = 0; p < phases.size(); ++p) {
+        phase_left[p] = phases[p].size();
+        total += phases[p].size();
+        for (auto& f : phases[p]) future_phases[p].push_back(Task{int(p), std::move(f), nullptr});
+      }
+      pending += total;
+      auto& ph0 = future_phases[0];
+      while (!ph0.empty()) {
+        ready.push_back(std::move(ph0.front()));
+        ph0.pop_front();
+      }
     }
     cv.notify_all();
+    std::unique_lock<std::mutex> lk(mu);
+    done_cv.wait(lk, [this] { return pending == 0; });
+  }
+  void run_batch(std::vector<std::function<void()>> batch) {
+    std::vector<std::vector<std::function<void()>>> ph;
+    ph.emplace_back(std::move(batch));
+    run_phased(std::move(ph));
+  }
+  // E9: 相位化图提交。byphase[p] 为相位 p 的任务队列 (head 等); 含延迟
+  // 入队者 (由某任务 on_done 推入) 也必须计入 phase_totals[p]。调用方
+  // 保证所有计数任务最终完成。
+  void submit_graph(size_t n_phases, const size_t* phase_totals,
+                    std::vector<std::deque<Task>>& byphase) {
+    size_t total = 0;
+    for (size_t p = 0; p < n_phases; ++p) total += phase_totals[p];
+    if (total == 0) return;
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      future_phases = std::move(byphase);
+      future_phases.resize(n_phases);
+      phase_left.assign(phase_totals, phase_totals + n_phases);
+      pending += total;
+      auto& ph0 = future_phases[0];
+      while (!ph0.empty()) {
+        ready.push_back(std::move(ph0.front()));
+        ph0.pop_front();
+      }
+      cv.notify_all();
+    }
     std::unique_lock<std::mutex> lk(mu);
     done_cv.wait(lk, [this] { return pending == 0; });
   }
@@ -335,6 +420,11 @@ AmxPanel amx_pack(const uint16_t* w, size_t rows, size_t K) {
   return p;
 }
 
+void amx_pack_into(const uint16_t* w, size_t rows, size_t K,
+                   std::vector<uint8_t>& out) {
+  pack_panel(w, rows, K, out);
+}
+
 void gemm_f16_amx_pp(const AmxPanel& pa, const AmxPanel& pb, float* c,
                      size_t M, size_t N) {
   if (pa.rows != M || pb.rows != N || pa.K != pb.K || M == 0 || N == 0) {
@@ -346,6 +436,108 @@ void gemm_f16_amx_pp(const AmxPanel& pa, const AmxPanel& pb, float* c,
 void gemm_f16_amx(const uint16_t* a, const uint16_t* b, float* c,
                   size_t M, size_t N, size_t K) {
   gemm_f16_amx_impl(a, b, c, M, N, K);
+}
+
+// ---------------- E9: 批量多 GEMM 单次派发 ----------------
+void amx_batch_run(const AmxBatchNode* nodes, size_t n) {
+  if (nodes == nullptr || n == 0) return;
+  AmxPool& pool = amx_pool();
+  const int healthy = pool.healthy.load(std::memory_order_acquire);
+  if (healthy <= 0) {
+    for (size_t i = 0; i < n; ++i)
+      gemm_f16_amx_pp(*nodes[i].pa, *nodes[i].pb, nodes[i].c, nodes[i].M,
+                      nodes[i].N);
+    return;
+  }
+
+  int max_phase = 0;
+  for (size_t i = 0; i < n; ++i) {
+    if (nodes[i].phase > max_phase) max_phase = nodes[i].phase;
+  }
+  const size_t np = size_t(max_phase) + 1;
+
+  // 节点执行态: tile 块预构建; 有 prepare 的节点先跑 head, 完成后才入块
+  struct NodeExec {
+    std::deque<AmxPool::Task> chunks;
+    int heads_left = 0;
+    bool launched = false;
+  };
+  std::vector<NodeExec> ex(n);
+  std::vector<size_t> totals(np, 0);
+  std::vector<std::deque<AmxPool::Task>> byphase(np);
+  std::vector<size_t> nodes_per_phase(np, 0);
+  {
+    auto valid = [&np](const AmxBatchNode& nd) {
+      return nd.phase >= 0 && size_t(nd.phase) < np && nd.pa && nd.pb &&
+             nd.c && nd.M > 0 && nd.N > 0 && nd.pa->rows == nd.M &&
+             nd.pb->rows == nd.N && nd.pa->K == nd.pb->K;
+    };
+    for (size_t i = 0; i < n; ++i)
+      if (valid(nodes[i])) ++nodes_per_phase[size_t(nodes[i].phase)];
+  }
+
+  auto launch_node = [&](size_t i) {  // mu 已持
+    auto& e = ex[i];
+    if (e.launched || --e.heads_left > 0) return;
+    e.launched = true;
+    while (!e.chunks.empty()) {
+      pool.ready.push_back(std::move(e.chunks.front()));
+      e.chunks.pop_front();
+    }
+    pool.cv.notify_all();
+  };
+
+  for (size_t i = 0; i < n; ++i) {
+    const AmxBatchNode& nd = nodes[i];
+    if (nd.phase < 0 || nd.phase > max_phase || !nd.pa || !nd.pb || !nd.c ||
+        nd.M == 0 || nd.N == 0 || nd.pa->rows != nd.M || nd.pb->rows != nd.N ||
+        nd.pa->K != nd.pb->K)
+      continue;  // 非法节点静默跳过 (与单发口径一致)
+    const size_t p = size_t(nd.phase);
+
+    // 节点内 tile 均分切块: 相位内总块数目标 ~2×worker (各相位独占全池)
+    const size_t tiles = ((nd.M + 31) / 32) * ((nd.N + 31) / 32);
+    const size_t nchunk = std::min(
+        tiles, std::max<size_t>(1, size_t(healthy) * 2 /
+                                       std::max<size_t>(nodes_per_phase[size_t(nd.phase)], 1)));
+    const size_t chunk = (tiles + nchunk - 1) / nchunk;
+    float* c = nd.c;
+    const size_t M = nd.M, N = nd.N, K = nd.pa->K;
+    const size_t nnb = (N + 31) / 32;
+    // 注意: pa/pb 的 data() 在任务执行时才取 —— prepare 可能刚填完 pb.buf
+    // (assign 后容量稳定, 但 data() 基址须以执行时为准)
+    for (size_t t0 = 0; t0 < tiles; t0 += chunk) {
+      const size_t t1 = std::min(tiles, t0 + chunk);
+      ex[i].chunks.push_back(AmxPool::Task{
+          nd.phase,
+          [&nd, c, M, N, K, nnb, t0, t1] {
+            const uint8_t* pa_data = nd.pa->data();
+            const uint8_t* pb_data = nd.pb->data();
+            for (size_t t = t0; t < t1; ++t)
+              amx_tile(pa_data, pb_data, c, M, N, K, t / nnb, t % nnb);
+          },
+          nullptr});
+      totals[p] += 1;
+    }
+
+    if (nd.prepare) {  // head: 池内前置 → 完成后放行本节点 tile 块
+      ex[i].heads_left = 1;
+      auto* pp = &nd.prepare;
+      AmxPool::Task head{
+          nd.phase,
+          [pp]() { (*pp)(); },
+          [launch_node, i] { launch_node(i); }};  // finish_task 持锁路径调用
+      byphase[p].push_back(std::move(head));
+      totals[p] += 1;
+    } else {
+      // 无前置: 块直接挂到相位队列, 由相位解锁自然放行
+      while (!ex[i].chunks.empty()) {
+        byphase[p].push_back(std::move(ex[i].chunks.front()));
+        ex[i].chunks.pop_front();
+      }
+    }
+  }
+  pool.submit_graph(np, totals.data(), byphase);
 }
 
 }  // namespace gsv::kern

@@ -18,6 +18,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -43,12 +44,38 @@ struct AmxPanel {
 
 AmxPanel amx_pack(const uint16_t* w, size_t rows, size_t K);
 
+// E9: 就地打包 (复用调用方缓冲容量; 与 amx_batch_run 的节点 prepare 钩子
+// 配套 —— 池内 worker 调用本函数把激活打包成 Y panel, 与其他节点数学重叠)
+void amx_pack_into(const uint16_t* w, size_t rows, size_t K,
+                   std::vector<uint8_t>& out);
+
 // 预打包版 GEMM: C[M,N] = pa·pbᵀ (pa: M×K, pb: N×K)。
 // 需 pa.rows==M && pb.rows==N && pa.K==pb.K, 否则回退即时打包路径。
 // AMX 不可用时回退 gemm_f16x_fmlal (自动从 panel 解不出原矩阵, 故要求
 // 调用方仅在 available()==true 时走此路径, 内部不二次校验)。
 void gemm_f16_amx_pp(const AmxPanel& pa, const AmxPanel& pb, float* c,
                      size_t M, size_t N);
+
+// ---- E9: 批量多 GEMM 单次派发 ----
+// 一批相互独立的预打包 GEMM, 按 phase 分桶调度: 同 phase 节点并行,
+// 高 phase 节点等低相位全部完成后开始; 整批仅一次池往返 (替代逐节点
+// 提交的 打包→等→打包→等 串行互等)。典型用法: SoVITS dec 每个 stage
+// 的 3 个独立 resblock 链按链深分 phase, 18 次派发→6 次。
+struct AmxBatchNode {
+  int phase = 0;              // ≥0; 同相位并行, 高相位等低相位全部完成
+  const AmxPanel* pa = nullptr;  // 权重侧 [M,K]
+  const AmxPanel* pb = nullptr;  // 激活侧 [N,K] (sovits im2col 直产)
+  float* c = nullptr;            // 输出 [M,N]; 各节点输出不得重叠
+  size_t M = 0, N = 0;
+  // 可选前置工作 (如 im2col 直产 panel): 在池内执行, 完成后才放行本节点
+  // 的 tile 计算 —— 与同相位其他节点的数学流水重叠。空 = 无前置。
+  std::function<void()> prepare;
+};
+
+// 阻塞至全部节点完成。不可用时逐节点回退 gemm_f16_amx_pp (含 fmlal 回退),
+// 语义不变。形状不合法的节点静默跳过 (与 pp 单发一致)。缓冲生命周期:
+// 调用返回前 pa/pb/c 必须保持有效。
+void amx_batch_run(const AmxBatchNode* nodes, size_t n);
 
 // C[M,N] = A·Bᵀ; 不可用时内部回退 gemm_f16x_fmlal。 (即时打包, 通用路径)
 void gemm_f16_amx(const uint16_t* a, const uint16_t* b, float* c,
