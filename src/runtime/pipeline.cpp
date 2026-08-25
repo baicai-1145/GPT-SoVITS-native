@@ -1,5 +1,6 @@
 // pipeline.cpp — C2: 全链路编排实现 (口径见 pipeline.hpp)
 #include "runtime/pipeline.hpp"
+#include "runtime/sovits_io.hpp"
 
 #include "runtime/segqueue.hpp"
 
@@ -613,6 +614,7 @@ bool Pipeline::synthesize(const std::string& utf8Text,
         seg.norm_text = ain.normText;
         seg.phones = ain.phonesSeg;
             SegSovIn sin = stageAr(ain, out->prompt_semantic);
+        if (!opt_.sovits_in_dump.empty()) sovInSink_.push_back(sin);
         stageVoc(sin, &seg, out->cond);
             if (!seg.audio.empty()) noteFirstPacket(nowMs() - tSynth);
         appendSeg(std::move(seg));
@@ -632,6 +634,7 @@ bool Pipeline::synthesize(const std::string& utf8Text,
           },
           [this, &tSynth, &out](const SegSovIn& v, SegTiming&) {
             SegmentResult seg;
+            if (!opt_.sovits_in_dump.empty()) sovInSink_.push_back(v);  // stage3 FIFO 单线程
             stageVoc(v, &seg, out->cond);
             if (!seg.audio.empty()) noteFirstPacket(nowMs() - tSynth);
             return seg;
@@ -668,6 +671,49 @@ bool Pipeline::synthesize(const std::string& utf8Text,
     out->audio = std::move(allAudio);
     out->sr = kSr;
     out->first_packet_ms = firstPacketMs();
+    if (!opt_.timing_csv.empty())
+      writeTimingCsv(opt_.timing_csv, out->segments);
+    if (!opt_.sovits_in_dump.empty()) {
+      std::string derr;
+      if (!dumpSovitsIn(opt_.sovits_in_dump, out->cond, sovInSink_, &derr))
+        fprintf(stderr, "警告: %s\n", derr.c_str());
+      else
+        fprintf(stderr, "SoVITS输入快照已存: %s (%zu 段)\n",
+                opt_.sovits_in_dump.c_str(), sovInSink_.size());
+      sovInSink_.clear();
+    }
+    return true;
+  } catch (const std::exception& e) {
+    if (err) *err = e.what();
+    return false;
+  }
+}
+
+// SoVITS 专攻重放: 跳过 textfront/AR/BERT/编码器, 直接逐段 stageVoc。
+// 输入含 noise 快照 ⇒ 与原链位级同输入; cond 来自快照(不依赖 ref-wav/缓存)。
+bool Pipeline::synthesizeFromSovitsIn(const std::string& sovitsInPath,
+                                      SynthResult* out, std::string* err) {
+  try {
+    DecodeCondition cond;
+    std::vector<SegSovIn> segs;
+    if (!loadSovitsIn(sovitsInPath, &cond, &segs, err)) return false;
+
+    std::vector<float> allAudio;
+    for (auto& sin : segs) {
+      SegmentResult seg;
+      seg.sentence = sin.normText;  // 重放时无原文, 用 normText 标识段
+      stageVoc(sin, &seg, cond);
+      seg.tf_ms = 0;  // 未执行 textfront
+      seg.wait_ms = 0;
+      if (!seg.audio.empty()) {
+        allAudio.reserve(allAudio.size() + seg.audio.size() + kSilence);
+        allAudio.insert(allAudio.end(), seg.audio.begin(), seg.audio.end());
+        allAudio.insert(allAudio.end(), kSilence, 0.f);
+      }
+      out->segments.push_back(std::move(seg));
+    }
+    out->audio = std::move(allAudio);
+    out->sr = kSr;
     if (!opt_.timing_csv.empty())
       writeTimingCsv(opt_.timing_csv, out->segments);
     return true;

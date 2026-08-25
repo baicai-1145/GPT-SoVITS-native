@@ -56,6 +56,8 @@ void printHelp(const char* argv0) {
       "  --prompt-text S   参考文本: 必须为参考音频的逐字转写,\n"
       "                    错配将导致严重音质/复读退化 [默认空=no_prompt_text]\n"
       "  --no-cache        禁用参考特征缓存\n"
+      "  --dump-sovits-in F 全链跑后快照 SoVITS 输入到 F (供重放)\n"
+      "  --sovits-in F     重放模式: 只跑 SoVITS (跳过文本前端/AR, 无需 --text/--ref-wav)\n"
       "  --overlap         流水重叠模式: AR(N+1) ‖ SoVITS(N) (数值同串行)\n"
       "  --timing-csv F    per-segment 三阶段耗时 CSV 输出路径\n"
       "  --amx             SoVITS conv 启用 AMX fp16 GEMM 后端(实验; 默认关)\n"
@@ -68,6 +70,7 @@ void printHelp(const char* argv0) {
 int main(int argc, char** argv) {
   std::string text, refWav, weights = "weights", data = "src/runtime/data",
                               out = "out.wav";
+  std::string sovitsInPath;  // --sovits-in: 重放模式 (只跑 SoVITS)
   gsv::rt::pipeline::PipelineOptions opt;
   int opt_threads = 0;
   bool haveText = false, haveRef = false;
@@ -115,6 +118,10 @@ int main(int argc, char** argv) {
       opt.sovits_amx = true;
     } else if (a == "--timing-csv") {
       opt.timing_csv = next("--timing-csv");
+    } else if (a == "--dump-sovits-in") {
+      opt.sovits_in_dump = next("--dump-sovits-in");
+    } else if (a == "--sovits-in") {
+      sovitsInPath = next("--sovits-in");
     } else if (a == "--no-cache") {
       opt.use_ref_cache = false;
     } else {
@@ -123,7 +130,9 @@ int main(int argc, char** argv) {
     }
   }
 
-  if (!haveText || !haveRef) {
+  if (!sovitsInPath.empty()) {
+    // 重放模式只需快照文件, 不要求 --text/--ref-wav
+  } else if (!haveText || !haveRef) {
     std::fprintf(stderr,
                  "错误: 必须提供 --text 与 --ref-wav (--help 查看用法)\n");
     return 2;
@@ -135,7 +144,7 @@ int main(int argc, char** argv) {
       return 2;
     }
   }
-  if (!std::filesystem::exists(refWav)) {
+  if (sovitsInPath.empty() && !std::filesystem::exists(refWav)) {
     std::fprintf(stderr, "错误: 参考音频不存在: %s\n", refWav.c_str());
     return 2;
   }
@@ -159,7 +168,13 @@ int main(int argc, char** argv) {
   const double tLoaded = nowMs();
 
   gsv::rt::pipeline::SynthResult res;
-  if (!pipe.synthesize(text, refWav, &res, &err)) {
+  if (!sovitsInPath.empty()) {
+    // 重放模式: 跳过 textfront/AR, 只跑 SoVITS (需 --ref-wav 不需要)
+    if (!pipe.synthesizeFromSovitsIn(sovitsInPath, &res, &err)) {
+      std::fprintf(stderr, "错误: SoVITS重放失败: %s\n", err.c_str());
+      return 1;
+    }
+  } else if (!pipe.synthesize(text, refWav, &res, &err)) {
     std::fprintf(stderr, "错误: 合成失败: %s\n", err.c_str());
     return 1;
   }

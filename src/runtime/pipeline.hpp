@@ -45,6 +45,7 @@ struct PipelineOptions {
                             // 空串 = 无提示文本(CPUFast no_prompt_text 口径)
   bool overlap = false;    // D2: AR(N+1) ‖ SoVITS(N) 流水重叠(纯调度, 数值同串行)
   std::string timing_csv;  // D2: per-segment 三阶段耗时 CSV 路径 (空=不写)
+  std::string sovits_in_dump;  // SoVITS专攻: 全链后快照落盘路径 (空=不存)
   bool sovits_amx = false; // E5-P2: SoVITS conv 接入 AMX 后端 (--amx; 默认关)
 };
 
@@ -82,6 +83,12 @@ class Pipeline {
   bool synthesize(const std::string& utf8Text, const std::string& refWavPath,
                   SynthResult* out, std::string* err);
 
+  // SoVITS 专攻模式: opt.sovits_in_dump 非空时, synthesize 结束后把各段
+  // SegSovIn + DecodeCondition 快照落盘 (供 --sovits-in 重放)。
+  // 重放: 跳过 textfront/AR/BERT, 直接逐段 stageVoc。位级同输入(noise 快照)。
+  bool synthesizeFromSovitsIn(const std::string& sovitsInPath, SynthResult* out,
+                              std::string* err);
+
   static constexpr uint32_t kSr = 32000;
   static constexpr size_t kSilence = 9600;  // fragment_interval=0.3s@32k
 
@@ -109,6 +116,9 @@ class Pipeline {
     std::vector<float> bertAll;       // [len(phonesAll),1024]
     std::string normText;
   };
+
+ public:
+  // SoVITS 输入载荷 (--sovits-in 重放 / --dump-sovits-in 快照用, 公开以便序列化)
   struct SegSovIn {
     std::vector<int64_t> codes;       // AR 生成 token (= sampled)
     std::vector<int32_t> rawArgmax;   // ↔ pairs golden tokens 口径
@@ -120,6 +130,7 @@ class Pipeline {
     bool empty = false;               // 纯标点段直通
   };
 
+ private:
   // 阶段函数: 两模式调用完全相同 ⇒ 纯调度差异不触数值。
   // stageFeaturize 前端失败以异常上报(overlap 下经 envelope 顺序送达)。
   SegArIn stageFeaturize(const SegText& t) const;
@@ -130,6 +141,9 @@ class Pipeline {
   // RNG: 仅 stage2/串行主线程按段序触碰 (overlap 下 FIFO 单线程独占)
   std::mt19937_64 rng_{42};
   bool rngSeeded_ = false;
+
+  // SoVITS 输入快照 sink (--dump-sovits-in 时由两模式 stage3 后收集)
+  std::vector<SegSovIn> sovInSink_;
 
  public:
   // D2: 重叠模式下由 stage3 在"首段音频产出"时刻写入(生产侧口径,
