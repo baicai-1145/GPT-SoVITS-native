@@ -46,6 +46,8 @@ struct PipelineOptions {
   bool overlap = false;    // D2: AR(N+1) ‖ SoVITS(N) 流水重叠(纯调度, 数值同串行)
   std::string timing_csv;  // D2: per-segment 三阶段耗时 CSV 路径 (空=不写)
   std::string sovits_in_dump;  // SoVITS专攻: 全链后快照落盘路径 (空=不存)
+  bool ar_fp16_kv = false;    // E1裁决B: AR KV fp16 (默认关, 与fp32位级一致)
+  bool ar_fp16_gemv = false;  // E2-AR: FMLAL gemv 实验开关 (--fp16-all 隐含)
   bool sovits_amx = false; // E5-P2: SoVITS conv 接入 AMX 后端 (--amx; 默认关)
 };
 

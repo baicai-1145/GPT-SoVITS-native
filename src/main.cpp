@@ -116,6 +116,11 @@ int main(int argc, char** argv) {
       opt.overlap = true;
     } else if (a == "--amx") {
       opt.sovits_amx = true;
+    } else if (a == "--fp16") {
+      opt.ar_fp16_kv = true;
+    } else if (a == "--fp16-all") {
+      opt.ar_fp16_kv = true;
+      opt.ar_fp16_gemv = true;
     } else if (a == "--timing-csv") {
       opt.timing_csv = next("--timing-csv");
     } else if (a == "--dump-sovits-in") {

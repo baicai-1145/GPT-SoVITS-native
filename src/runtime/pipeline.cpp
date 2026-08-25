@@ -201,6 +201,14 @@ bool Pipeline::load(const std::string& weightsDir, const std::string& dataDir,
 
     fAr_ = std::make_unique<rt::GsvFile>(joinPath(weightsDir, "ar_s1v3.gsv"));
     ar_ = std::make_unique<ar::T2SEngine>(*fAr_);
+    if (opt_.ar_fp16_kv || opt_.ar_fp16_gemv) {
+      ar::T2SEngine::Fp16Options fo;
+      fo.kv = opt_.ar_fp16_kv;
+      fo.gemv = opt_.ar_fp16_gemv;
+      ar_->set_fp16(fo);
+      std::fprintf(stderr, "AR fp16: kv=%d gemv=%d (实验开关)\n", fo.kv,
+                   fo.gemv);
+    }
     profMark("ar_load(444MB)", &tStage);
     sovits_ = std::make_unique<sovits::SovitsEngine>();
     fSov_ = std::make_unique<rt::GsvFile>(joinPath(weightsDir, "sovits_v2ProPlus.gsv"));
