@@ -63,6 +63,13 @@ class Conv1d {
   kern::AmxPanel panel_;  // [out, K=in*k] 预打包 (仅 amx_enabled 且大块时)
 #endif
   bool has_panel_ = false;
+#if defined(GSV_AMX_GEMM)
+  // E10: resblock 批量图执行需要直访 panel 与就绪态 (仅读)
+  bool amx_ready() const { return has_panel_; }
+  const kern::AmxPanel& amx_panel() const { return panel_; }
+#else
+  bool amx_ready() const { return false; }
+#endif
 
   void load(const rt::GsvFile& f, std::string_view prefix, size_t o, size_t i,
             size_t kk, size_t dil = 1) {
