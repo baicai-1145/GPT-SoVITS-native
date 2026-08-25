@@ -184,7 +184,11 @@ inline void im2col_to_panel_f16(const float* x, size_t C, size_t T,
   const size_t Kw = C * k;
   const size_t nt = (T + 31) / 32;
   // 免全量 memset (容量复用): 仅尾块未用行在写入后单独补零
-  out.resize(nt * K * 64 + 64);
+  // E10-MEM: 避免 d.assign(c*t, 0) 收缩触发 realloc; 容量足仅 size 调
+  // (零填), 容量不够才 reserve + 零填 (caller 期望零起点)。
+  const size_t need = nt * K * 64 + 64;
+  if (out.capacity() < need) out.resize(need);
+  else if (out.size() < need) out.resize(need);
   const uintptr_t pbase = (uintptr_t)out.data();
   uint8_t* dst = out.data() + ((64 - (pbase & 63)) & 63);
   const long pad_l = static_cast<long>((k - 1) * dil) / 2;

@@ -101,12 +101,82 @@ class Generator {
             !resblocks[stage][j].convs2[m].amx_ready())
           return false;
 
+    // E10-MEM: 预算守卫。ResBatchScratch 静态复用 s.cur/tin/tA/tB (18×C*Tn
+    // floats = 72·C·Tn 字节) + 18 个 panel (nt·K·64+64)。 10s 段 S2 (C=192,
+    // T=102400) 总占用 ~3GB+ → 16GB 机器上多段叠加 phys_footprint 失控。 超过
+    // 预算回退串行 (后者 thread_local + 临时分配, 峰值小)。 默认 3GB
+    // (ResBatchScratch 主贡献; Conv1d::forward / textfront / encoder 另计
+    // 在外), 环境变量 GSV_SOVITS_BUDGET_MB 覆盖。
+    static const size_t kBudgetBytes = []() {
+      long mb = 3L * 1024L * 1024L * 1024L;  // 3 GiB 默认
+      if (const char* e = std::getenv("GSV_SOVITS_BUDGET_MB")) {
+        char* end = nullptr;
+        long v = std::strtol(e, &end, 10);
+        if (end && *end == '\0' && v > 0) mb = v * 1024L * 1024L;
+      }
+      return static_cast<size_t>(mb);
+    }();
+    // 预算精账: 18 panel (取本 stage 各 (j, k) 形状计算) + 18 张量。
+    // 注: panel size 取阶段所有 j 中最大 K, 偏保守但能准确盖住 (j*p 形状
+    // 不同, 但所有 panel 同时间活在 scratch)。实际 K_j = stage_ch·k_j + 1。
+    const size_t nt = (Tn + 31) / 32;
+    size_t panel_total = 0;
+    for (size_t j = 0; j < kResKernels; ++j) {
+      const ResBlock1& rb = resblocks[stage][j];
+      // convs1 与 convs2 共享 in_c/out_c, 取最大 k 即可覆盖两种 panel
+      const size_t k_max = std::max(rb.convs1[0].k,
+                              std::max(rb.convs1[1].k,
+                                       std::max(rb.convs1[2].k,
+                                                std::max(rb.convs2[0].k,
+                                                  std::max(rb.convs2[1].k,
+                                                           rb.convs2[2].k)))));
+      const size_t K = rb.convs1[0].in_c * k_max + 1;
+      // 每 j 有 6 panel (2 convs × 3 m), shape 相同
+      panel_total += 6 * (nt * K * 64 + 64);
+    }
+    const size_t tensor_total = 18 * C * Tn * sizeof(float);
     // 单飞安全: SoVITS stage 为单线程 FIFO, amx_batch_run 阻塞至完成;
     // 静态存活使 pb/张量容量跨调用复用 (免 prepare 内分配)。
+    // E10-MEM: 避免 shrink 触发 realloc churn; 容量足仅 size 调, 容量
+    // 不够才 resize (capacity 翻倍策略, 后续调用走 size-only 免费)。
+    // 静态 s 提前到本块顶部声明, 使预算守卫能访问并主动释放超容的 s
+    // (避免大 stage 调大后 OS 仍记 1 页高水位, 后续小 stage 调不到
+    // 较紧 footprint)。
     static ResBatchScratch s;
     auto ensure = [](Tensor2D& t, size_t c, size_t tt) {
-      t.C = c; t.T = tt; t.d.resize(c * tt);
+      const size_t need = c * tt;
+      if (t.d.capacity() < need) t.d.resize(need);
+      else if (t.d.size() < need) t.d.resize(need);
+      t.C = c; t.T = tt;
     };
+    if (panel_total + tensor_total > kBudgetBytes) {
+      if (sov_timing_enabled()) {
+        std::fprintf(stderr,
+            "[sovits-dec-budget] stage=%zu T=%zu C=%zu panel=%zumiB "
+            "tensor=%zumiB total=%zumiB > budget=%zumiB → fallback serial\n",
+            stage, Tn, C, panel_total >> 20, tensor_total >> 20,
+            (panel_total + tensor_total) >> 20, kBudgetBytes >> 20);
+      }
+      // 主动释放 s: 避免上一调大后 OS 仍记 1 页高水位。仅释放一次, 后续
+      // 小 stage 调不到预算也不会重新触发。
+      static thread_local bool released = false;
+      if (!released) {
+        for (size_t j = 0; j < kResKernels; ++j) {
+          for (size_t p = 0; p < 6; ++p) {
+            s.pb[j][p].buf.clear();
+            s.pb[j][p].buf.shrink_to_fit();
+          }
+          // 18 张量也缩回 0 容量, 让 OS 回收 (cur/tin/tA/tB 共 18 个)。
+          for (auto* t : {&s.cur[j], &s.tin[j], &s.tA[j][0], &s.tA[j][1],
+                          &s.tB[j][0], &s.tB[j][1]}) {
+            std::vector<float>().swap(t->d);
+            t->C = t->T = 0;
+          }
+        }
+        released = true;
+      }
+      return false;
+    }
     for (size_t j = 0; j < kResKernels; ++j) {
       ensure(s.cur[j], C, Tn);
       ensure(s.tin[j], C, Tn);
@@ -259,20 +329,24 @@ class Generator {
         if (prof) T.dec_res += batch_ms;
       } else {
         static thread_local Tensor2D cur, t_in, t_a, t_b;
+        // E10-MEM: 静态 thread_local 跨调用复用; 只增长 capacity, 避免小
+        // 调用收缩触发 realloc churn (与 res_forward_batched 同样的策略)
+        auto ensure_tl = [](Tensor2D& t, size_t c, size_t tt) {
+          const size_t need = c * tt;
+          if (t.d.capacity() < need) t.d.resize(need);
+          else if (t.d.size() < need) t.d.resize(need);
+          t.C = c; t.T = tt;
+        };
         bool first = true;
         for (size_t j = 0; j < kResKernels; ++j) {
           const ResBlock1& rb = resblocks[i][j];
-          cur.C = x.C;
-          cur.T = x.T;
-          cur.d.resize(x.d.size());
+          ensure_tl(cur, x.C, x.T);
           std::memcpy(cur.d.data(), x.d.data(), x.d.size() * sizeof(float));
           for (size_t jj = 0; jj < 3; ++jj) {
             // torch: xt=lrelu(x); xt=c1(xt); xt=lrelu(xt); xt=c2(xt); x=xt+x
             // (lrelu 不污染残差分支 — 用独立缓冲 t_in)
             double te = tic();
-            t_in.C = cur.C;
-            t_in.T = cur.T;
-            t_in.d.resize(cur.d.size());
+            ensure_tl(t_in, cur.C, cur.T);
             leaky_relu_write(cur.d.data(), t_in.d.data(), cur.d.size(), 0.1f);
             if (prof) T.res_ew += now_ms_e6() - te;
             t0 = tic();
