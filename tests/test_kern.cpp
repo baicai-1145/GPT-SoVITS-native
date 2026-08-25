@@ -345,4 +345,63 @@ GSV_TEST(gemm_f16_amx_pp_bitwise_same) {
 }
 #endif  // GSV_AMX_GEMM
 
+
+#if defined(GSV_AMX_GEMM)
+#include "kern/gemm_f16_amx.hpp"
+// E9: 批量派发与逐节点单发结果逐位一致 (同内核); prepare 钩子路径可用。
+GSV_TEST(amx_batch_matches_sequential) {
+  if (!gsv::kern::amx_gemm_available()) return;
+  Rng rng;
+  struct Spec {
+    size_t M, N, K;
+  };
+  const Spec specs[] = {{384, 2000, 1152}, {96, 777, 672}, {65, 33, 9}};
+  constexpr int kPhases = 3;
+  std::vector<gsv::kern::AmxPanel> pas, pbs;
+  std::vector<std::vector<float>> c_seq, c_bat;
+  std::vector<gsv::kern::AmxBatchNode> nodes;
+  std::vector<std::function<void()>> preps;
+  // 预留容量: 节点存的是元素指针, 防扩容悬垂
+  pas.reserve(kPhases * 3);
+  pbs.reserve(kPhases * 3);
+  c_seq.reserve(kPhases * 3);
+  c_bat.reserve(kPhases * 3);
+  nodes.reserve(kPhases * 3);
+  size_t idx = 0;
+  for (int ph = 0; ph < kPhases; ++ph)
+    for (const auto& s : specs) {
+      const size_t M = s.M, N = s.N, K = s.K;
+      std::vector<uint16_t> wa(M * K), wb(N * K);
+      for (auto& v : wa) {
+        _Float16 h(rng.next() * 0.5f);
+        __builtin_memcpy(&v, &h, 2);
+      }
+      for (auto& v : wb) {
+        _Float16 h(rng.next() * 0.5f);
+        __builtin_memcpy(&v, &h, 2);
+      }
+      pas.push_back(gsv::kern::amx_pack(wa.data(), M, K));
+      // pb: 走 prepare 打包路径 (覆盖钩子语义)
+      pbs.emplace_back();
+      gsv::kern::amx_pack_into(wb.data(), N, K, pbs.back().buf);
+      pbs.back().rows = N;
+      pbs.back().K = K;
+      c_seq.emplace_back(M * N, 0.f);
+      c_bat.emplace_back(M * N, 0.f);
+      nodes.push_back(gsv::kern::AmxBatchNode{ph, &pas.back(), &pbs.back(),
+                                              c_bat.back().data(), M, N, {}});
+      ++idx;
+    }
+  (void)idx;
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    gsv::kern::gemm_f16_amx_pp(*nodes[i].pa, *nodes[i].pb, c_seq[i].data(),
+                               nodes[i].M, nodes[i].N);
+  }
+  gsv::kern::amx_batch_run(nodes.data(), nodes.size());
+  for (size_t i = 0; i < c_seq.size(); ++i)
+    CHECK(std::memcmp(c_seq[i].data(), c_bat[i].data(),
+                      c_seq[i].size() * sizeof(float)) == 0);
+}
+#endif  // GSV_AMX_GEMM
+
 GSV_TEST_MAIN()
