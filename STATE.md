@@ -50,7 +50,7 @@
 | E2-ENC | BERT/RoBERTa/HuBERT 编码栈 fp16 化 | E1 | exec-txt | DONE | task/E2-ENC | view零拷贝+真FMLAL+生命周期修复; 初判REJECTED系误判(短句基线vs长句对照无效): 受控A/B证fp16与fp32输出token级一致(同句均910)且load 4.6s→170ms → 已reapply(f754269); 调节链fp16安全性与AR采样语义问题拆分至E4 |
 | E3 | AR int8 权重+int8 KV (原E2) | E2-AR | 未分配 | TODO | A/B 听感 |
 | E6 | SoVITS热点消灭二轮DONE合入: bias-fold快径ones列bug修复(main潜伏bug!)+ConvT相位amx_batch_run接入; 配对A/B SoVITS段 -62%(1645→627ms) | E5-P2 | exec-sov | REVIEW→DONE待定标 | task/E6 | G3全过/单测过/off不变; 绝对值待安静窗口D1定标复测 |
-| E9 | kern 批量多GEMM单次派发 API(run_batch 提交整stage conv序列, 消prep/GEMM互等与同步往返) | E6 | exec-ar | TODO | task/E9 | E6二轮前置; 需与exec-sov联调接口 |
+| E9 | kern 批量多GEMM单次派发 API(amx_batch_run, phase-图调度, prepare钩子就地im2col) | E6 | exec-ar | DONE | task/E9 | amx_batch_run+AmxBatchNode+prepare钩子实现; bench: C场景prep流水1.10x, bitwise_diff=0; test amx_batch_matches_sequential PASS |
 | E7 | 加载方差治理: 根因=USB盘73MB/s+双布局冗余63%+页缓存挤占; --slim(-63%字节,wav逐位一致)+RDADVISE预读 | E5-P2 | exec-ar | DONE | task/E7 | 已合并; slim权重已部署内置NVMe ~/gsv-weights(load 380ms达标); 后续: convert.py直产slim(C方案)归M0工具链 |
 | E8 | encoder DenseF16→AMX后端切换(bert.ffn形状bench 2.07x; 当前仅66ms, 低优先级) | E5 | 未分配 | TODO | | 待E6后视余量 |
 | E4 | 长单段AR复读环鲁棒性: 对齐python topk_sampling(top_k/top_p/temperature+惩罚,CALIBRATION)或移植early_stop_num | C2 | 未分配 | TODO | 复读事件根因已定位=默认参考文本与参考音频错配(修正为no_prompt_text默认, 910→68 tokens); 本卡降级为低优先级鲁棒性储备 |
