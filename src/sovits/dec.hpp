@@ -126,6 +126,19 @@ class Generator {
     const size_t nmb = (C + 31) / 32, nnb = (Tn + 31) / 32;
     std::vector<kern::AmxTileChainLink> nodes;
     nodes.reserve(kResKernels * 6 * nmb * nnb);
+    // E10-K2-b37 紧急修复: b36 接线遗漏了 s.pb[j][p].buf 容量初始化
+    // (per-tile im2col 不经 Conv1d::forward, Conv1d 内 pb.buf 赋值不会发生)
+    // —— 不补会 im2col 写 null 段错误 (lldb 定位 im2col_to_panel_f16_tile
+    // +752 处 `strh w7, [x8, x3]` 写 x8=0)。
+    for (size_t j = 0; j < kResKernels; ++j) {
+      for (size_t p = 0; p < 6; ++p) {
+        const bool even = (p % 2) == 0;
+        const Conv1d& cv = even ? resblocks[stage][j].convs1[p / 2]
+                                 : resblocks[stage][j].convs2[p / 2];
+        const size_t Kp1 = cv.in_c * cv.k + 1;  // 包含 bias 列 (append_ones)
+        s.pb[j][p].buf.resize(nnb * Kp1 * 64 + 64);
+      }
+    }
     for (size_t j = 0; j < kResKernels; ++j) {
       const ResBlock1& rb = resblocks[stage][j];
       for (size_t p = 0; p < 6; ++p) {
