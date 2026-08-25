@@ -63,24 +63,29 @@ class MultiHeadAttention {
                const std::vector<uint8_t>& mask, Tensor2D& out, Tensor2D& qb,
                Tensor2D& kb, Tensor2D& vb, Tensor2D& scores,
                const Dumper* dbg = nullptr) const {
+    const bool prof = sov_timing_enabled();
+    StageTimers& Tm = sov_timers();
+    const double t0 = prof ? now_ms_e6() : 0.0;
     const size_t Tq = q_in.T, Tk = kv_in.T;
     conv_q.forward(q_in, qb);
     conv_k.forward(kv_in, kb);
     conv_v.forward(kv_in, vb);
+    if (prof) Tm.mha_proj += now_ms_e6() - t0;
 
     const float scale = 1.f / std::sqrt(static_cast<float>(dk));
     scores.reset(heads * Tq, Tk);
-    for (size_t h = 0; h < heads; ++h)
-      for (size_t t = 0; t < Tq; ++t) {
-        float* sr = &scores.d[(h * Tq + t) * Tk];
-        const float* qp = &qb.d[(h * dk) * Tq + t];
-        for (size_t s = 0; s < Tk; ++s) {
-          const float* kp = &kb.d[(h * dk) * Tk + s];
-          float acc = 0.f;
-          for (size_t d = 0; d < dk; ++d) acc += qp[d * Tq] * kp[d * Tk];
-          sr[s] = acc * scale;
-        }
-      }
+    const double ts = prof ? now_ms_e6() : 0.0;
+    // E10-mha-sgemm: scores[h] = scale * Q[h]^T · K[h] via Accelerate sgemm.
+    // Q/K 布局 [h*dk, T] 行主 → Q[h]^T 是 [Tq, dk] (ldA=Tq), K[h] 是 [dk, Tk] (ldB=Tk)。
+    // 逐头一次 sgemm (h≤4, 远低于批门限; BLAS 调优已自洽)。
+    for (size_t h = 0; h < heads; ++h) {
+      kern::accel::sgemm('T', 'N', static_cast<int>(Tq), static_cast<int>(Tk),
+                         static_cast<int>(dk), scale,
+                         &qb.d[(h * dk) * Tq], static_cast<int>(Tq),
+                         &kb.d[(h * dk) * Tk], static_cast<int>(Tk),
+                         0.0f, &scores.d[(h * Tq) * Tk], static_cast<int>(Tk));
+    }
+    if (prof) Tm.mha_scores += now_ms_e6() - ts;
     if (dbg) {
       dbg->dump("mha_q", qb);
       dbg->dump("mha_k", kb);
@@ -88,6 +93,7 @@ class MultiHeadAttention {
       dbg->dump("mha_scores_core", scores);
     }
 
+    const double tr0 = has_rel() ? (prof ? now_ms_e6() : 0.0) : 0.0;
     thread_local std::vector<float> usedk_buf, usedv_buf;
     if (has_rel()) {
       const size_t L = Tq;
@@ -98,14 +104,18 @@ class MultiHeadAttention {
       // rel_logits[h,t,m]
       thread_local std::vector<float> rel_logits;
       rel_logits.assign(heads * L * (2 * L - 1), 0.f);
-      for (size_t h = 0; h < heads; ++h)
-        for (size_t t = 0; t < L; ++t)
-          for (size_t m = 0; m < 2 * L - 1; ++m) {
-            float acc = 0.f;
-            for (size_t d = 0; d < dk; ++d)
-              acc += qb.d[(h * dk + d) * Tq + t] * usedk_buf[m * dk + d];
-            rel_logits[(h * L + t) * (2 * L - 1) + m] = acc * scale;
-          }
+      // E10-mha-sgemm: rel_logits[h] = scale * Q[h]^T · usedk_buf^T
+      //   Q[h] = [dk, Tq] (ldA=Tq), usedk_buf = [2L-1, dk] (ldB=dk)
+      //   rel_logits[h] = [Tq, 2L-1] (ldC=2L-1)
+      for (size_t h = 0; h < heads; ++h) {
+        kern::accel::sgemm('T', 'T', static_cast<int>(L),
+                           static_cast<int>(2 * L - 1), static_cast<int>(dk),
+                           scale,
+                           &qb.d[(h * dk) * Tq], static_cast<int>(Tq),
+                           usedk_buf.data(), static_cast<int>(dk),
+                           0.0f, &rel_logits[(h * L) * (2 * L - 1)],
+                           static_cast<int>(2 * L - 1));
+      }
       if (dbg) {
         // torch rel_logits [b,h,L,2L-1]: 内存序 [h][L][m]
         Tensor2D rl_tmp(heads * L, 2 * L - 1);
@@ -145,8 +155,10 @@ class MultiHeadAttention {
         dbg->dump("mha_rel_abs", ra_tmp);
       }
     }
+    if (has_rel()) Tm.mha_rel_pre += now_ms_e6() - tr0;
 
     // mask → -1e4, softmax over s
+    const double tsm = prof ? now_ms_e6() : 0.0;
     for (size_t h = 0; h < heads; ++h)
       for (size_t t = 0; t < Tq; ++t) {
         float* sr = &scores.d[(h * Tq + t) * Tk];
@@ -154,9 +166,11 @@ class MultiHeadAttention {
           if (!mask[t * Tk + s]) sr[s] = -1e4f;
         softmax_row_inplace(sr, Tk);
       }
+    if (prof) Tm.mha_soft += now_ms_e6() - tsm;
     if (dbg) dbg->dump("mha_p_attn", scores);
 
     // out = Σ_s p·v
+    const double to = prof ? now_ms_e6() : 0.0;
     out.reset(channels, Tq);
     for (size_t h = 0; h < heads; ++h)
       for (size_t t = 0; t < Tq; ++t) {
@@ -169,6 +183,8 @@ class MultiHeadAttention {
             op[d * Tq] += p * vb.d[(h * dk + d) * Tk + s];
         }
       }
+    if (prof) Tm.mha_out += now_ms_e6() - to;
+    const double tr = has_rel() ? (prof ? now_ms_e6() : 0.0) : 0.0;
     if (has_rel()) {
       const size_t L = Tq;
       // p_rel[h,i,mrel]: _absolute_position_to_relative_position 索引同构:
@@ -195,7 +211,11 @@ class MultiHeadAttention {
         dbg->dump("mha_attn_out", ao_tmp);
       }
     }
+    if (has_rel()) Tm.mha_rel += now_ms_e6() - tr;
+
+    const double tco = prof ? now_ms_e6() : 0.0;
     conv_o.forward(out, out);
+    if (prof) Tm.mha_conv_o += now_ms_e6() - tco;
   }
 };
 

@@ -19,6 +19,8 @@
 #include <cstring>
 #include <functional>
 #include <random>
+#include <sys/sysctl.h>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -180,6 +182,97 @@ int main() {
         "diff_batch_chain=%zu\n",
         kNames[sc], t_seq, t_bat, t_chain, t_seq / t_chain,
         t_bat / t_chain, t_seq / t_bat, diff_bc);
+  }
+
+  // ---- D: stage1 resblock 真实形状复刻 ----
+  // 3链×6卷积=18节点, 6相位×3节点/相位, K=576/1344/2112 (k3/k7/k11), T=16000, Co=192
+  // 测量: (1) batch+prep 真实路径 (2) batch 无 prep 纯数学 (3) seq 串行
+  {
+    const size_t M = 192, N = 16000;
+    const size_t Karr[3] = {192 * 3, 192 * 7, 192 * 11};
+    const size_t CHAIN = 3, CONVS = 6, NNODES = CHAIN * CONVS;
+
+    std::vector<gsv::kern::AmxPanel> wp(NNODES), ap(NNODES);
+    std::vector<std::vector<uint16_t>> araw(NNODES);
+    for (size_t id = 0; id < NNODES; ++id) {
+      size_t chain = id / CONVS;        // 0/1/2
+      size_t K = Karr[chain];           // k3/k7/k11
+      wp[id] = mkpanel(M, K);
+      ap[id] = mkpanel(N, K);
+      araw[id].resize(N * K);
+      for (auto& v : araw[id]) {
+        __fp16 h((float)((int)(rng() % 4096) - 2048) * 0.001953125f);
+        std::memcpy(&v, &h, 2);
+      }
+    }
+    std::printf("D: mkpanel ok\n"); std::fflush(stdout);
+    std::vector<std::vector<float>> cs(NNODES);
+    for (size_t i = 0; i < NNODES; ++i) cs[i].assign(M * N, 0.f);
+    std::printf("D: cs ok\n"); std::fflush(stdout);
+
+    // Pre-build nodes (prep=false)
+    std::vector<gsv::kern::AmxBatchNode> nodes_math(NNODES);
+    for (size_t d = 0; d < CONVS; ++d)
+      for (size_t j = 0; j < CHAIN; ++j) {
+        size_t id = j * CONVS + d;
+        nodes_math[id].phase = (int)d;
+        nodes_math[id].pa = &wp[id];
+        nodes_math[id].pb = &ap[id];
+        nodes_math[id].c = cs[id].data();
+        nodes_math[id].M = M; nodes_math[id].N = N;
+      }
+    std::printf("D: nodes_math ok\n"); std::fflush(stdout);
+
+    // prep=true: holds vector (lifetime贯穿整个 D block)
+    std::vector<gsv::kern::AmxBatchNode> nodes_prep(NNODES);
+    std::vector<std::function<void()>> holds(NNODES);
+    for (size_t d = 0; d < CONVS; ++d)
+      for (size_t j = 0; j < CHAIN; ++j) {
+        size_t id = j * CONVS + d, K = Karr[j];
+        nodes_prep[id].phase = (int)d;
+        nodes_prep[id].pa = &wp[id];
+        nodes_prep[id].pb = &ap[id];
+        nodes_prep[id].c = cs[id].data();
+        nodes_prep[id].M = M; nodes_prep[id].N = N;
+        holds[id] = [&araw, &ap, id, K] {
+          gsv::kern::amx_pack_into(araw[id].data(), N, K, ap[id].buf);
+          ap[id].rows = N; ap[id].K = K;
+        };
+        nodes_prep[id].prepare = holds[id];
+      }
+
+    size_t ps = 0; { size_t l = sizeof(ps);
+      if (::sysctlbyname("hw.perflevel0.logicalcpu", &ps, &l, nullptr, 0) != 0)
+        ps = std::thread::hardware_concurrency(); }
+    double gmac = (double)M * N * (Karr[0]+Karr[1]+Karr[2]) * CONVS / 1e9;
+    constexpr int R = 5;
+
+    double t_prep = 1e30, t_math = 1e30, t_seq = 1e30;
+    for (int r = 0; r < R; ++r) {
+      for (auto& c : cs) std::fill(c.begin(), c.end(), 0.f);
+      auto t0 = now_ms(); gsv::kern::amx_batch_run(nodes_prep.data(), NNODES);
+      t_prep = std::min(t_prep, now_ms() - t0);
+
+      for (auto& c : cs) std::fill(c.begin(), c.end(), 0.f);
+      t0 = now_ms(); gsv::kern::amx_batch_run(nodes_math.data(), NNODES);
+      t_math = std::min(t_math, now_ms() - t0);
+
+      for (auto& c : cs) std::fill(c.begin(), c.end(), 0.f);
+      t0 = now_ms();
+      for (size_t i = 0; i < NNODES; ++i)
+        gsv::kern::gemm_f16_amx_pp(wp[i], ap[i], cs[i].data(), M, N);
+      t_seq = std::min(t_seq, now_ms() - t0);
+    }
+
+    std::printf("\n=== D: stage1 real shapes (M=192, N=16000, k=3/7/11, x18) ===\n");
+    std::printf("pool_workers=%zu  total_GMAC=%.1f  tiles/GEMM=%zu\n",
+                ps, gmac, ((M+31)/32)*((N+31)/32));
+    std::printf("batch_prep=%7.2fms  batch_math=%7.2fms  seq=%7.2fms\n",
+                t_prep, t_math, t_seq);
+    std::printf("prep_overhead=%7.2fms (%.1f%% of batch_prep)  batch_gain=%.2fx\n",
+                t_prep - t_math, 100.0*(t_prep - t_math)/t_prep, t_seq / t_math);
+    std::printf("throughput: prep=%.0f GMAC/s  pure_math=%.0f GMAC/s  seq=%.0f GMAC/s\n",
+                gmac/(t_prep/1e3), gmac/(t_math/1e3), gmac/(t_seq/1e3));
   }
   return 0;
 }

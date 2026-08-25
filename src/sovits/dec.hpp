@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <string>
@@ -205,24 +206,41 @@ class Generator {
     cond.forward(ge, cb);  // [768, gT]
     if (prof) T.dec_cond += now_ms_e6() - t0;
     dm.dump("dbg_dec_cond_out", cb);
-    for (size_t c = 0; c < 768; ++c) {
-      const float cv = cb.d[c * gT];
-      for (size_t t = 0; t < x.T; ++t) x.d[c * x.T + t] += cv;
+    // x += cond(ge) (广播 gT==1)
+    double t_cond_ew = 0;
+    { double te = tic();
+      for (size_t c = 0; c < 768; ++c) {
+        const float cv = cb.d[c * gT];
+        for (size_t t = 0; t < x.T; ++t) x.d[c * x.T + t] += cv;
+      }
+      if (prof) t_cond_ew = now_ms_e6() - te;
     }
 
+    // E10: per-stage timing (lightweight, only when prof)
+    double stage_ups[kStages] = {};
+    double stage_pre_ew[kStages] = {};
+    double stage_swap[kStages] = {};
+    double stage_res_t[kStages] = {};
+    double stage_res_pool[kStages] = {};
     // E6: scratch 持久化 (thread_local) — 每 stage 重构造会反复 mmap/缺页零填
     static thread_local Tensor2D xu, scratch, sum;
     for (size_t i = 0; i < kStages; ++i) {
-      leaky_relu_io(x.d.data(), x.d.size(), 0.1f);
+      { double te = tic();
+        leaky_relu_io(x.d.data(), x.d.size(), 0.1f);
+        if (prof) stage_pre_ew[i] = now_ms_e6() - te;
+      }
       t0 = tic();
       ups[i].forward(x, xu, scratch);
-      if (prof) T.dec_ups += now_ms_e6() - t0;
-      x.d.swap(xu.d);
-      x.C = xu.C;
-      x.T = xu.T;
-      {
-        std::string n = "dbg_dec_up" + std::to_string(i);
-        dm.dump(n.c_str(), x);
+      if (prof) { T.dec_ups += now_ms_e6() - t0; stage_ups[i] = now_ms_e6() - t0; }
+      { double ts = tic();
+        x.d.swap(xu.d);
+        x.C = xu.C;
+        x.T = xu.T;
+        {
+          std::string n = "dbg_dec_up" + std::to_string(i);
+          dm.dump(n.c_str(), x);
+        }
+        if (prof) stage_swap[i] = now_ms_e6() - ts;
       }
       // torch: xs = Σ_j block_j(x) (块内三对串联卷积, 每对后残差相加,
       // 故 block_j 已含输入 x); x = xs / 3。
@@ -235,6 +253,7 @@ class Generator {
       // chain_id=j/depth=p, 同 chain 串行异 chain 并行 (无 phase barrier)。
       // im2col/lrelu/residual-add 放进 prepare 钩子, 与同 chain 数学重叠。
       double batch_ms = 0.0;
+      double t_res = tic();
       t0 = tic();
       if (res_forward_batched(i, x, sum, &batch_ms)) {
         if (prof) T.dec_res += batch_ms;
@@ -278,17 +297,51 @@ class Generator {
         }
         if (prof) T.dec_res += now_ms_e6() - t0;
       }
+      if (prof) { stage_res_t[i] = now_ms_e6() - t_res; stage_res_pool[i] = batch_ms; }
       x.d.swap(sum.d);
       {
         std::string n = "dbg_dec_res" + std::to_string(i);
         dm.dump(n.c_str(), x);
       }
     }
-    leaky_relu_io(x.d.data(), x.d.size(), 0.01f);  // F.leaky_relu 默认 slope
+    double t_final_ew = 0, t_tanh = 0;
+    { double te = tic();
+      leaky_relu_io(x.d.data(), x.d.size(), 0.01f);  // F.leaky_relu 默认 slope
+      if (prof) t_final_ew = now_ms_e6() - te;
+    }
     t0 = tic();
     conv_post.forward(x, out);
     if (prof) T.dec_post += now_ms_e6() - t0;
-    for (float& v : out.d) v = std::tanh(v);
+    { double te = tic();
+      for (float& v : out.d) v = std::tanh(v);
+      if (prof) t_tanh = now_ms_e6() - te;
+    }
+    if (prof) {
+      double total = T.dec_pre + T.dec_cond + t_cond_ew + T.dec_ups +
+                     T.dec_post + t_final_ew + t_tanh;
+      for (size_t i = 0; i < kStages; ++i) total += stage_res_t[i];
+      const auto pct = [&](double v) { return total > 0 ? v / total * 100.0 : 0; };
+      std::fprintf(stderr,
+          "[sovits-dec-timing] total=%.1fms (prof=%s)\n"
+          "  conv_pre       %8.2fms (%.1f%%)\n"
+          "  cond+broadcast %8.2fms (%.1f%%)\n",
+          total, prof ? "on" : "off",
+          T.dec_pre, pct(T.dec_pre),
+          T.dec_cond + t_cond_ew, pct(T.dec_cond + t_cond_ew));
+      for (size_t i = 0; i < kStages; ++i) {
+        const double main_work = stage_res_t[i] - stage_res_pool[i];
+        std::fprintf(stderr,
+            "  stage %d: ups=%6.2fms pre_ew=%5.2fms res=%6.2fms "
+            "pool=%6.2fms main_work=%5.2fms swap=%5.2fms\n",
+            (int)i, stage_ups[i], stage_pre_ew[i], stage_res_t[i],
+            stage_res_pool[i], main_work, stage_swap[i]);
+      }
+      std::fprintf(stderr,
+          "  final_lrelu+tanh %8.2fms (%.1f%%)\n"
+          "  conv_post      %8.2fms (%.1f%%)\n",
+          t_final_ew + t_tanh, pct(t_final_ew + t_tanh),
+          T.dec_post, pct(T.dec_post));
+    }
   }
 };
 
