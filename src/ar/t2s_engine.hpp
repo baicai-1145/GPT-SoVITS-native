@@ -21,6 +21,7 @@
 #pragma once
 
 #include "kern/accel.hpp"
+#include "kern/gemm_f16_amx.hpp"  // E11-2: prefill AMX 预打包面板
 #include "kern/kern.hpp"
 #include "runtime/gsv_loader.hpp"
 
@@ -148,6 +149,9 @@ class T2SEngine {
     std::vector<float> n1g, n1b, n2g, n2b;
     // M1-fp16: 原始 f16 位型副本(fp16 直读 GEMV 路径用; 与升位缓冲并存)
     std::vector<uint16_t> wqkv16, wout16, w116, w216;
+    // E11-2: prefill 专用的 AMX 预打包面板(wqkv/w1/w2; wout 保留 FMLAL)。
+    // 非 AMX 构建下为空表(隐式 false 检查), 供 block_prefill_impl 路径选择。
+    kern::AmxPanel wqkv_pa, w1_pa, w2_pa;
   };
 
   const rt::TensorView& need(const rt::GsvFile& f, const char* name) const;
@@ -183,6 +187,11 @@ class T2SEngine {
   std::vector<uint16_t> xh_, ffh_;          // 激活 fp16 化暂存([D]/[FF])
   std::vector<std::vector<uint16_t>> kc16_, vc16_;  // KV cache fp16 位型 [cap*D]
   std::vector<float> kvrow_;                // KV fp16 读出升位行暂存([D])
+
+  // E11-2: prefill AMX 路径复用 scratch(按最大 S 一次性分配, 避免逐层重分配)
+  std::vector<uint16_t> prefill_xh_;        // 激活 f16 暂存 [cap_prefill_max*D]
+  size_t prefill_cap_ = 0;                  // 已分配 cap(按 S 重分配)
+  bool prefill_amx_in_use_ = false;          // 构造期 amx_gemm_available() 快照
 
   // scratch(generate 内复用)
   std::vector<std::vector<float>> kc_, vc_; // 每层 KV cache [cap*D] (fp32 模式)

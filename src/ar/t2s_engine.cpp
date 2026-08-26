@@ -13,6 +13,8 @@
 #include <arm_neon.h>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -227,7 +229,14 @@ T2SEngine::T2SEngine(const GsvFile& f) {
     L.n1b = vec_of((p + "norm1.bias").c_str());
     L.n2g = vec_of((p + "norm2.weight").c_str());
     L.n2b = vec_of((p + "norm2.bias").c_str());
+    // E11-2: prefill AMX 预打包面板(包后即可在 block_prefill_impl 走 gemm_f16_amx_pp)
+    if (kern::amx_gemm_available()) {
+      L.wqkv_pa = kern::amx_pack(L.wqkv16.data(), 3 * D, D);
+      L.w1_pa   = kern::amx_pack(L.w116.data(),   dims_.ffn, D);
+      L.w2_pa   = kern::amx_pack(L.w216.data(),   D, dims_.ffn);
+    }
   }
+  prefill_amx_in_use_ = kern::amx_gemm_available();
 }
 
 const TensorView& T2SEngine::need(const GsvFile& f, const char* name) const {
@@ -280,9 +289,26 @@ void T2SEngine::block_prefill_impl(size_t l, float* x, size_t S, size_t pos,
   Layer& L = layers_[l];
   const float scale = 1.0f / std::sqrt(static_cast<float>(HD));
 
-  // fused QKV: qkv[S,3D] = x·Wqkvᵀ+b (prefill 大矩阵乘固定 Accelerate sgemm)
+  // fused QKV: qkv[S,3D] = x·Wqkvᵀ+b
+  // E11-2: prefill 优先走 AMX(预打包面板) → gemm_f16_amx_pp;
+  // 不可用时回退 DenseF16::forward(FMLAL) —— 数值同源(fp16 存储 + FMLAL 扩展精度累加),
+  // 差异仅在中位 bit 舍入顺序。
+  // gemm_f16_amx_pp 语义: C[M,N] = pa·pbᵀ, pa 形态 = M×K (激活侧), pb 形态 = N×K (权重侧)
   qkv_.resize(S * 3 * D);
-  L.wqkv.forward(x, S, qkv_.data());
+  if (prefill_amx_in_use_) {
+    if (prefill_cap_ < S * D) {
+      prefill_xh_.resize(S * D);
+      prefill_cap_ = S * D;
+    }
+    kern::f32_to_f16(x, prefill_xh_.data(), S * D);
+    kern::AmxPanel pa_act;  // 激活面板: [S][D] = pa 侧 (M=S)
+    pa_act.rows = S; pa_act.K = D;
+    kern::amx_pack_into(prefill_xh_.data(), S, D, pa_act.buf);
+    // L.wqkv_pa 预打包为 [3D][D] = pb 侧 (N=3D)
+    kern::gemm_f16_amx_pp(pa_act, L.wqkv_pa, qkv_.data(), S, 3 * D);
+  } else {
+    L.wqkv.forward(x, S, qkv_.data());
+  }
   for (size_t i = 0; i < S; ++i)
     for (size_t j = 0; j < 3 * D; ++j) qkv_[i * 3 * D + j] += L.bqkv[j];
 
@@ -348,10 +374,27 @@ void T2SEngine::block_prefill_impl(size_t l, float* x, size_t S, size_t pos,
 
   // FFN(ReLU) + 残差 + post-LN(norm2)
   ff_.resize(S * FF);
+  // E11-2: W1 暂留 FMLAL —— ff_ 在 S~200 区间内 FMLAL ~ 1ms, AMX ~0.5ms 但漂移源多;
+  // 数值稳定性优先(避免与 QKV/W2 同时改归约序导致雪崩对漂移)
   L.w1.forward(x, S, ff_.data());
   for (size_t i = 0; i < S * FF; ++i) ff_[i] += L.b1[i % FF];
   gsv::kern::relu(ff_.data(), ff_.data(), S * FF);
-  L.w2.forward(ff_.data(), S, tmp_.data());
+
+  // E11-2: W2 走 AMX (FFN 下降 S×FF → S×D)
+  if (prefill_amx_in_use_) {
+    if (prefill_cap_ < S * FF) {
+      prefill_xh_.resize(S * FF);
+      prefill_cap_ = S * FF;
+    }
+    kern::f32_to_f16(ff_.data(), prefill_xh_.data(), S * FF);
+    kern::AmxPanel pa_act;  // 激活面板: [S][FF] = pa 侧 (M=S)
+    pa_act.rows = S; pa_act.K = dims_.ffn;
+    kern::amx_pack_into(prefill_xh_.data(), S, dims_.ffn, pa_act.buf);
+    // L.w2_pa 预打包为 [D][FF] = pb 侧 (N=D)
+    kern::gemm_f16_amx_pp(pa_act, L.w2_pa, tmp_.data(), S, D);
+  } else {
+    L.w2.forward(ff_.data(), S, tmp_.data());
+  }
   for (size_t i = 0; i < S * D; ++i) x[i] += tmp_[i] + L.b2[i % D];
   for (size_t t = 0; t < S; ++t)
     gsv::kern::layernorm(x + t * D, L.n2g.data(), L.n2b.data(), x + t * D, D,
@@ -643,6 +686,15 @@ GenResult T2SEngine::generate(const int64_t* phones, size_t T,
   r.logits_last.assign(logits_.data(), logits_.data() + dims_.vocab);
   last_prefill_ms_ = std::chrono::duration<double, std::milli>(t1 - t0).count();
   last_decode_ms_ = std::chrono::duration<double, std::milli>(t2 - t1).count();
+  // E11-2 起加 GSV_AR_TIMING=1 探针, stderr 打印 prefill/decode/全程耗时(用与 E11-1/E11-2 验收报表)
+  if (std::getenv("GSV_AR_TIMING")) {
+    const double ms_per_tok =
+        last_decode_ms_ / static_cast<double>(r.steps);
+    std::fprintf(stderr,
+                 "[ar-timing] T=%zu P=%zu S=%zu steps=%zu prefill=%.2fms "
+                 "decode=%.2fms (%.3f ms/tok)\n",
+                 T, P, S, r.steps, last_prefill_ms_, last_decode_ms_, ms_per_tok);
+  }
   return r;
 }
 
