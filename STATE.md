@@ -61,7 +61,7 @@
 | E11-4 | decode GEMV全核(P+E)派发 | E11-2 | exec-ar-b36 | CLOSED | task/E11-4 | 验收无收益(5.76vs5.82不可区分)默认关; 根因=GEMV轮转86%贴4核墙+串行链, E核FMLAL拖尾 |
 | E11-5 | prefill QK^T/PV 走AMX GEMM(FlashAttention CPU子集) | E11-2 | exec-ar-b36 | CLAIMED | task/E11-5 | 靶: 短句prefill 114→≤105或长句285→≤260; K=32薄K形状允许负结论交付 |
 | E8 | encoder DenseF16→AMX后端切换(bert.ffn形状bench 2.07x; 当前仅66ms, 低优先级) | E5 | 未分配 | TODO | | 待E6后视余量 |
-| E4 | 长单段AR复读环鲁棒性: 对齐python topk_sampling(top_k/top_p/temperature+惩罚,CALIBRATION)或移植early_stop_num | C2 | 未分配 | TODO | 复读事件根因已定位=默认参考文本与参考音频错配(修正为no_prompt_text默认, 910→68 tokens); 本卡降级为低优先级鲁棒性储备 |
+| E4 | 采样器对齐python: topk_sample(k=15/pen1.35)+--sample旋钮; greedy保默认 | C2 | exec-ar-b36 | CLAIMED | task/E4 | python对照实锤: 纯贪心1698复读(模型固有), k=15采样211正常; 长段AR 12s→1s级 |
 | E5 | AMX 指令直接编程: fp16×fp16→fp32 矩阵协处理器后端(压榨CPU终极手段) | E2-SOV,E2-ENC | exec-ar | DONE(phase1) | task/E5 | 已合入(main默认OFF,-DGSV_AMX_GEMM=ON); 本机复验bench: amxpp 9/10形状反超sgemm 1.04-2.07x, cos=1.0全PASS; 实锤手写fmlal慢5-10x→E2-SOV的fmlal方案作废 |
 | E5-P2 | AMX接线: sovits conv按形状分流(M<64/T<64/dil>1→sgemm GEMV, 大块→amxpp+panel直写im2col), w_f16单副本, --amx开关默认关 | E5 | exec-sov | DONE | task/E5-P2 | 已合入; 本机复验: --amx热缓存RTF=0.508, off/on wav cos=0.999903(int16 maxdiff=2); G3全过(mel_rel最差0.00414); 内存裁决: --amx=速度模式(+120MB panel), 默认=省内存fp32 |
 
