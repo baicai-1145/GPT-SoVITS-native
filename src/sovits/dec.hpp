@@ -82,9 +82,15 @@ class Generator {
   // 放进 prepare 钩子在池 worker 内执行, 与同 chain 其他节点的数学重叠。
   // 三链 sum 累加留主线程 (单飞, 阻塞式 amx_chain_run)。
   // 数值序与串行路径完全一致: 链内算子序列不变, sum 累加按 j 序。
+  //
+  // E10-MEM-②: panel ping-pong 复用。链内 p%2 串行依赖——p 的 panel 在
+  // p+1 的 prepare 前已 GEMM 完毕, buf 可覆盖; 跨链 p 同步 (不能共享)。
+  // pb[3][6] → pb[3][2], 节省 2.9GB (12 panel slot 容量)。
+  // 容量保证: 预备时按本 stage max(K_j) 一次 reserve, im2col 内部
+  // 严格不缩/不重分配, data() 指针跨 p 复用期间稳定。
   struct ResBatchScratch {
     Tensor2D cur[3], tin[3], tA[3][2], tB[3][2];
-    kern::AmxPanel pb[3][6];
+    kern::AmxPanel pb[3][2];
   };
 
   // batch_ms 输出本次批量派发耗时 (含 prepare+gemm)。
@@ -116,9 +122,9 @@ class Generator {
       }
       return static_cast<size_t>(mb);
     }();
-    // 预算精账: 18 panel (取本 stage 各 (j, k) 形状计算) + 18 张量。
-    // 注: panel size 取阶段所有 j 中最大 K, 偏保守但能准确盖住 (j*p 形状
-    // 不同, 但所有 panel 同时间活在 scratch)。实际 K_j = stage_ch·k_j + 1。
+    // 预算精账: 2 panel per j (ping-pong, p%2 复用) + 18 张量。
+    // 容量按本 stage 所有 j 中最大 K 一次 reserve, K 取 convs1 dil={1,3,5}
+    // + convs2 dil=1 中 k*in_c+1 最大 (同 j)。
     const size_t nt = (Tn + 31) / 32;
     size_t panel_total = 0;
     for (size_t j = 0; j < kResKernels; ++j) {
@@ -131,8 +137,8 @@ class Generator {
                                                   std::max(rb.convs2[1].k,
                                                            rb.convs2[2].k)))));
       const size_t K = rb.convs1[0].in_c * k_max + 1;
-      // 每 j 有 6 panel (2 convs × 3 m), shape 相同
-      panel_total += 6 * (nt * K * 64 + 64);
+      // 每 j 2 panel slot (ping-pong p%2)
+      panel_total += 2 * (nt * K * 64 + 64);
     }
     const size_t tensor_total = 18 * C * Tn * sizeof(float);
     // 单飞安全: SoVITS stage 为单线程 FIFO, amx_batch_run 阻塞至完成;
@@ -162,7 +168,7 @@ class Generator {
       static thread_local bool released = false;
       if (!released) {
         for (size_t j = 0; j < kResKernels; ++j) {
-          for (size_t p = 0; p < 6; ++p) {
+          for (size_t p = 0; p < 2; ++p) {
             s.pb[j][p].buf.clear();
             s.pb[j][p].buf.shrink_to_fit();
           }
@@ -198,7 +204,10 @@ class Generator {
         const Conv1d& cv = even ? rb.convs1[m] : rb.convs2[m];
         // MUST set rows/K before node creation: amx_chain_run validates
         // pb->rows==N && pa->K==pb->K before prepare hook runs.
-        kern::AmxPanel& pb = s.pb[j][p];
+        // E10-MEM-②: ping-pong, 每 j 2 slot 复用 (p%2)。 容量已在 ensure
+        // 阶段按 max(K_j) reserve 一次到位, im2col 内部不会重 alloc,
+        // data() 跨 p 复用期间稳定。
+        kern::AmxPanel& pb = s.pb[j][p & 1];
         pb.rows = Tn;
         pb.K = cv.in_c * cv.k + 1;
         float* outp = even ? s.tA[j][m & 1].d.data()
@@ -212,7 +221,7 @@ class Generator {
         nd.M = cv.out_c;
         nd.N = Tn;
         nd.prepare = [j, p, m, even, Tn, nn, xn, cvl = &cv]() {
-          kern::AmxPanel& pbl = s.pb[j][p];
+          kern::AmxPanel& pbl = s.pb[j][p & 1];
           if (even) {
             // cur 初始化/累加, 然后 lrelu(cur) → tin, im2col → panel
             if (m == 0) {
