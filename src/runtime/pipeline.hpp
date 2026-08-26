@@ -38,6 +38,9 @@ struct PipelineOptions {
   int threads = 0;         // 0 = 默认(P+E 全核)
   uint64_t seed = 42;      // SoVITS 噪声种子(自定 RNG; 与 torch 非位等价)
   int cut_method = 1;      // cut0..cut5, 与 CPUFast text_split_method 对应
+  // FE-AUTO-1: 前端语种模式: "auto"(默认)=LangSegmenter 空参口径切分 zh/en;
+  // "all_zh"=B10 原口径(golden 位级红线)。用户指令: native 默认走 auto。
+  std::string lang_mode = "auto";
   bool use_ref_cache = true;
   // 参考文本必须与参考音频实际内容一致, 错配会致 AR 复读退化;
   // 默认空 = no_prompt_text 口径(CPUFast 支持), 用户须显式传入正确转写

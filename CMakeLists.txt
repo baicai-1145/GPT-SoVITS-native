@@ -72,7 +72,7 @@ target_link_libraries(gsv_encoder PUBLIC gsv_rt gsv_kern)
 add_library(gsv_sovits INTERFACE)
 target_include_directories(gsv_sovits INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-# ---- 文本前端 (B9/M3: jieba+g2p+归一化) ----
+# ---- 文本前端 (B9/M3: jieba+g2p+归一化; FE-AUTO-1: 语种切分) ----
 add_library(gsv_textfront STATIC
   src/textfront/jieba.cpp
   src/textfront/pinyin.cpp
@@ -85,8 +85,8 @@ add_library(gsv_textfront STATIC
   src/textfront/chinese_g2p.cpp
   src/textfront/textfront.cpp
   src/textfront/polyphone_fix.cpp
-  src/textfront/chinese_g2p.cpp
-  src/textfront/textfront.cpp
+  src/textfront/fasttext_lid.cpp
+  src/textfront/langsegmenter.cpp
 )
 
 # ---- CLI 工具 ----

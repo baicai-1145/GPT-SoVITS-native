@@ -51,6 +51,9 @@ void printHelp(const char* argv0) {
       "src/runtime/data]\n"
       "  --out FILE        输出 wav (int16@32k)      [默认 out.wav]\n"
       "  --cut N           分句法 0..5 (cut0..cut5)  [默认 1]\n"
+      "  --lang MODE       前端语种模式 auto|all_zh (auto=中英自动切分,\n"
+      "                    中英以外语种片段告警跳过; all_zh=全按中文处理)\n"
+      "                    [默认 auto]\n"
       "  --seed N          噪声种子                  [默认 42]\n"
       "  --threads N       线程数 (0=自动)           [默认 0]\n"
       "  --prompt-text S   参考文本: 必须为参考音频的逐字转写,\n"
@@ -106,6 +109,14 @@ int main(int argc, char** argv) {
       opt.cut_method = std::atoi(next("--cut").c_str());
       if (opt.cut_method < 0 || opt.cut_method > 5) {
         std::fprintf(stderr, "错误: --cut 取值 0..5\n");
+        return 2;
+      }
+    } else if (a == "--lang") {
+      // FE-AUTO-1: 前端语种模式。auto=LangSegmenter 空参口径(默认);
+      // all_zh=B10 全中文口径(golden 位级红线)。
+      opt.lang_mode = next("--lang");
+      if (opt.lang_mode != "auto" && opt.lang_mode != "all_zh") {
+        std::fprintf(stderr, "错误: --lang 取值 auto|all_zh\n");
         return 2;
       }
     } else if (a == "--seed") {

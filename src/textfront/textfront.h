@@ -17,6 +17,7 @@
 // without touching call sites.
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -25,6 +26,16 @@
 namespace gsv::textfront {
 
 using U32 = std::u32string;
+
+class LangSegmenterCpp;
+class FastTextLid;
+
+// FE-AUTO-1: 前端语种模式(CPUFast TTS_infer_pack lang 参数对应物)
+enum class TextLangMode {
+    Auto = 0,   // getTexts(text) 空参口径: 切分后 zh/en 走各自 G2P,
+                // ja/ko 片 stderr 告警跳过, punctuation 兕底空格串
+    AllZh = 1,  // getTexts(text, "zh") 口径(B10 现行为, golden 位级红线)
+};
 
 class TextFrontend {
 public:
@@ -52,9 +63,14 @@ public:
     // data paths: jieba trie bin + pinyin bin; cmudictPath is optional and
     // enables the English segment path (mixed zh/en inputs). When absent,
     // Latin segments fail with an error instead of silently misreading.
+    // FE-AUTO-1: budouxDir 为 auto 模式所需的 budoux 模型目录(ja.json +
+    // zh-hans.json); langModelPath 为 fasttext lid.176.bin。两者都提供时
+    // 才启用 auto 模式(all_zh 不依赖它们)。
     bool load(const std::string& triePath, const std::string& pinyinPath,
               std::string* err, const std::string& cmudictPath = {},
-              const G2pwOptions* g2pw = nullptr);
+              const G2pwOptions* g2pw = nullptr,
+              const std::string& langModelPath = {},
+              const std::string& budouxDir = {});
     ~TextFrontend();
 
     // Injection seam for B6's G2PW converter. nullptr restores the default
@@ -64,8 +80,17 @@ public:
 
     // Full pipeline. cutMethod: TTS_infer_pack text_segmentation_method id,
     // 0..5 ("cut0".."cut5"); runtime default is "cut1".
+    // mode: Auto(默认, FE-AUTO-1) / AllZh(B10 口径, 位级不变)。
     bool process(const std::string& utf8Text, Result* out,
-                 int cutMethod = 1) const;
+                 int cutMethod = 1,
+                 TextLangMode mode = TextLangMode::Auto) const;
+
+    // 语种切分测试口(fixture 对照用): 返回 [lang, text] 片。
+    // 所有者语义: getLangPieces 仅在 load(langModel,budoux) 成功后可用;
+    // 模式透传 getTexts(default_lang)。不可用时返回空且写 error。
+    std::vector<std::pair<std::string, std::string>> getLangPieces(
+        const std::string& utf8Text, TextLangMode mode,
+        std::string* error) const;
 
     // TTS_infer_pack segmentation only (pre_seg_text), exposed for golden
     // fixtures and tests. Returns final synthesis segments as codepoints.
@@ -90,7 +115,10 @@ private:
     void* en_ = nullptr;
     void* g2pwConv_ = nullptr;      // G2PWConverter (owned when g2pw given)
     void* g2pwResolver_ = nullptr;  // G2PWResolver (owned)
-    void* polyFix_ = nullptr;       // PolyphoneFixTable (owned when given)  // std::unique_ptr<EnglishG2p>, type-erased to keep
+    void* polyFix_ = nullptr;       // PolyphoneFixTable (owned when given)
+    void* langSeg_ = nullptr;  // LangSegmenterCpp (owned; FE-AUTO-1, 可空)
+                               // unique_ptr 会把不完整类型泄露给 pipeline TU
+                          // std::unique_ptr<EnglishG2p>, type-erased to keep
                           // english.h out of this header
 };
 

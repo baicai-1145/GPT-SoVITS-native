@@ -186,7 +186,28 @@ bool Pipeline::load(const std::string& weightsDir, const std::string& dataDir,
     // 文件体积 -67%, 页缓存压力同比降)。
     if (profileLoad) profMark("prefetch_issue(异步,不阻塞)", &tStage);
 
-    if (!tf_.load(trieP, pinyinP, err, cmuP, haveG2pw ? &g2pwOpt : nullptr))
+    // FE-AUTO-1: 语种切分数据(lid.176.bin + budoux json)可选; 按环境变量
+    // GSV_LID_BIN > dataDir > CPUFast 权威路径 的顺序探测。缺失时 auto
+    // 模式在 process 报错, all_zh 不受影响。
+    std::string lidP;
+    if (const char* envLid = ::getenv("GSV_LID_BIN"); envLid && *envLid) {
+      lidP = envLid;
+    } else if (!firstExisting(
+                   {joinPath(dataDir, "lid.176.bin"),
+                    joinPath(dataDir + "/../..", "pretrained_models/lid.176.bin")},
+                   &lidP)) {
+      const char* cpuFast = "/Volumes/2T/GPT-SoVITS-CPUFast/GPT_SoVITS/"
+                            "pretrained_models/fast_langdetect/lid.176.bin";
+      if (std::filesystem::exists(cpuFast)) lidP = cpuFast;
+    }
+    std::string budouxD;
+    if (!firstExisting({joinPath(dataDir, "budoux"),
+                        joinPath(dataDir + "/../..", "textfront/data/budoux")},
+                       &budouxD))
+      budouxD.clear();
+
+    if (!tf_.load(trieP, pinyinP, err, cmuP, haveG2pw ? &g2pwOpt : nullptr,
+                  lidP, budouxD))
       return false;
     profMark("textfront(含G2PW)", &tStage);
     if (!tok_.load(joinPath(dataDir, "roberta_vocab.txt"), err)) return false;
@@ -370,9 +391,10 @@ struct Feat {
 Feat featurize(const textfront::TextFrontend* tf,
                const textfront::ChineseG2p* g2pNorm, const BertTokenizer* tok,
                const bert::BertModel& bm, const std::string& utf8,
-               std::string* /*err*/) {
+               std::string* /*err*/,
+               textfront::TextLangMode langMode = textfront::TextLangMode::Auto) {
   textfront::TextFrontend::Result one;
-  if (!tf->process(utf8, &one, /*cutMethod=*/0))
+  if (!tf->process(utf8, &one, /*cutMethod=*/0, langMode))
     throw std::runtime_error(one.error);
   Feat f;
   f.phones.assign(one.phones.begin(), one.phones.end());
@@ -457,7 +479,10 @@ bool Pipeline::buildPrompt(PromptCond* out, std::string* err) {
       out->ready = true;  // no_prompt_text 口径
       return true;
     }
-    Feat f = featurize(&tf_, &g2pNorm_, &tok_, bert_, pt, err);
+    textfront::TextLangMode lm = opt_.lang_mode == "all_zh"
+                                     ? textfront::TextLangMode::AllZh
+                                     : textfront::TextLangMode::Auto;
+    Feat f = featurize(&tf_, &g2pNorm_, &tok_, bert_, pt, err, lm);
     out->phones = std::move(f.phones);
     out->bert = std::move(f.bert);
     out->ready = true;
@@ -470,7 +495,10 @@ bool Pipeline::buildPrompt(PromptCond* out, std::string* err) {
 
 // ---- D2: 三阶段实现 (串行/重叠两模式调用完全相同的函数) ----
 Pipeline::SegArIn Pipeline::stageFeaturize(const SegText& t) const {
-  Feat f = featurize(&tf_, &g2pNorm_, &tok_, bert_, t.sentence, nullptr);
+  textfront::TextLangMode lm = opt_.lang_mode == "all_zh"
+                                   ? textfront::TextLangMode::AllZh
+                                   : textfront::TextLangMode::Auto;
+  Feat f = featurize(&tf_, &g2pNorm_, &tok_, bert_, t.sentence, nullptr, lm);
   SegArIn r;
   r.phonesSeg = std::move(f.phones);
   r.normText = std::move(f.normU8);
