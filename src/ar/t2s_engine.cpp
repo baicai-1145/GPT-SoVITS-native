@@ -229,14 +229,18 @@ T2SEngine::T2SEngine(const GsvFile& f) {
     L.n1b = vec_of((p + "norm1.bias").c_str());
     L.n2g = vec_of((p + "norm2.weight").c_str());
     L.n2b = vec_of((p + "norm2.bias").c_str());
+#ifdef GSV_AMX_GEMM
     // E11-2: prefill AMX 预打包面板(包后即可在 block_prefill_impl 走 gemm_f16_amx_pp)
     if (kern::amx_gemm_available()) {
       L.wqkv_pa = kern::amx_pack(L.wqkv16.data(), 3 * D, D);
       L.w1_pa   = kern::amx_pack(L.w116.data(),   dims_.ffn, D);
       L.w2_pa   = kern::amx_pack(L.w216.data(),   D, dims_.ffn);
     }
+#endif
   }
+#ifdef GSV_AMX_GEMM
   prefill_amx_in_use_ = kern::amx_gemm_available();
+#endif
 }
 
 const TensorView& T2SEngine::need(const GsvFile& f, const char* name) const {
@@ -295,6 +299,7 @@ void T2SEngine::block_prefill_impl(size_t l, float* x, size_t S, size_t pos,
   // 差异仅在中位 bit 舍入顺序。
   // gemm_f16_amx_pp 语义: C[M,N] = pa·pbᵀ, pa 形态 = M×K (激活侧), pb 形态 = N×K (权重侧)
   qkv_.resize(S * 3 * D);
+#ifdef GSV_AMX_GEMM
   if (prefill_amx_in_use_) {
     if (prefill_cap_ < S * D) {
       prefill_xh_.resize(S * D);
@@ -306,7 +311,9 @@ void T2SEngine::block_prefill_impl(size_t l, float* x, size_t S, size_t pos,
     kern::amx_pack_into(prefill_xh_.data(), S, D, pa_act.buf);
     // L.wqkv_pa 预打包为 [3D][D] = pb 侧 (N=3D)
     kern::gemm_f16_amx_pp(pa_act, L.wqkv_pa, qkv_.data(), S, 3 * D);
-  } else {
+  } else
+#endif
+  {
     L.wqkv.forward(x, S, qkv_.data());
   }
   for (size_t i = 0; i < S; ++i)
@@ -381,6 +388,7 @@ void T2SEngine::block_prefill_impl(size_t l, float* x, size_t S, size_t pos,
   gsv::kern::relu(ff_.data(), ff_.data(), S * FF);
 
   // E11-2: W2 走 AMX (FFN 下降 S×FF → S×D)
+#ifdef GSV_AMX_GEMM
   if (prefill_amx_in_use_) {
     if (prefill_cap_ < S * FF) {
       prefill_xh_.resize(S * FF);
@@ -392,7 +400,9 @@ void T2SEngine::block_prefill_impl(size_t l, float* x, size_t S, size_t pos,
     kern::amx_pack_into(prefill_xh_.data(), S, dims_.ffn, pa_act.buf);
     // L.w2_pa 预打包为 [D][FF] = pb 侧 (N=D)
     kern::gemm_f16_amx_pp(pa_act, L.w2_pa, tmp_.data(), S, D);
-  } else {
+  } else
+#endif
+  {
     L.w2.forward(ff_.data(), S, tmp_.data());
   }
   for (size_t i = 0; i < S * D; ++i) x[i] += tmp_[i] + L.b2[i % D];
