@@ -54,7 +54,12 @@
 | E7 | 加载方差治理: 根因=USB盘73MB/s+双布局冗余63%+页缓存挤占; --slim(-63%字节,wav逐位一致)+RDADVISE预读 | E5-P2 | exec-ar | DONE | task/E7 | 已合并; slim权重已部署内置NVMe ~/gsv-weights(load 380ms达标); 后续: convert.py直产slim(C方案)归M0工具链 |
 | E10-MHA | MHA batched sgemm(320→58ms实测) — 已合入 | E9 | exec-sov-b35 | DONE | task/E6 | 热态配对-9%; 剩余attn_out 29+rel 24标量路径低优先 |
 | E10-S2 | S2排查一轮DONE合入: im2col dil>1 NEON化(100→25ms), 全局voc 900→~770ms; S2 224→157ms | E10-MHA | exec-sov-b37 | DONE(一轮) | task/E6 | 确诊根因=per-node prepare依赖; 后续在E10-K2 |
-| E10-K2 | kern amx_chain_run per-tile prepare依赖(行波推进, math/prepare overlap) | E10-S2 | exec-ar-b36 | IN_PROGRESS | task/E10-K2 | S2靶≤110ms; b37随后接线dec侧 |
+| E10-K2 | kern amx_chain_run per-tile prepare依赖(行波推进, math/prepare overlap) | E10-S2 | exec-ar-b36 | CLOSED | task/E10-K2 | K2闭包税裁决后K3重试: 安静窗口736ms反输per-node29ms→裁决不合并, per-node为工程最优 |
+| E10-MEM | 多段segfault修复(s_hi off-by)+内存治理: panel ping-pong(18→6)+张量合并(21→12)+预算守卫 | E10-K2 | exec-sov-b37 | DONE | task/E6 | 19s段8.5GB必爆→6.1GB跑通; 位级一致+golden 6/6+长句679ms反超707; 残余=conv1d thread_local缓冲(补刀卡≤5GB目标, 2.5GB门经重算判定为此结构不可达) |
+| E11-1 | AR attention KV扫描 NEON 4-lane 树形归约 | main | exec-ar-b36 | DONE | task/E11-1 | 2.4x内核/数值1e-9; G1/G2 63对全过 |
+| E11-2 | prefill 大GEMM走AMX(wqkv/w2) | E11-1 | exec-ar-b36 | DONE | task/E11-2 | 254→155ms(-39%安静口径/当前带宽环境-18%); W1雪崩敏感保守留FMLAL |
+| E11-4 | decode GEMV全核(P+E)派发 | E11-2 | exec-ar-b36 | CLOSED | task/E11-4 | 验收无收益(5.76vs5.82不可区分)默认关; 根因=GEMV轮转86%贴4核墙+串行链, E核FMLAL拖尾 |
+| E11-5 | prefill QK^T/PV 走AMX GEMM(FlashAttention CPU子集) | E11-2 | exec-ar-b36 | CLAIMED | task/E11-5 | 靶: 短句prefill 114→≤105或长句285→≤260; K=32薄K形状允许负结论交付 |
 | E8 | encoder DenseF16→AMX后端切换(bert.ffn形状bench 2.07x; 当前仅66ms, 低优先级) | E5 | 未分配 | TODO | | 待E6后视余量 |
 | E4 | 长单段AR复读环鲁棒性: 对齐python topk_sampling(top_k/top_p/temperature+惩罚,CALIBRATION)或移植early_stop_num | C2 | 未分配 | TODO | 复读事件根因已定位=默认参考文本与参考音频错配(修正为no_prompt_text默认, 910→68 tokens); 本卡降级为低优先级鲁棒性储备 |
 | E5 | AMX 指令直接编程: fp16×fp16→fp32 矩阵协处理器后端(压榨CPU终极手段) | E2-SOV,E2-ENC | exec-ar | DONE(phase1) | task/E5 | 已合入(main默认OFF,-DGSV_AMX_GEMM=ON); 本机复验bench: amxpp 9/10形状反超sgemm 1.04-2.07x, cos=1.0全PASS; 实锤手写fmlal慢5-10x→E2-SOV的fmlal方案作废 |
