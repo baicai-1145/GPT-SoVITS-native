@@ -186,3 +186,10 @@ S4真实形状K={72,168,264}全落在饥饿区(渐近值一半以下) → M拼�
 - 数据: lid.176.bin 探测链 GSV_LID_BIN > dataDir > CPUFast 权威路径; budoux ja/zh-hans.json 已入库 src/textfront/data/budoux/
 - ja/ko 片显式告警跳过(G2P 待 FE-AUTO-2/3); CLI --lang auto|all_zh, 默认 auto
 - ⚠️ 已知差距登记(FE-AUTO-1.5): 混排段 BERT native 整段置零, python auto 为逐片 bert 再 torch.cat(zh 片保留真特征) — 决策者开卡口径遗漏, 非 b5 执行偏差; 影响 auto 模式下混排句听感潜力
+
+## 2026-08-27 LangSegmenter 对齐性扩样审计 (用户问: 与python完全对齐了吗)
+- 发现并修复: b5 的 test_langsegment 未注册 ctest(tests留工作区规矩漏捡) → 已补注册, 64/64 过, ctest 现 8/8
+- 扩样 fuzz 对拍两轮: 60+50 条随机/极端混排 × auto/zh = 246 记录, 片级差异 0/1114 (60语料390片 + 极端组724片)
+- 覆盖: 五语种随机拼接/数字归属/西里尔(非支持)/CJK-ExtB/全符号/长混排/budoux断句边界
+- 结论: 切分层在已测域内位级完全对齐(fasttext lid 概率差 2e-6 未引发任何切分翻转)
+- 边界诚实声明: fasttext lid 是概率模型非 bit-exact 组件, 理论上存在未测文本的翻转可能; fuzz fixture 已入库复测路径, 语料累积制
