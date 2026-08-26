@@ -156,3 +156,13 @@ S4真实形状K={72,168,264}全落在饥饿区(渐近值一半以下) → M拼�
 - 长句 prefill: 基线319-412ms → 207-212ms (-35~49%) 超-28%承诺; 短句持平(S短SDPA占比小)
 - golden/ctest 6/6 过; 双段全链 wav 正常
 - E11 系列终局: AR prefill 155ms(安静)/207ms(当前) — SDPA AMX化后 prefill 侧收官
+
+## 2026-08-26 E4 复读环定性 (python 原版对照实验, 决定性)
+- 实验设置: 同 checkpoint(s1v3.ckpt) python Text2SemanticDecoder, 100 phones 长序列, no prompt text
+- 纯贪心(k=1): 1698 tokens 复读被截 → **python 也复读, 模型固有倾向, 非移植 bug**
+- python 默认(k=15, pen=1.35): 211 tokens 自然 EOS; k=15 无惩罚: 250 也正常
+- → 采样随机性是主逃生机制; 贪心在长序列锁进复读吸引子(确定性自强化)
+- native B2/C2 当初选贪心的原因: golden 位级对账需要确定性(python multinomial 不可跨实现复现) — 合理但留下长句病灶
+- E4 方案定案: greedy 保默认(golden 红线) + --sample(k=15/pen1.35) 对齐 python 产品行为
+- 收益: 100 phones 段 AR 12045ms → ~1.0s 量级; 消灭"重复念到天荒地老"
+- 另: python bert 布局 [1024,T] 通道在前, infer_panel_batch_infer List 语义 — 复现实验的坑已踩平
