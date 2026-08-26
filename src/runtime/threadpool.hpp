@@ -21,4 +21,15 @@ size_t e_core_count();   // hw.perflevel1.logicalcpu, 缺失回退 0(单池方�
 void parallel_for(size_t n, size_t grain,
                   const std::function<void(size_t, size_t)>& fn, Qos qos);
 
+// E11-4: 全核联合派发 —— P 池拿 p_weight/(p_weight+e_weight) 的总工作量,
+//        E 池拿余下; 默认权重 P:E = 2:1(授 P 核频率更高，可多领任务)。
+//        E 核拿不到工作则 fallback P-only。禁止用于 AMX/cblas(它们绑 P 核)。
+//        E11-4 边界: 纯 NEON FMLAL GEMV/GEMM 路径才允许(项目当前唯一全核可走点)。
+void parallel_for_full(size_t n, size_t grain,
+                       const std::function<void(size_t, size_t)>& fn);
+
+// 查询当前 GSV_GEMV_E_DISABLE 环境开关: 1=退到 P-only, 0=全核(默认 0)。
+// 本探针供 decode GEMV 路径探判选用; 全核路径与 P-only 数值位级一致 (纯调度)。
+bool gemv_use_e_cores();
+
 }  // namespace gsv::rt

@@ -115,12 +115,15 @@ void gemv_f16w_f32acc(const uint16_t* w, const float* x, float* y, size_t out, s
     gemv_f16w_4rows_kernel(w, x, y, 0, out, in);
     return;
   }
-  const size_t workers = std::max(rt::p_core_count(), size_t{1});
-  const size_t grain = (out + workers - 1) / workers;
-  rt::parallel_for(
-      out, grain, [&](size_t b, size_t e) {
-        gemv_f16w_4rows_kernel(w, x, y, b, e, in);
-      }, rt::Qos::UserInitiated);
+  // E11-4: 全核联合派发 (P+E 双池)
+  const size_t p = rt::p_core_count();
+  const size_t e = rt::gemv_use_e_cores() ? rt::e_core_count() : 0;
+  const size_t total_workers = p + e;
+  const size_t grain = (out + total_workers - 1) / total_workers;
+  rt::parallel_for_full(
+      out, grain, [&](size_t b, size_t end) {
+        gemv_f16w_4rows_kernel(w, x, y, b, end, in);
+      });
 }
 
 }  // namespace gsv::kern
