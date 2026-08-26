@@ -143,3 +143,11 @@ S4真实形状K={72,168,264}全落在饥饿区(渐近值一半以下) → M拼�
 - 真瓶颈不变: 非GEMV串行 2.6ms/tok(attention/softmax/LN/24层调度)
 - 教训: SLLC 16MB 存在下, "有效带宽利用率"对 GEMV 不可定义; goal条款2证据链
   改为"GEMV内核实测 + 缓存红利 + 串行瓶颈分解"三件套
+
+## 2026-08-26 AR decode 第五版画像 (轮转判别实验, 替代前四版)
+- bench_real_rotate: 真实内核 gemv_f16x_fmlal 24层轮转(压穿缓存) 5.3ms vs 单层驻留 4.8ms
+- 轮转表观 63GB/s = 4核DRAM墙(74)的 86% ← decode GEMV 真带宽行为
+- 前版"2.17ms内核+2.6ms串行"分解作废(bench_gemv 驻留口径乐观值)
+- 端到端 fp16-all 4.4ms < 纯GEMV轮转 5.3ms: 串行部分与池调度重叠 + 小矩阵SLLC驻留红利
+- E11-4 无收益最终解释: GEMV 86%贴墙+E核FMLAL拖尾, 净收益归零
+- 新线索: 换轻计算内核(fp16 dot 替 FMLAL)后全核才有意义, 上限~30%
