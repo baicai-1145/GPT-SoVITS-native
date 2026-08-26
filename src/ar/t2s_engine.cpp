@@ -10,11 +10,135 @@
 
 #include "kern/gemv_fmlal.hpp"
 
+#include <arm_neon.h>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+
+// ---- E11-1: SDPA NEON helpers (decode + prefill 共享) ----
+// 数值纪律:
+//   fp32 路径: 4-lane 独立累加 → 树形归约 (a0+a1)+(a2+a3) → 水平求和
+//   (等价于 8 个 vdot 等价 FMA 但顺序可比, 保留 G1/G2 数值容差)
+//   fp16 KV 路径: vld1q_f16×2 升位 fp32 后 FMA, 避免标量升位瓶颈
+// 性能纪律: HD=32 (AR 默认 512/16) 时全部走 4-lane×8vec 主路径, 无尾循环
+namespace {
+namespace ar_neon {
+
+// fp32 dot: qv[0..HD) · kv[0..HD), 4-lane tree reduce
+inline float dot_f32(const float* qv, const float* kv, size_t HD) {
+  float32x4_t a0 = vdupq_n_f32(0.f);
+  float32x4_t a1 = vdupq_n_f32(0.f);
+  float32x4_t a2 = vdupq_n_f32(0.f);
+  float32x4_t a3 = vdupq_n_f32(0.f);
+  size_t e = 0;
+  // 主路径: 16 元素一组 (4 vec × 4 lanes) — AR 默认 HD=32 时一轮吃完
+  for (; e + 16 <= HD; e += 16) {
+    a0 = vfmaq_f32(a0, vld1q_f32(qv + e + 0),  vld1q_f32(kv + e + 0));
+    a1 = vfmaq_f32(a1, vld1q_f32(qv + e + 4),  vld1q_f32(kv + e + 4));
+    a2 = vfmaq_f32(a2, vld1q_f32(qv + e + 8),  vld1q_f32(kv + e + 8));
+    a3 = vfmaq_f32(a3, vld1q_f32(qv + e + 12), vld1q_f32(kv + e + 12));
+  }
+  // 4-lane 树形归约: (a0+a1)+(a2+a3)
+  float32x4_t s01 = vaddq_f32(a0, a1);
+  float32x4_t s23 = vaddq_f32(a2, a3);
+  float32x4_t s = vaddq_f32(s01, s23);
+  // 水平求和: pairwise add
+  float32x2_t lo = vget_low_f32(s);
+  float32x2_t hi = vget_high_f32(s);
+  float32x2_t sum2 = vadd_f32(lo, hi);
+  float32x2_t sum1 = vpadd_f32(sum2, sum2);
+  float dot = vget_lane_f32(sum1, 0);
+  // 尾元素 (HD 非 16 倍数时; AR 实际 HD=32/64 走不到这里)
+  for (; e < HD; ++e) dot += qv[e] * kv[e];
+  return dot;
+}
+
+// fp16 KV dot: qv[fp32] · k16[fp16] 升位累加
+inline float dot_f16kv(const float* qv, const uint16_t* k16, size_t HD) {
+  float32x4_t a0 = vdupq_n_f32(0.f);
+  float32x4_t a1 = vdupq_n_f32(0.f);
+  float32x4_t a2 = vdupq_n_f32(0.f);
+  float32x4_t a3 = vdupq_n_f32(0.f);
+  size_t e = 0;
+  for (; e + 16 <= HD; e += 16) {
+    // 每 8 个 fp16 装一 NEON half 向量; 一组 16 fp16 = 2 个 half vec
+    float16x8_t h0 = vld1q_f16(reinterpret_cast<const __fp16*>(k16 + e));
+    float16x8_t h1 = vld1q_f16(reinterpret_cast<const __fp16*>(k16 + e + 8));
+    a0 = vfmaq_f32(a0, vld1q_f32(qv + e + 0),
+                   vcvt_f32_f16(vget_low_f16(h0)));
+    a1 = vfmaq_f32(a1, vld1q_f32(qv + e + 4),
+                   vcvt_f32_f16(vget_high_f16(h0)));
+    a2 = vfmaq_f32(a2, vld1q_f32(qv + e + 8),
+                   vcvt_f32_f16(vget_low_f16(h1)));
+    a3 = vfmaq_f32(a3, vld1q_f32(qv + e + 12),
+                   vcvt_f32_f16(vget_high_f16(h1)));
+  }
+  float32x4_t s01 = vaddq_f32(a0, a1);
+  float32x4_t s23 = vaddq_f32(a2, a3);
+  float32x4_t s = vaddq_f32(s01, s23);
+  float32x2_t lo = vget_low_f32(s);
+  float32x2_t hi = vget_high_f32(s);
+  float32x2_t sum2 = vadd_f32(lo, hi);
+  float32x2_t sum1 = vpadd_f32(sum2, sum2);
+  float dot = vget_lane_f32(sum1, 0);
+  for (; e < HD; ++e) {
+    __fp16 h;
+    __builtin_memcpy(&h, k16 + e, 2);
+    dot += qv[e] * static_cast<float>(h);
+  }
+  return dot;
+}
+
+// ov[0..HD) += p * vv[0..HD)  (fp32)
+inline void accum_f32(float* ov, const float* vv, float p, size_t HD) {
+  float32x4_t p4 = vdupq_n_f32(p);
+  // 4-lane 独立累加 → 加到 ov
+  // 注意: vv 是只读, ov 是读写; 4-lane 分组保持 4×4 网格, 末尾归并到 ov
+  // 简化: 16 元素一组, 累加后立即归并 (HD=32 时仅一轮)
+  size_t e = 0;
+  for (; e + 16 <= HD; e += 16) {
+    float32x4_t a0 = vmulq_f32(p4, vld1q_f32(vv + e + 0));
+    float32x4_t a1 = vmulq_f32(p4, vld1q_f32(vv + e + 4));
+    float32x4_t a2 = vmulq_f32(p4, vld1q_f32(vv + e + 8));
+    float32x4_t a3 = vmulq_f32(p4, vld1q_f32(vv + e + 12));
+    // ov 加载 + 累加
+    vst1q_f32(ov + e + 0,  vaddq_f32(vld1q_f32(ov + e + 0),  a0));
+    vst1q_f32(ov + e + 4,  vaddq_f32(vld1q_f32(ov + e + 4),  a1));
+    vst1q_f32(ov + e + 8,  vaddq_f32(vld1q_f32(ov + e + 8),  a2));
+    vst1q_f32(ov + e + 12, vaddq_f32(vld1q_f32(ov + e + 12), a3));
+  }
+  for (; e < HD; ++e) ov[e] += p * vv[e];
+}
+
+// ov[0..HD) += p * vv16[0..HD)  (fp16 KV)
+inline void accum_f16kv(float* ov, const uint16_t* v16, float p, size_t HD) {
+  float32x4_t p4 = vdupq_n_f32(p);
+  size_t e = 0;
+  for (; e + 16 <= HD; e += 16) {
+    float16x8_t h0 = vld1q_f16(reinterpret_cast<const __fp16*>(v16 + e));
+    float16x8_t h1 = vld1q_f16(reinterpret_cast<const __fp16*>(v16 + e + 8));
+    float32x4_t a0 = vmulq_f32(p4, vcvt_f32_f16(vget_low_f16(h0)));
+    float32x4_t a1 = vmulq_f32(p4, vcvt_f32_f16(vget_high_f16(h0)));
+    float32x4_t a2 = vmulq_f32(p4, vcvt_f32_f16(vget_low_f16(h1)));
+    float32x4_t a3 = vmulq_f32(p4, vcvt_f32_f16(vget_high_f16(h1)));
+    vst1q_f32(ov + e + 0,  vaddq_f32(vld1q_f32(ov + e + 0),  a0));
+    vst1q_f32(ov + e + 4,  vaddq_f32(vld1q_f32(ov + e + 4),  a1));
+    vst1q_f32(ov + e + 8,  vaddq_f32(vld1q_f32(ov + e + 8),  a2));
+    vst1q_f32(ov + e + 12, vaddq_f32(vld1q_f32(ov + e + 12), a3));
+  }
+  for (; e < HD; ++e) {
+    __fp16 h;
+    __builtin_memcpy(&h, v16 + e, 2);
+    ov[e] += p * static_cast<float>(h);
+  }
+}
+
+}  // namespace ar_neon
+}  // namespace
 
 namespace gsv::ar {
 
@@ -105,7 +229,18 @@ T2SEngine::T2SEngine(const GsvFile& f) {
     L.n1b = vec_of((p + "norm1.bias").c_str());
     L.n2g = vec_of((p + "norm2.weight").c_str());
     L.n2b = vec_of((p + "norm2.bias").c_str());
+#ifdef GSV_AMX_GEMM
+    // E11-2: prefill AMX 预打包面板(包后即可在 block_prefill_impl 走 gemm_f16_amx_pp)
+    if (kern::amx_gemm_available()) {
+      L.wqkv_pa = kern::amx_pack(L.wqkv16.data(), 3 * D, D);
+      L.w1_pa   = kern::amx_pack(L.w116.data(),   dims_.ffn, D);
+      L.w2_pa   = kern::amx_pack(L.w216.data(),   D, dims_.ffn);
+    }
+#endif
   }
+#ifdef GSV_AMX_GEMM
+  prefill_amx_in_use_ = kern::amx_gemm_available();
+#endif
 }
 
 const TensorView& T2SEngine::need(const GsvFile& f, const char* name) const {
@@ -158,9 +293,29 @@ void T2SEngine::block_prefill_impl(size_t l, float* x, size_t S, size_t pos,
   Layer& L = layers_[l];
   const float scale = 1.0f / std::sqrt(static_cast<float>(HD));
 
-  // fused QKV: qkv[S,3D] = x·Wqkvᵀ+b (prefill 大矩阵乘固定 Accelerate sgemm)
+  // fused QKV: qkv[S,3D] = x·Wqkvᵀ+b
+  // E11-2: prefill 优先走 AMX(预打包面板) → gemm_f16_amx_pp;
+  // 不可用时回退 DenseF16::forward(FMLAL) —— 数值同源(fp16 存储 + FMLAL 扩展精度累加),
+  // 差异仅在中位 bit 舍入顺序。
+  // gemm_f16_amx_pp 语义: C[M,N] = pa·pbᵀ, pa 形态 = M×K (激活侧), pb 形态 = N×K (权重侧)
   qkv_.resize(S * 3 * D);
-  L.wqkv.forward(x, S, qkv_.data());
+#ifdef GSV_AMX_GEMM
+  if (prefill_amx_in_use_) {
+    if (prefill_cap_ < S * D) {
+      prefill_xh_.resize(S * D);
+      prefill_cap_ = S * D;
+    }
+    kern::f32_to_f16(x, prefill_xh_.data(), S * D);
+    kern::AmxPanel pa_act;  // 激活面板: [S][D] = pa 侧 (M=S)
+    pa_act.rows = S; pa_act.K = D;
+    kern::amx_pack_into(prefill_xh_.data(), S, D, pa_act.buf);
+    // L.wqkv_pa 预打包为 [3D][D] = pb 侧 (N=3D)
+    kern::gemm_f16_amx_pp(pa_act, L.wqkv_pa, qkv_.data(), S, 3 * D);
+  } else
+#endif
+  {
+    L.wqkv.forward(x, S, qkv_.data());
+  }
   for (size_t i = 0; i < S; ++i)
     for (size_t j = 0; j < 3 * D; ++j) qkv_[i * 3 * D + j] += L.bqkv[j];
 
@@ -181,7 +336,7 @@ void T2SEngine::block_prefill_impl(size_t l, float* x, size_t S, size_t pos,
   // SDPA: 掩码 allowed(q,k) = k<text_len || k<=q —— 文本块双向互见(text_len>0 时
   // 对 q<text_len 自动覆盖全部文本 key), 音频行因果。text_len==0 ⇒ 纯因果。
   // torch 侧为全行 softmax(-inf 掩蔽); 此处紧致遍历 allowed 集, 数学等价。
-  // KV16 读出: 每 key 行先升位到 kvrow_(fp32), 计算全 fp32。
+  // E11-1: 标量 → NEON 4-lane 树形 (同 decode)
   scores_.resize(S);
   probs_.resize(S);
   attn_.assign(S * D, 0.f);
@@ -193,15 +348,12 @@ void T2SEngine::block_prefill_impl(size_t l, float* x, size_t S, size_t pos,
       size_t n = 0;
       for (size_t k = 0; k < n_max; ++k) {
         if (!(k < text_len || k <= q)) continue;
-        const float* kv;
+        float dot;
         if constexpr (KV16) {
-          accel::f16_to_f32(k16 + (pos + k) * D + h * HD, kvrow_.data(), HD);
-          kv = kvrow_.data();
+          dot = ar_neon::dot_f16kv(qv, k16 + (pos + k) * D + h * HD, HD);
         } else {
-          kv = kf32 + (pos + k) * D + h * HD;
+          dot = ar_neon::dot_f32(qv, kf32 + (pos + k) * D + h * HD, HD);
         }
-        float dot = 0.f;
-        for (size_t e = 0; e < HD; ++e) dot += qv[e] * kv[e];
         scores_[n++] = dot * scale;
       }
       gsv::kern::softmax(scores_.data(), probs_.data(), n);
@@ -210,14 +362,11 @@ void T2SEngine::block_prefill_impl(size_t l, float* x, size_t S, size_t pos,
       for (size_t k = 0; k < n_max; ++k) {
         if (!(k < text_len || k <= q)) continue;
         const float p = probs_[idx++];
-        const float* vv;
         if constexpr (KV16) {
-          accel::f16_to_f32(v16 + (pos + k) * D + h * HD, kvrow_.data(), HD);
-          vv = kvrow_.data();
+          ar_neon::accum_f16kv(ov, v16 + (pos + k) * D + h * HD, p, HD);
         } else {
-          vv = vf32 + (pos + k) * D + h * HD;
+          ar_neon::accum_f32(ov, vf32 + (pos + k) * D + h * HD, p, HD);
         }
-        for (size_t e = 0; e < HD; ++e) ov[e] += p * vv[e];
       }
     }
   }
@@ -232,10 +381,30 @@ void T2SEngine::block_prefill_impl(size_t l, float* x, size_t S, size_t pos,
 
   // FFN(ReLU) + 残差 + post-LN(norm2)
   ff_.resize(S * FF);
+  // E11-2: W1 暂留 FMLAL —— ff_ 在 S~200 区间内 FMLAL ~ 1ms, AMX ~0.5ms 但漂移源多;
+  // 数值稳定性优先(避免与 QKV/W2 同时改归约序导致雪崩对漂移)
   L.w1.forward(x, S, ff_.data());
   for (size_t i = 0; i < S * FF; ++i) ff_[i] += L.b1[i % FF];
   gsv::kern::relu(ff_.data(), ff_.data(), S * FF);
-  L.w2.forward(ff_.data(), S, tmp_.data());
+
+  // E11-2: W2 走 AMX (FFN 下降 S×FF → S×D)
+#ifdef GSV_AMX_GEMM
+  if (prefill_amx_in_use_) {
+    if (prefill_cap_ < S * FF) {
+      prefill_xh_.resize(S * FF);
+      prefill_cap_ = S * FF;
+    }
+    kern::f32_to_f16(ff_.data(), prefill_xh_.data(), S * FF);
+    kern::AmxPanel pa_act;  // 激活面板: [S][FF] = pa 侧 (M=S)
+    pa_act.rows = S; pa_act.K = dims_.ffn;
+    kern::amx_pack_into(prefill_xh_.data(), S, dims_.ffn, pa_act.buf);
+    // L.w2_pa 预打包为 [D][FF] = pb 侧 (N=D)
+    kern::gemm_f16_amx_pp(pa_act, L.w2_pa, tmp_.data(), S, D);
+  } else
+#endif
+  {
+    L.w2.forward(ff_.data(), S, tmp_.data());
+  }
   for (size_t i = 0; i < S * D; ++i) x[i] += tmp_[i] + L.b2[i % D];
   for (size_t t = 0; t < S; ++t)
     gsv::kern::layernorm(x + t * D, L.n2g.data(), L.n2b.data(), x + t * D, D,
@@ -272,36 +441,31 @@ void T2SEngine::block_decode_impl(size_t l, float* x, size_t pos, size_t len,
     std::memcpy(vf32 + pos * D, qkv + 2 * D, D * sizeof(float));
   }
 
-  // SDPA 单 query 对 len 个 key(KV16: 每 key 升位 fp32 后计算)
+  // SDPA 单 query 对 len 个 key — E11-1: 标量 → NEON 4-lane 树形
   scores_.resize(len);
   attn_.assign(D, 0.f);
   if constexpr (KV16) kvrow_.resize(D);
   for (size_t h = 0; h < H; ++h) {
     const float* qv = qkv + h * HD;
     for (size_t k = 0; k < len; ++k) {
-      const float* kv;
+      float dot;
       if constexpr (KV16) {
-        accel::f16_to_f32(k16 + k * D + h * HD, kvrow_.data(), HD);
-        kv = kvrow_.data();
+        // 原地升位 + dot (避免中间缓冲跳跳; 升位为 inline 热路径)
+        dot = ar_neon::dot_f16kv(qv, k16 + k * D + h * HD, HD);
       } else {
-        kv = kf32 + k * D + h * HD;
+        dot = ar_neon::dot_f32(qv, kf32 + k * D + h * HD, HD);
       }
-      float dot = 0.f;
-      for (size_t e = 0; e < HD; ++e) dot += qv[e] * kv[e];
       scores_[k] = dot * scale;
     }
     gsv::kern::softmax(scores_.data(), scores_.data(), len);  // 就地稳定 softmax
     float* ov = attn_.data() + h * HD;
     for (size_t k = 0; k < len; ++k) {
       const float p = scores_[k];
-      const float* vv;
       if constexpr (KV16) {
-        accel::f16_to_f32(v16 + k * D + h * HD, kvrow_.data(), HD);
-        vv = kvrow_.data();
+        ar_neon::accum_f16kv(ov, v16 + k * D + h * HD, p, HD);
       } else {
-        vv = vf32 + k * D + h * HD;
+        ar_neon::accum_f32(ov, vf32 + k * D + h * HD, p, HD);
       }
-      for (size_t e = 0; e < HD; ++e) ov[e] += p * vv[e];
     }
   }
 
@@ -532,9 +696,15 @@ GenResult T2SEngine::generate(const int64_t* phones, size_t T,
   r.logits_last.assign(logits_.data(), logits_.data() + dims_.vocab);
   last_prefill_ms_ = std::chrono::duration<double, std::milli>(t1 - t0).count();
   last_decode_ms_ = std::chrono::duration<double, std::milli>(t2 - t1).count();
-  if (std::getenv("GSV_AR_TIMING"))
-    std::fprintf(stderr, "[ar-timing] prefill=%.1f decode=%.1f (steps=%zu)\n",
-                 last_prefill_ms_, last_decode_ms_, r.steps);
+  // E11-2 起加 GSV_AR_TIMING=1 探针, stderr 打印 prefill/decode/全程耗时(用与 E11-1/E11-2 验收报表)
+  if (std::getenv("GSV_AR_TIMING")) {
+    const double ms_per_tok =
+        last_decode_ms_ / static_cast<double>(r.steps);
+    std::fprintf(stderr,
+                 "[ar-timing] T=%zu P=%zu S=%zu steps=%zu prefill=%.2fms "
+                 "decode=%.2fms (%.3f ms/tok)\n",
+                 T, P, S, r.steps, last_prefill_ms_, last_decode_ms_, ms_per_tok);
+  }
   return r;
 }
 
