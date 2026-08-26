@@ -15,6 +15,9 @@ gsv_add_test(test_gsv_loader)
 gsv_add_test(test_kern)
 gsv_add_test(test_accel)
 
+# E8: BERT AMX 路径一致性(无权重/无AMX时 SKIP; 有权重时跑数值对照)
+gsv_add_test(test_bert_amx)
+
 # 层验证 harness(由 tools/layer0_check.py 驱动, 不注册 ctest)
 add_executable(layer0_check layer0_check.cpp)
 target_link_libraries(layer0_check PRIVATE gsv_rt gsv_kern)

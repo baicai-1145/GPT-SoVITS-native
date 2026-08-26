@@ -49,6 +49,7 @@ struct PipelineOptions {
   bool ar_fp16_kv = false;    // E1裁决B: AR KV fp16 (默认关, 与fp32位级一致)
   bool ar_fp16_gemv = false;  // E2-AR: FMLAL gemv 实验开关 (--fp16-all 隐含)
   bool sovits_amx = false; // E5-P2: SoVITS conv 接入 AMX 后端 (--amx; 默认关)
+  bool bert_amx = false;   // E8: BERT dense 接入 AMX 后端 (--amx-bert; 默认关)
 };
 
 struct SegmentResult {

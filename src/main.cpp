@@ -26,6 +26,9 @@
 
 #include "runtime/pipeline.hpp"
 #include "sovits/wav_writer.hpp"
+#if defined(GSV_AMX_GEMM)
+#include "bert/bert_ops.hpp"
+#endif
 
 namespace {
 
@@ -61,6 +64,8 @@ void printHelp(const char* argv0) {
       "  --overlap         流水重叠模式: AR(N+1) ‖ SoVITS(N) (数值同串行)\n"
       "  --timing-csv F    per-segment 三阶段耗时 CSV 输出路径\n"
       "  --amx             SoVITS conv 启用 AMX fp16 GEMM 后端(实验; 默认关)\n"
+      "  --amx-bert        BERT dense 层启用 AMX fp16 GEMM(实验; 默认关;\n"
+      "                    影响文本前端 roberta/G2PW 计算时长, 数值位级一致)\n"
       "  -h/--help         本帮助\n",
       argv0);
 }
@@ -116,6 +121,12 @@ int main(int argc, char** argv) {
       opt.overlap = true;
     } else if (a == "--amx") {
       opt.sovits_amx = true;
+    } else if (a == "--amx-bert") {
+#if defined(GSV_AMX_GEMM)
+      // E8: BERT dense 层切换 AMX (roberta/G2PW 共用); 权重 panel 在
+      // Linear::load 期预打包, 与 SoVITS AMX 解耦开关。
+      opt.bert_amx = true;
+#endif
     } else if (a == "--fp16") {
       opt.ar_fp16_kv = true;
     } else if (a == "--fp16-all") {

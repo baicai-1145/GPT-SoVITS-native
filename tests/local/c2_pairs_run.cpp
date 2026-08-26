@@ -4,6 +4,7 @@
 //
 // 用法: ./c2_pairs_run <weightsDir> <dataDir> <refWav> <out.json>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <string>
 
@@ -25,6 +26,13 @@ int main(int argc, char** argv) {
   gsv::rt::pipeline::Pipeline pipe;
   gsv::rt::pipeline::PipelineOptions opt;
   opt.cut_method = 0;  // pairs 导出用 cut0 单段完整推理
+#if defined(GSV_AMX_GEMM)
+  // E8: 允许用 GSV_AMX_BERT=1 环境变量验收 AMX 路径的 golden 对齐
+  if (std::getenv("GSV_AMX_BERT")) {
+    opt.bert_amx = true;
+    std::fprintf(stderr, "[c2_pairs_run] GSV_AMX_BERT=1 → bert_amx enabled\n");
+  }
+#endif
   std::string err;
   if (!pipe.load(argv[1], argv[2], opt, &err)) {
     std::fprintf(stderr, "load fail: %s\n", err.c_str());
