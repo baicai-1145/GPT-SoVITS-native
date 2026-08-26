@@ -179,3 +179,10 @@ S4真实形状K={72,168,264}全落在饥饿区(渐近值一半以下) → M拼�
 - 性能: 负载下 layers=22 计时 qkv=10.9/head=5.1/wout_ln=9.7/ffn=49.7ms; 执行者声明长句 345→50ms 待安静窗口配对复测定标(Goal 条款4)
 - 开关: --amx-bert 默认关; GSV_AMX_BERT_MODE=all|ffn|none 分流档; 与 SoVITS --amx 解耦
 - 教训: 面板重建后派卡必须先 herdr_agent list 确认 agent 存在, 否则卡会吞(w13:p5 FE-AUTO-1 首派即如此)
+
+## 2026-08-27 FE-AUTO-1 验收 DONE (用户指令: 前端默认 auto)
+- 合入 task/FE-AUTO-1 (9fb27b0): fasttext lid.176 手写推理(对齐官方 2e-6) + LangSegmenter 位级移植(split_lang 全规则+budoux 断句+怪癖保留)
+- fixture 64/64 语料×模式位级全等; all_zh 红线 wav md5 fa78ef01 一致; ctest 7/7; 纯中文 auto≡all_zh 同 wav
+- 数据: lid.176.bin 探测链 GSV_LID_BIN > dataDir > CPUFast 权威路径; budoux ja/zh-hans.json 已入库 src/textfront/data/budoux/
+- ja/ko 片显式告警跳过(G2P 待 FE-AUTO-2/3); CLI --lang auto|all_zh, 默认 auto
+- ⚠️ 已知差距登记(FE-AUTO-1.5): 混排段 BERT native 整段置零, python auto 为逐片 bert 再 torch.cat(zh 片保留真特征) — 决策者开卡口径遗漏, 非 b5 执行偏差; 影响 auto 模式下混排句听感潜力
