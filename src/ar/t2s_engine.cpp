@@ -532,6 +532,9 @@ GenResult T2SEngine::generate(const int64_t* phones, size_t T,
   r.logits_last.assign(logits_.data(), logits_.data() + dims_.vocab);
   last_prefill_ms_ = std::chrono::duration<double, std::milli>(t1 - t0).count();
   last_decode_ms_ = std::chrono::duration<double, std::milli>(t2 - t1).count();
+  if (std::getenv("GSV_AR_TIMING"))
+    std::fprintf(stderr, "[ar-timing] prefill=%.1f decode=%.1f (steps=%zu)\n",
+                 last_prefill_ms_, last_decode_ms_, r.steps);
   return r;
 }
 
