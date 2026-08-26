@@ -193,3 +193,10 @@ S4真实形状K={72,168,264}全落在饥饿区(渐近值一半以下) → M拼�
 - 覆盖: 五语种随机拼接/数字归属/西里尔(非支持)/CJK-ExtB/全符号/长混排/budoux断句边界
 - 结论: 切分层在已测域内位级完全对齐(fasttext lid 概率差 2e-6 未引发任何切分翻转)
 - 边界诚实声明: fasttext lid 是概率模型非 bit-exact 组件, 理论上存在未测文本的翻转可能; fuzz fixture 已入库复测路径, 语料累积制
+
+## 2026-08-27 用户裁定: RefCache 路径缓存不解决问题本体
+- 实际推理参考音频常变(录音/上传), sha256(path|mtime) 键只在固定音色文件场景有效 → 音频侧编码本身必须贴硬件地板
+- --no-cache 全量画像: sv.forward3=3972ms(737帧) + hubert.run=4092ms(T=399) + 重采样fbank=145ms ≈ 8.2s(负载4.8)
+- 反思: E5-P2 曾把 SoVITS conv 接上 AMX, 但 SV/HuBERT 这两个"参考侧专用引擎"从未被纳入 AMX 版图 — 架构盲区
+- E12 开卡: HuBERT 密集层抄 E8 配方(AmxPanel 预打包+形状分流); SV 1x1 conv=纯 GEMM 直吃 AMX, 3x3 按 E5-P2 分流
+- 位级红线: hubert hidden/RVQ codes 与基线逐位(或 cos)一致, 不过则保守档回退
