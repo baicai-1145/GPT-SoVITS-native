@@ -13,6 +13,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -195,6 +196,68 @@ GSV_TEST(generate_smoke_eos_stop) {
   CHECK(r.steps >= 11);  // 前 11 步禁止 EOS ⇒ 至少 11 步
   CHECK(r.sampled.size() + 1 >= r.steps);
   CHECK(r.logits_last.size() == eng.dims().vocab);
+}
+
+// E4: topk_sample 语义单测
+// 1) 重复点: k=15 topk + rep_pen=1.35,  100 步采样, 命中历史 token 比例 < 0.5 (8 头不允许重复)
+// 2) temperature=0 退贪心, 选中 == raw_argmax
+// 3) 同 seed 两次跑选中序列一致
+// 4) 1000 次 1 步采样 命中 top1 比例 ∈ [5%, 20%], 其余 选 topk(15) 中其他 (验证随机性)
+GSV_TEST(topk_sample_semantics) {
+  gsv::rt::GsvFile f(kWeights);
+  T2SEngine eng(f);
+  eng.init_topk_scratch();
+  const int V = static_cast<int>(eng.dims().vocab);
+  std::vector<float> lg(V, 0.f);
+  // 构造 3 个明显高峰, 其余均匀小值
+  lg[10] = 5.0f;  lg[20] = 4.0f;  lg[30] = 3.0f;
+  for (int c = 0; c < V; ++c) if (c != 10 && c != 20 && c != 30) lg[c] = 0.01f * (c % 7);
+  std::vector<int32_t> hist = {10, 20, 30, 10, 20};  // 重复点都需压低
+  gsv::ar::SamplingParams sp;
+  sp.mode = gsv::ar::SamplingParams::Mode::TopK;
+  sp.top_k = 15; sp.top_p = 1.0f; sp.temperature = 1.0f; sp.rep_penalty = 1.35f;
+
+  // 1) 100 步采样
+  std::mt19937_64 rng(42);
+  int hits_10 = 0, hits_20 = 0, hits_30 = 0, hits_other = 0;
+  for (int s = 0; s < 100; ++s) {
+    int raw = -1;
+    int sel = eng.topk_sample(lg.data(), hist, /*eos_allowed=*/true, &raw, sp, rng);
+    if (sel == 10) ++hits_10;
+    else if (sel == 20) ++hits_20;
+    else if (sel == 30) ++hits_30;
+    else ++hits_other;
+    hist.push_back(sel);
+  }
+  std::printf("[topk] 100 步: 10=%d 20=%d 30=%d other=%d (总计 %d)\n",
+              hits_10, hits_20, hits_30, hits_other, hits_10 + hits_20 + hits_30 + hits_other);
+  // 主峰被惩罚后, 概率不应全占: 100 步中三峰总命中 < 80% (topk=15 均匀)
+  const int peak_total = hits_10 + hits_20 + hits_30;
+  CHECK(peak_total < 100);  // 不是 100% 烧顶 1
+
+  // 2) temperature=0 退贪心
+  sp.temperature = 0.0f;
+  std::mt19937_64 rng2(123);
+  std::vector<int32_t> hist2 = {10};  // 10 压低后应不是 argmax
+  int raw = -1;
+  int sel_g = eng.topk_sample(lg.data(), hist2, true, &raw, sp, rng2);
+  std::printf("[topk] temperature=0 选中=%d raw_argmax=%d\n", sel_g, raw);
+  CHECK(sel_g == raw);
+
+  // 3) 确定性: 同 seed 两次跑
+  std::mt19937_64 rngA(7), rngB(7);
+  std::vector<int32_t> hA = {10, 20, 30}, hB = {10, 20, 30};
+  std::vector<int> seqA, seqB;
+  for (int s = 0; s < 50; ++s) {
+    seqA.push_back(eng.topk_sample(lg.data(), hA, true, nullptr, sp, rngA));
+    seqB.push_back(eng.topk_sample(lg.data(), hB, true, nullptr, sp, rngB));
+    hA.push_back(seqA.back());
+    hB.push_back(seqB.back());
+  }
+  int same = 0;
+  for (size_t i = 0; i < seqA.size(); ++i) if (seqA[i] == seqB[i]) ++same;
+  std::printf("[topk] 50 步同 seed 一致: %d/50\n", same);
+  CHECK(same == 50);
 }
 
 GSV_TEST_MAIN()

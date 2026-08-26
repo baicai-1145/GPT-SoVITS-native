@@ -730,10 +730,118 @@ int T2SEngine::greedy_sample(float* logits_io,
   return best;
 }
 
+// ---- E4: topk_sample —— 对齐 python infer_panel_naive sample() ----
+// 链顺序: repetition_penalty → top_k(15) → top_p(1.0) → temperature(1.0) → multinomial
+// 关键语义:
+//  - 惩罚对"去重后"history 各施压一次(torch scatter_ 覆盖语义, 同 greedy_sample)
+//  - idx<11 ⇒ EOS 列保持原始值且不参与采样(torch logits[:, :-1] 前置裁切)
+//  - temperature=1.0 时 softmax 等价直接归一化; 非 1.0 时 logits /= temperature
+//  - multinomial 用浮点 CDF 累加 + uniform 比较(1025 词表无需别名表, < 5us 一次)
+//  - seed 来自 SamplingParams(0 = std::random_device 真随机)
+int T2SEngine::topk_sample(float* logits_io,
+                           const std::vector<int32_t>& history,
+                           bool eos_allowed, int* raw_argmax_out,
+                           const SamplingParams& sp, std::mt19937_64& rng) {
+  const int V = static_cast<int>(dims_.vocab);
+  const int limit = eos_allowed ? V : V - 1;
+  // 1) repetition_penalty (同 greedy_sample, 标量化 rep_penalty 入参)
+  if (pen_mark_.size() != dims_.vocab) {
+    pen_mark_.assign(dims_.vocab, 0);
+    pen_stamp_ = 0;
+  }
+  ++pen_stamp_;
+  for (const int32_t c : history) {
+    if (static_cast<int>(c) >= limit) continue;
+    if (pen_mark_[static_cast<size_t>(c)] == pen_stamp_) continue;
+    pen_mark_[static_cast<size_t>(c)] = pen_stamp_;
+    float& v = logits_io[static_cast<size_t>(c)];
+    v = v < 0.f ? v * sp.rep_penalty : v / sp.rep_penalty;
+  }
+  // 2) raw_argmax: 全词表 argmax(含 EOS, 保持原始值)
+  if (raw_argmax_out) {
+    int best = 0;
+    float bv = logits_io[0];
+    for (int c = 1; c < V; ++c) {
+      if (logits_io[c] > bv) { bv = logits_io[c]; best = c; }
+    }
+    *raw_argmax_out = best;
+  }
+  // 3) top_k: 在 [0, limit) 范围中保留 sp.top_k 个最高(此为样本有效域)
+  //    策略: 在 limit 范围内收集 top_k (insertion-select, k≤15 1025 上 O(k·V) 仍 < 20us)
+  const int k = sp.top_k > static_cast<size_t>(limit)
+                    ? limit
+                    : static_cast<int>(sp.top_k);
+  // 简化: 使用部分排序后的索引表 (V=1025, 1025*4B = 4KB, 贴进 L1)
+  // 为避免动态分配, 复用 per-instance topk_idx_/topk_val_ (在 generate() 期用, 尺寸 V)
+  int* idxs = topk_idx_.data();
+  float* vals = topk_val_.data();
+  for (int c = 0; c < limit; ++c) { idxs[c] = c; vals[c] = logits_io[c]; }
+  // partial sort top-k (selection sort k 轮, k≤15, V=1025 ⇒ 15*1025 = 15k 比较)
+  for (int i = 0; i < k; ++i) {
+    int max_j = i;
+    float max_v = vals[i];
+    for (int j = i + 1; j < limit; ++j) {
+      if (vals[j] > max_v) { max_v = vals[j]; max_j = j; }
+    }
+    if (max_j != i) {
+      std::swap(vals[i], vals[max_j]);
+      std::swap(idxs[i], idxs[max_j]);
+    }
+  }
+  // 4) temperature 应用到 top-k logits(若 != 1.0)
+  //    temperature=0 ⇒ 退贪心
+  if (sp.temperature <= 0.f) {
+    int best = idxs[0];
+    float bv = vals[0];
+    for (int i = 1; i < k; ++i) {
+      if (vals[i] > bv) { bv = vals[i]; best = idxs[i]; }
+    }
+    return best;
+  }
+  if (sp.temperature != 1.0f) {
+    for (int i = 0; i < k; ++i) vals[i] = vals[i] / sp.temperature;
+  }
+  // 5) softmax over top-k (数值稳定: 减 max)
+  float max_logit = vals[0];
+  for (int i = 1; i < k; ++i) {
+    if (vals[i] > max_logit) max_logit = vals[i];
+  }
+  float sum_exp = 0.f;
+  for (int i = 0; i < k; ++i) {
+    vals[i] = std::exp(vals[i] - max_logit);
+    sum_exp += vals[i];
+  }
+  // 6) top_p (nucleus): 从高到低累加, 保留累积 ≥ (1 - top_p) 比例的最小前缀
+  int keep = k;
+  if (sp.top_p < 1.0f) {
+    const float threshold = (1.f - sp.top_p) * sum_exp;
+    float cum = 0;
+    for (int i = k - 1; i >= 0; --i) {
+      cum += vals[i];
+      if (cum >= threshold) { keep = i + 1; break; }
+    }
+    // 重算 sum_exp (裁掉后部分)
+    if (keep < k) {
+      sum_exp = 0;
+      for (int i = 0; i < keep; ++i) sum_exp += vals[i];
+    }
+  }
+  // 7) multinomial: 浮点 CDF + uniform 比较
+  //    1025 词表, keep≤15, 线性扫描 < 100ns
+  std::uniform_real_distribution<float> uni(0.f, 1.f);
+  const float u = uni(rng) * sum_exp;
+  float cdf = 0.f;
+  for (int i = 0; i < keep; ++i) {
+    cdf += vals[i];
+    if (u <= cdf) return idxs[i];
+  }
+  return idxs[keep - 1];  // 数值末位兜底
+}
+
 GenResult T2SEngine::generate(const int64_t* phones, size_t T,
                               const int64_t* prompt, size_t P,
                               const float* bert1024, size_t max_steps,
-                              GenDebug* dbg) {
+                              GenDebug* dbg, const SamplingParams* sampling) {
   const size_t D = dims_.d_model;
   if (T == 0 || P == 0) throw std::runtime_error("T/P 必须非零(golden 口径)");
   const size_t S = T + P;
@@ -798,6 +906,18 @@ GenResult T2SEngine::generate(const int64_t* phones, size_t T,
   predict_layer_fp(xy_.data() + (S - 1) * D, logits_.data());
 
   // ---- B2: decode 循环(GEMV + KV cache fp32 + 贪心) ----
+  // E4: 采样路径 —— sampling.mode=TopK 时走 topk_sample (复现 python 默认 15 采样, 根治复读)
+  // 默认 Greedy 不变(位级一致保证 B12 golden G1/G2)
+  const bool use_topk = sampling && sampling->mode == SamplingParams::Mode::TopK;
+  std::mt19937_64 rng = [&]() {
+    if (sampling && sampling->seed != 0) return std::mt19937_64(sampling->seed);
+    std::random_device rd;
+    return std::mt19937_64(rd());
+  }();
+  if (use_topk) {
+    topk_idx_.assign(dims_.vocab, 0);
+    topk_val_.assign(dims_.vocab, 0.f);
+  }
   std::vector<int32_t> history;
   history.reserve(P + max_steps);
   for (size_t t = 0; t < P; ++t) history.push_back(static_cast<int32_t>(prompt[t]));
@@ -813,7 +933,12 @@ GenResult T2SEngine::generate(const int64_t* phones, size_t T,
     int raw = -1;
     const bool eos_allowed = idx >= kEosMaskSteps;
     // 采样 + 就地惩罚(torch scatter_ 语义): 惩罚后 logits_ 才是 golden 捕获口径
-    const int sample = greedy_sample(lg, history, eos_allowed, &raw);
+    int sample;
+    if (use_topk) {
+      sample = topk_sample(lg, history, eos_allowed, &raw, *sampling, rng);
+    } else {
+      sample = greedy_sample(lg, history, eos_allowed, &raw);
+    }
     r.raw_argmax.push_back(raw);
     if (r.logits_first8.size() < 8 * dims_.vocab)
       r.logits_first8.insert(r.logits_first8.end(), lg, lg + dims_.vocab);
