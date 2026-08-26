@@ -112,20 +112,23 @@ inline float row_dot_fmlal(const uint16_t* wr, const uint16_t* xh,
 
 void gemv_f16x_fmlal(const uint16_t* w, const uint16_t* xh, float* y,
                      size_t out, size_t in) {
-  // 小矩阵单线程免池开销; 大矩阵按行块并行(P 核池, 实时链路 QoS)
+  // 小矩阵单线程免池开销; 大矩阵按行块并行
   if (out * in < 1u << 18) {
     for (size_t r = 0; r < out; ++r)
       y[r] = row_dot_fmlal(w + r * in, xh, in);
     return;
   }
-  // 行块数 ≈ P 核数(粗粒度, 免逐块派发开销); 带宽受限负载无需细粒度均衡
-  const size_t workers = std::max(rt::p_core_count(), size_t{1});
-  const size_t grain = (out + workers - 1) / workers;
-  rt::parallel_for(
-      out, grain, [&](size_t b, size_t e) {
-        for (size_t r = b; r < e; ++r)
+  // E11-4: 全核联合派发 (P+E 双池, 带宽型负载 → 越多核越近吃满)
+  // grain = total / (P核数 + E核数), 保证每核至少一个任务
+  const size_t p = rt::p_core_count();
+  const size_t e = rt::gemv_use_e_cores() ? rt::e_core_count() : 0;
+  const size_t total_workers = p + e;
+  const size_t grain = (out + total_workers - 1) / total_workers;
+  rt::parallel_for_full(
+      out, grain, [&](size_t b, size_t end) {
+        for (size_t r = b; r < end; ++r)
           y[r] = row_dot_fmlal(w + r * in, xh, in);
-      }, rt::Qos::UserInitiated);
+      });
 }
 
 // ---- E2-ENC: 矩阵版 FMLAL GEMM (C = A·Bᵀ, A/B fp16, C fp32) ----
