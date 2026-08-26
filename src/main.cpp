@@ -61,6 +61,9 @@ void printHelp(const char* argv0) {
       "  --overlap         流水重叠模式: AR(N+1) ‖ SoVITS(N) (数值同串行)\n"
       "  --timing-csv F    per-segment 三阶段耗时 CSV 输出路径\n"
       "  --amx             SoVITS conv 启用 AMX fp16 GEMM 后端(实验; 默认关)\n"
+      "  --sample          AR 采样对齐 python(top_k=15/pen=1.35, 根治长文本复读; 默认贪心=位级口径)\n"
+      "  --sample-top-k N  自定义 top_k (隐含 --sample)\n"
+      "  --sample-seed S   采样种子(默认随机)\n"
       "  -h/--help         本帮助\n",
       argv0);
 }
@@ -121,6 +124,18 @@ int main(int argc, char** argv) {
     } else if (a == "--fp16-all") {
       opt.ar_fp16_kv = true;
       opt.ar_fp16_gemv = true;
+    } else if (a == "--sample") {
+      // E4: python 口径采样(top_k=15/pen=1.35) 根治长段贪心复读
+      opt.ar_sample_on = true;
+      opt.ar_sampling.mode = gsv::ar::SamplingParams::Mode::TopK;
+    } else if (a == "--sample-top-k") {
+      if (++i >= argc) throw std::runtime_error("--sample-top-k 需参数");
+      opt.ar_sample_on = true;
+      opt.ar_sampling.mode = gsv::ar::SamplingParams::Mode::TopK;
+      opt.ar_sampling.top_k = std::strtoul(argv[i], nullptr, 10);
+    } else if (a == "--sample-seed") {
+      if (++i >= argc) throw std::runtime_error("--sample-seed 需参数");
+      opt.ar_sampling.seed = std::strtoull(argv[i], nullptr, 10);
     } else if (a == "--timing-csv") {
       opt.timing_csv = next("--timing-csv");
     } else if (a == "--dump-sovits-in") {

@@ -497,8 +497,15 @@ Pipeline::SegSovIn Pipeline::stageAr(const SegArIn& in,
 
   const double t0 = nowMs();
   ar::GenResult gen =
-      ar_->generate(in.phonesAll.data(), in.phonesAll.size(),
-                    promptSem.data(), promptSem.size(), in.bertAll.data());
+      opt_.ar_sample_on
+          ? ar_->generate(in.phonesAll.data(), in.phonesAll.size(),
+                          promptSem.data(), promptSem.size(),
+                          in.bertAll.data(),
+                          ar::T2SEngine::kMaxDecodeSteps, nullptr,
+                          &opt_.ar_sampling)
+          : ar_->generate(in.phonesAll.data(), in.phonesAll.size(),
+                          promptSem.data(), promptSem.size(),
+                          in.bertAll.data());
   o.arMs = nowMs() - t0;
   o.hitEos = gen.hit_eos;
   o.codes.assign(gen.sampled.begin(), gen.sampled.end());

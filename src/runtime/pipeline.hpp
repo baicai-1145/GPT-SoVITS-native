@@ -49,6 +49,9 @@ struct PipelineOptions {
   bool ar_fp16_kv = false;    // E1裁决B: AR KV fp16 (默认关, 与fp32位级一致)
   bool ar_fp16_gemv = false;  // E2-AR: FMLAL gemv 实验开关 (--fp16-all 隐含)
   bool sovits_amx = false; // E5-P2: SoVITS conv 接入 AMX 后端 (--amx; 默认关)
+  // E4: AR 采样对齐 python (--sample; 空=贪心默认, golden 位级口径)
+  ar::SamplingParams ar_sampling;   // 默认 mode=Greedy
+  bool ar_sample_on = false;        // true 时把 ar_sampling 传给 generate
 };
 
 struct SegmentResult {
