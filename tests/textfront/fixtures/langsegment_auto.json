@@ -1,0 +1,1106 @@
+[
+ {
+  "mode": "zh",
+  "input": "重庆的火锅店终于开张了，银行旁边的河水平静地权威流着。",
+  "pieces": [
+   [
+    "zh",
+    "重庆的火锅店终于开张了，银行旁边的河水平静地权威流着。"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ja",
+  "input": "重庆的火锅店终于开张了，银行旁边的河水平静地权威流着。",
+  "pieces": [
+   [
+    "ja",
+    "重庆的火锅店终于开张了，银行旁边的河水平静地权威流着。"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ko",
+  "input": "重庆的火锅店终于开张了，银行旁边的河水平静地权威流着。",
+  "pieces": [
+   [
+    "ko",
+    "重庆的火锅店终于开张了，银行旁边的河水平静地权威流着。"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "auto(auto=空参)",
+  "input": "重庆的火锅店终于开张了，银行旁边的河水平静地权威流着。",
+  "pieces": [
+   [
+    "zh",
+    "重庆的火锅店终于开张了，银行旁边的河水平静地权威流着。"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "zh",
+  "input": "Today I want to recommend my favorite hotpot restaurant.",
+  "pieces": [
+   [
+    "en",
+    "Today I want to recommend my favorite hotpot restaurant."
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ja",
+  "input": "Today I want to recommend my favorite hotpot restaurant.",
+  "pieces": [
+   [
+    "en",
+    "Today I want to recommend my favorite hotpot restaurant."
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ko",
+  "input": "Today I want to recommend my favorite hotpot restaurant.",
+  "pieces": [
+   [
+    "en",
+    "Today I want to recommend my favorite hotpot restaurant."
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "auto(auto=空参)",
+  "input": "Today I want to recommend my favorite hotpot restaurant.",
+  "pieces": [
+   [
+    "en",
+    "Today I want to recommend my favorite hotpot restaurant."
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "zh",
+  "input": "重庆的火锅店，银行旁边的河流。Today I recommend it. 寿司とラーメンも人気です。안녕하세요, 감사합니다。",
+  "pieces": [
+   [
+    "zh",
+    "重庆的火锅店，银行旁边的河流。"
+   ],
+   [
+    "en",
+    "Today I recommend it. "
+   ],
+   [
+    "zh",
+    "寿司とラーメンも人気です。안녕하세요, 감사합니다。"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ja",
+  "input": "重庆的火锅店，银行旁边的河流。Today I recommend it. 寿司とラーメンも人気です。안녕하세요, 감사합니다。",
+  "pieces": [
+   [
+    "ja",
+    "重庆的火锅店，银行旁边的河流。"
+   ],
+   [
+    "en",
+    "Today I recommend it. "
+   ],
+   [
+    "ja",
+    "寿司とラーメンも人気です。안녕하세요, 감사합니다。"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ko",
+  "input": "重庆的火锅店，银行旁边的河流。Today I recommend it. 寿司とラーメンも人気です。안녕하세요, 감사합니다。",
+  "pieces": [
+   [
+    "ko",
+    "重庆的火锅店，银行旁边的河流。"
+   ],
+   [
+    "en",
+    "Today I recommend it. "
+   ],
+   [
+    "ko",
+    "寿司とラーメンも人気です。안녕하세요, 감사합니다。"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "auto(auto=空参)",
+  "input": "重庆的火锅店，银行旁边的河流。Today I recommend it. 寿司とラーメンも人気です。안녕하세요, 감사합니다。",
+  "pieces": [
+   [
+    "zh",
+    "重庆的火锅店，银行旁边的河流。"
+   ],
+   [
+    "en",
+    "Today I recommend it. "
+   ],
+   [
+    "ja",
+    "寿司とラーメンも人気です。"
+   ],
+   [
+    "ko",
+    "안녕하세요, 감사합니다。"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "zh",
+  "input": "价格是 3.5 折，#1 号店！2024年开业。",
+  "pieces": [
+   [
+    "zh",
+    "价格是 3.5 折，#1 号店！2024年开业。"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ja",
+  "input": "价格是 3.5 折，#1 号店！2024年开业。",
+  "pieces": [
+   [
+    "ja",
+    "价格是 3.5 折，#1 号店！2024年开业。"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ko",
+  "input": "价格是 3.5 折，#1 号店！2024年开业。",
+  "pieces": [
+   [
+    "ko",
+    "价格是 3.5 折，#1 号店！2024年开业。"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "auto(auto=空参)",
+  "input": "价格是 3.5 折，#1 号店！2024年开业。",
+  "pieces": [
+   [
+    "zh",
+    "价格是 3.5 "
+   ],
+   [
+    "ja",
+    "折，#1 号店！"
+   ],
+   [
+    "zh",
+    "2024年开业。"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "zh",
+  "input": "他说\"hello world\"然后走了。",
+  "pieces": [
+   [
+    "zh",
+    "他说\""
+   ],
+   [
+    "en",
+    "hello world\""
+   ],
+   [
+    "zh",
+    "然后走了。"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ja",
+  "input": "他说\"hello world\"然后走了。",
+  "pieces": [
+   [
+    "ja",
+    "他说\""
+   ],
+   [
+    "en",
+    "hello world\""
+   ],
+   [
+    "ja",
+    "然后走了。"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ko",
+  "input": "他说\"hello world\"然后走了。",
+  "pieces": [
+   [
+    "ko",
+    "他说\""
+   ],
+   [
+    "en",
+    "hello world\""
+   ],
+   [
+    "ko",
+    "然后走了。"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "auto(auto=空参)",
+  "input": "他说\"hello world\"然后走了。",
+  "pieces": [
+   [
+    "zh",
+    "他说\""
+   ],
+   [
+    "en",
+    "hello world\""
+   ],
+   [
+    "zh",
+    "然后走了。"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "zh",
+  "input": "Hello 世界! こんにちは mundo, 安녕 세상, hi 世界!",
+  "pieces": [
+   [
+    "en",
+    "Hello "
+   ],
+   [
+    "zh",
+    "世界! こんにちは "
+   ],
+   [
+    "en",
+    "mundo, "
+   ],
+   [
+    "zh",
+    "安녕 세상, "
+   ],
+   [
+    "en",
+    "hi "
+   ],
+   [
+    "zh",
+    "世界!"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ja",
+  "input": "Hello 世界! こんにちは mundo, 安녕 세상, hi 世界!",
+  "pieces": [
+   [
+    "en",
+    "Hello "
+   ],
+   [
+    "ja",
+    "世界! こんにちは "
+   ],
+   [
+    "en",
+    "mundo, "
+   ],
+   [
+    "ja",
+    "安녕 세상, "
+   ],
+   [
+    "en",
+    "hi "
+   ],
+   [
+    "ja",
+    "世界!"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ko",
+  "input": "Hello 世界! こんにちは mundo, 安녕 세상, hi 世界!",
+  "pieces": [
+   [
+    "en",
+    "Hello "
+   ],
+   [
+    "ko",
+    "世界! こんにちは "
+   ],
+   [
+    "en",
+    "mundo, "
+   ],
+   [
+    "ko",
+    "安녕 세상, "
+   ],
+   [
+    "en",
+    "hi "
+   ],
+   [
+    "ko",
+    "世界!"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "auto(auto=空参)",
+  "input": "Hello 世界! こんにちは mundo, 安녕 세상, hi 世界!",
+  "pieces": [
+   [
+    "en",
+    "Hello "
+   ],
+   [
+    "ja",
+    "世界! こんにちは "
+   ],
+   [
+    "en",
+    "mundo, "
+   ],
+   [
+    "zh",
+    "安"
+   ],
+   [
+    "ko",
+    "녕 세상, "
+   ],
+   [
+    "en",
+    "hi "
+   ],
+   [
+    "ja",
+    "世界!"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "zh",
+  "input": "URL: 안녕 세상 테스트 测试 https://example.com/path?q=1",
+  "pieces": [
+   [
+    "en",
+    "URL: "
+   ],
+   [
+    "zh",
+    "안녕 세상 테스트 测试 "
+   ],
+   [
+    "en",
+    "https://example.com/path?q="
+   ],
+   [
+    "zh",
+    "1"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ja",
+  "input": "URL: 안녕 세상 테스트 测试 https://example.com/path?q=1",
+  "pieces": [
+   [
+    "en",
+    "URL: "
+   ],
+   [
+    "ja",
+    "안녕 세상 테스트 测试 "
+   ],
+   [
+    "en",
+    "https://example.com/path?q="
+   ],
+   [
+    "ja",
+    "1"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ko",
+  "input": "URL: 안녕 세상 테스트 测试 https://example.com/path?q=1",
+  "pieces": [
+   [
+    "en",
+    "URL: "
+   ],
+   [
+    "ko",
+    "안녕 세상 테스트 测试 "
+   ],
+   [
+    "en",
+    "https://example.com/path?q="
+   ],
+   [
+    "ko",
+    "1"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "auto(auto=空参)",
+  "input": "URL: 안녕 세상 테스트 测试 https://example.com/path?q=1",
+  "pieces": [
+   [
+    "en",
+    "URL: "
+   ],
+   [
+    "ko",
+    "안녕 세상 테스트 "
+   ],
+   [
+    "zh",
+    "测试 "
+   ],
+   [
+    "en",
+    "https://example.com/path?q=1"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "zh",
+  "input": "I have 42 apples, 我有42个苹果，私は42個のリンゴを持っています。",
+  "pieces": [
+   [
+    "en",
+    "I have "
+   ],
+   [
+    "zh",
+    "42 "
+   ],
+   [
+    "en",
+    "apples, "
+   ],
+   [
+    "zh",
+    "我有42个苹果，私は42個のリンゴを持っています。"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ja",
+  "input": "I have 42 apples, 我有42个苹果，私は42個のリンゴを持っています。",
+  "pieces": [
+   [
+    "en",
+    "I have "
+   ],
+   [
+    "ja",
+    "42 "
+   ],
+   [
+    "en",
+    "apples, "
+   ],
+   [
+    "ja",
+    "我有42个苹果，私は42個のリンゴを持っています。"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ko",
+  "input": "I have 42 apples, 我有42个苹果，私は42個のリンゴを持っています。",
+  "pieces": [
+   [
+    "en",
+    "I have "
+   ],
+   [
+    "ko",
+    "42 "
+   ],
+   [
+    "en",
+    "apples, "
+   ],
+   [
+    "ko",
+    "我有42个苹果，私は42個のリンゴを持っています。"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "auto(auto=空参)",
+  "input": "I have 42 apples, 我有42个苹果，私は42個のリンゴを持っています。",
+  "pieces": [
+   [
+    "en",
+    "I have 42 apples, "
+   ],
+   [
+    "zh",
+    "我有42个苹果，"
+   ],
+   [
+    "ja",
+    "私は42個のリンゴを持っています。"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "zh",
+  "input": "数量词混合 ABC-def_123 mix 中文 English 日本語 mix",
+  "pieces": [
+   [
+    "zh",
+    "数量词混合 "
+   ],
+   [
+    "en",
+    "ABC-def_"
+   ],
+   [
+    "zh",
+    "123 "
+   ],
+   [
+    "en",
+    "mix "
+   ],
+   [
+    "zh",
+    "中文 "
+   ],
+   [
+    "en",
+    "English "
+   ],
+   [
+    "zh",
+    "日本語 "
+   ],
+   [
+    "en",
+    "mix"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ja",
+  "input": "数量词混合 ABC-def_123 mix 中文 English 日本語 mix",
+  "pieces": [
+   [
+    "ja",
+    "数量词混合 "
+   ],
+   [
+    "en",
+    "ABC-def_"
+   ],
+   [
+    "ja",
+    "123 "
+   ],
+   [
+    "en",
+    "mix "
+   ],
+   [
+    "ja",
+    "中文 "
+   ],
+   [
+    "en",
+    "English "
+   ],
+   [
+    "ja",
+    "日本語 "
+   ],
+   [
+    "en",
+    "mix"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ko",
+  "input": "数量词混合 ABC-def_123 mix 中文 English 日本語 mix",
+  "pieces": [
+   [
+    "ko",
+    "数量词混合 "
+   ],
+   [
+    "en",
+    "ABC-def_"
+   ],
+   [
+    "ko",
+    "123 "
+   ],
+   [
+    "en",
+    "mix "
+   ],
+   [
+    "ko",
+    "中文 "
+   ],
+   [
+    "en",
+    "English "
+   ],
+   [
+    "ko",
+    "日本語 "
+   ],
+   [
+    "en",
+    "mix"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "auto(auto=空参)",
+  "input": "数量词混合 ABC-def_123 mix 中文 English 日本語 mix",
+  "pieces": [
+   [
+    "zh",
+    "数量词混"
+   ],
+   [
+    "ja",
+    "合 "
+   ],
+   [
+    "en",
+    "ABC-def_123 mix "
+   ],
+   [
+    "zh",
+    "中文 "
+   ],
+   [
+    "en",
+    "English "
+   ],
+   [
+    "ja",
+    "日本語 "
+   ],
+   [
+    "en",
+    "mix"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "zh",
+  "input": "ONLY ENGLISH HERE",
+  "pieces": [
+   [
+    "en",
+    "ONLY ENGLISH HERE"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ja",
+  "input": "ONLY ENGLISH HERE",
+  "pieces": [
+   [
+    "en",
+    "ONLY ENGLISH HERE"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ko",
+  "input": "ONLY ENGLISH HERE",
+  "pieces": [
+   [
+    "en",
+    "ONLY ENGLISH HERE"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "auto(auto=空参)",
+  "input": "ONLY ENGLISH HERE",
+  "pieces": [
+   [
+    "en",
+    "ONLY ENGLISH HERE"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "zh",
+  "input": "。！？、；：",
+  "pieces": [
+   [
+    "zh",
+    "。！？、；："
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ja",
+  "input": "。！？、；：",
+  "pieces": [
+   [
+    "ja",
+    "。！？、；："
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ko",
+  "input": "。！？、；：",
+  "pieces": [
+   [
+    "ko",
+    "。！？、；："
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "auto(auto=空参)",
+  "input": "。！？、；：",
+  "pieces": [
+   [
+    "punctuation",
+    "。！？、；："
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "zh",
+  "input": "",
+  "pieces": [],
+  "error": "IndexError: list index out of range"
+ },
+ {
+  "mode": "ja",
+  "input": "",
+  "pieces": [],
+  "error": "IndexError: list index out of range"
+ },
+ {
+  "mode": "ko",
+  "input": "",
+  "pieces": [],
+  "error": "IndexError: list index out of range"
+ },
+ {
+  "mode": "auto(auto=空参)",
+  "input": "",
+  "pieces": [],
+  "error": "IndexError: list index out of range"
+ },
+ {
+  "mode": "zh",
+  "input": "3.1415926",
+  "pieces": [
+   [
+    "zh",
+    "3.1415926"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ja",
+  "input": "3.1415926",
+  "pieces": [
+   [
+    "ja",
+    "3.1415926"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ko",
+  "input": "3.1415926",
+  "pieces": [
+   [
+    "ko",
+    "3.1415926"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "auto(auto=空参)",
+  "input": "3.1415926",
+  "pieces": [
+   [
+    "zh",
+    "3.1415926"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "zh",
+  "input": "CJK Ext: 𠮷野家 vs 吉野家",
+  "pieces": [
+   [
+    "en",
+    "CJK Ext: "
+   ],
+   [
+    "zh",
+    "𠮷野家 "
+   ],
+   [
+    "en",
+    "vs "
+   ],
+   [
+    "zh",
+    "吉野家"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ja",
+  "input": "CJK Ext: 𠮷野家 vs 吉野家",
+  "pieces": [
+   [
+    "en",
+    "CJK Ext: "
+   ],
+   [
+    "ja",
+    "𠮷野家 "
+   ],
+   [
+    "en",
+    "vs "
+   ],
+   [
+    "ja",
+    "吉野家"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ko",
+  "input": "CJK Ext: 𠮷野家 vs 吉野家",
+  "pieces": [
+   [
+    "en",
+    "CJK Ext: "
+   ],
+   [
+    "ko",
+    "𠮷野家 "
+   ],
+   [
+    "en",
+    "vs "
+   ],
+   [
+    "ko",
+    "吉野家"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "auto(auto=空参)",
+  "input": "CJK Ext: 𠮷野家 vs 吉野家",
+  "pieces": [
+   [
+    "en",
+    "CJK Ext: 𠮷"
+   ],
+   [
+    "ja",
+    "野家 "
+   ],
+   [
+    "en",
+    "vs "
+   ],
+   [
+    "ja",
+    "吉野家"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "zh",
+  "input": "繁体: 重慶の火鍋店終於開張了",
+  "pieces": [
+   [
+    "zh",
+    "繁体: 重慶の火鍋店終於開張了"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ja",
+  "input": "繁体: 重慶の火鍋店終於開張了",
+  "pieces": [
+   [
+    "ja",
+    "繁体: 重慶の火鍋店終於開張了"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ko",
+  "input": "繁体: 重慶の火鍋店終於開張了",
+  "pieces": [
+   [
+    "ko",
+    "繁体: 重慶の火鍋店終於開張了"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "auto(auto=空参)",
+  "input": "繁体: 重慶の火鍋店終於開張了",
+  "pieces": [
+   [
+    "ja",
+    "繁体: "
+   ],
+   [
+    "zh",
+    "重慶"
+   ],
+   [
+    "ja",
+    "の"
+   ],
+   [
+    "zh",
+    "火鍋店終於開張了"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "zh",
+  "input": "emoji 🍲😀 测试",
+  "pieces": [
+   [
+    "zh",
+    "emoji 🍲😀 测试"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ja",
+  "input": "emoji 🍲😀 测试",
+  "pieces": [
+   [
+    "ja",
+    "emoji 🍲😀 测试"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "ko",
+  "input": "emoji 🍲😀 测试",
+  "pieces": [
+   [
+    "ko",
+    "emoji 🍲😀 测试"
+   ]
+  ],
+  "error": ""
+ },
+ {
+  "mode": "auto(auto=空参)",
+  "input": "emoji 🍲😀 测试",
+  "pieces": [
+   [
+    "zh",
+    "  测试"
+   ]
+  ],
+  "error": ""
+ }
+]
