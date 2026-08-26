@@ -138,7 +138,8 @@ GSV_TEST(prefill_causal_matches_stepwise_decode) {
                        std::fabs(static_cast<double>(last[d]) - refA[(N - 1) * D + d]));
   // E11-2: AMX prefill 路径归约序与 GEMV 不同, 忍差 3e-3 (远低于 G1 门限 1e-3 rel, 因为 N=24 步后 24×∑ 小漂移)。
   // FMLAL 路径仍走 5e-4 旧门限, 保持原 M1 fp32 步严格验证。两者不能同时过。
-  const double tol = gsv::kern::amx_gemm_available() ? 3e-3 : 5e-4;
+  // E11-5: prefill SDPA 亦走 AMX (Q·K^T/P·V), 归约序漂移叠加, 忍差提到 5e-3 (cos8≥0.9999 由 B12 把关)。
+  const double tol = gsv::kern::amx_gemm_available() ? 5e-3 : 5e-4;
   CHECK_NEAR(max_abs, 0.0, tol);  // GEMM/GEMV 归约序差, 远小于 G1 门限
 
   // KV cache 内容一致性抽查
