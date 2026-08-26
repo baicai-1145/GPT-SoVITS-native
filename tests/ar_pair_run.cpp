@@ -55,6 +55,7 @@ int main(int argc, char** argv) {
   const char* dump_layers = nullptr;  // 可选: 导出 xy 与逐层 prefill 输出(调试对拍)
   int max_steps = static_cast<int>(gsv::ar::T2SEngine::kMaxDecodeSteps);
   gsv::ar::T2SEngine::Fp16Options fp16;  // M1-fp16: 默认全关(fp32 步不动)
+  gsv::ar::SamplingParams sampling;       // E4: 默认 Greedy (位级一致, B12 golden 口径)
   for (int i = 1; i < argc; ++i) {
     auto next = [&]() { return argv[++i]; };
     if (!std::strcmp(argv[i], "--weights")) weights = next();
@@ -67,11 +68,27 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--fp16-kv")) fp16.kv = true;
     else if (!std::strcmp(argv[i], "--fp16-gemv")) fp16.gemv = true;  // 实验开关(激活舍入雪崩归 M6)
     else if (!std::strcmp(argv[i], "--fp16-all")) { fp16.kv = true; fp16.gemv = true; }
+    // E4: 采样开关 (默认贪心; --sample 启用 python 默认 k=15 采样根治长段复读)
+    else if (!std::strcmp(argv[i], "--sample")) {
+      sampling.mode = gsv::ar::SamplingParams::Mode::TopK;
+    } else if (!std::strcmp(argv[i], "--top-k")) {
+      sampling.top_k = static_cast<size_t>(std::atoi(next()));
+    } else if (!std::strcmp(argv[i], "--top-p")) {
+      sampling.top_p = std::atof(next());
+    } else if (!std::strcmp(argv[i], "--temperature")) {
+      sampling.temperature = std::atof(next());
+    } else if (!std::strcmp(argv[i], "--rep-penalty")) {
+      sampling.rep_penalty = std::atof(next());
+    } else if (!std::strcmp(argv[i], "--seed")) {
+      sampling.seed = std::strtoull(next(), nullptr, 10);
+    }
   }
   if (!weights || !pairs_dir || !out_dir) {
     std::fprintf(stderr,
                  "用法: %s --weights w.gsv --pairs-dir DIR --out DIR [--only stem] "
-                 "[--max-steps N] [--fp16 | --fp16-kv | --fp16-gemv | --fp16-all]\n",
+                 "[--max-steps N] [--fp16 | --fp16-kv | --fp16-gemv | --fp16-all] "
+                 "[--sample] [--top-k N=15] [--top-p F=1.0] [--temperature F=1.0] "
+                 "[--rep-penalty F=1.35] [--seed N=0]\n",
                  argv[0]);
     return 2;
   }
@@ -132,10 +149,13 @@ int main(int argc, char** argv) {
         dumper.layers = &layer_dump;
         dbg = &dumper;
       }
+      // E4: 采样参数默认 greedy(保持 B12 位级一致); --sample 启用 topk
+      const gsv::ar::SamplingParams* sp_ptr =
+          (sampling.mode == gsv::ar::SamplingParams::Mode::TopK) ? &sampling : nullptr;
       gsv::ar::GenResult r =
           eng.generate(phones.data(), static_cast<size_t>(T), prompt.data(),
                        static_cast<size_t>(P), bert.data(),
-                       static_cast<size_t>(max_steps), dbg);
+                       static_cast<size_t>(max_steps), dbg, sp_ptr);
       const auto t1 = std::chrono::steady_clock::now();
       const double wall_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 

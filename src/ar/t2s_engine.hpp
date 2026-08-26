@@ -27,6 +27,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <random>
 #include <stdexcept>
 #include <vector>
 
@@ -56,6 +57,20 @@ struct GenResult {
   std::vector<float> logits_last;    // 最后一步(惩罚后)logits [vocab] ↔ logits_last
   size_t steps = 0;                  // 执行的 decode 步数(含触发停止的最后一步) ↔ n_ar_steps
   bool hit_eos = false;              // true=EOS 正常终止; false=max_steps 用尽
+};
+
+// E4: 采样参数(对齐 python infer_panel_naive LogitsProcessor 链)。
+// 默认 mode=greedy → 与原贪心路径位级一致(保持 B12 golden G1/G2)。
+// mode=topk → 复现 python sample(k=15, p=1, temp=1, pen=1.35) 自然 EOS,
+//           根治长单段复读环。产品级修复。
+struct SamplingParams {
+  enum class Mode { Greedy, TopK };
+  Mode mode = Mode::Greedy;
+  size_t top_k = 15;                // python 默认 15, topk 启用时生效
+  float top_p = 1.0f;               // 默认 1.0 不裁减; <1 启用 nucleus
+  float temperature = 1.0f;         // 1.0 不缩放; 0 退贪心
+  float rep_penalty = 1.35f;        // 与 kRepPenalty 一致; 1.0 不施压
+  uint64_t seed = 0;                // 0 = 末固定 (用 std::random_device)
 };
 
 // 调试对拍钩子(prefill 阶段逐层导出, 仅验收工具用)
@@ -90,11 +105,14 @@ class T2SEngine {
 
   // 全链路: prefill + 贪心 decode。phones[T] 文本音素, prompt[P] 音频语义,
   // bert1024 为 [T,bert_dim] 行主(即 pairs 的 bert_feat_1024 摊平)。
+  // sampling = nullopt → 贪心(位级一致默认, B12 golden 口径)
+  // sampling = SamplingParams{Mode::TopK,...} → python 口径采样(根治复读)
   GenResult generate(const int64_t* phones, size_t T,
                      const int64_t* prompt, size_t P,
                      const float* bert1024,
                      size_t max_steps = kMaxDecodeSteps,
-                     GenDebug* dbg = nullptr);
+                     GenDebug* dbg = nullptr,
+                     const SamplingParams* sampling = nullptr);
 
   double last_prefill_ms() const { return last_prefill_ms_; }
   double last_decode_ms() const { return last_decode_ms_; }
@@ -137,6 +155,20 @@ class T2SEngine {
   // raw_argmax_out 非空则写入惩罚后全词表 argmax(golden tokens 口径)。返回选中 token。
   int greedy_sample(float* logits_io, const std::vector<int32_t>& history,
                     bool eos_allowed, int* raw_argmax_out);
+
+  // E4: 复现 python infer_panel_naive sample() — repetition_penalty → top_k(15) →
+  //   top_p → temperature → multinomial。rng 为外部传入, 须在多次调用间持同一个
+  //   实例以保证 state 连续。返回选中 token; 贪心/采样路径 logits_ 都被就地修改
+  //   (与 greedy_sample 一致: hook 抓取的是惩罚后状态)。
+  int topk_sample(float* logits_io, const std::vector<int32_t>& history,
+                  bool eos_allowed, int* raw_argmax_out,
+                  const SamplingParams& sp, std::mt19937_64& rng);
+
+  // E4: 公开 scratch 初始化 (正常由 generate() 自动调用; bench/单测直调 topk_sample 前需先调一次)
+  void init_topk_scratch() {
+    topk_idx_.assign(dims_.vocab, 0);
+    topk_val_.assign(dims_.vocab, 0.f);
+  }
 
   // 正弦位置编码单行: d 偶=sin(pos·div), 奇=cos(pos·div),
   // div[i]=exp(i·(-ln(10000)/D)) i 取偶数索引 —— 与 SinePositionalEmbedding.extend_pe 同构。
@@ -210,6 +242,11 @@ class T2SEngine {
   std::vector<float> sdpa_probs_;
   std::vector<uint16_t> sdpa_xh_;
   size_t sdpa_cap_ = 0;
+
+  // E4: topk_sample scratch — 1025 词表, idx+val 各占 4KB, 贴 L1
+  // 在 generate() 入口按 V 一次性 resize, 之后复用
+  std::vector<int> topk_idx_;
+  std::vector<float> topk_val_;
 
   // scratch(generate 内复用)
   std::vector<std::vector<float>> kc_, vc_; // 每层 KV cache [cap*D] (fp32 模式)
