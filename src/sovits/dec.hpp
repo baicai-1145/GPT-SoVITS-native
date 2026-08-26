@@ -82,9 +82,21 @@ class Generator {
   // 放进 prepare 钩子在池 worker 内执行, 与同 chain 其他节点的数学重叠。
   // 三链 sum 累加留主线程 (单飞, 阻塞式 amx_chain_run)。
   // 数值序与串行路径完全一致: 链内算子序列不变, sum 累加按 j 序。
+  //
+  // E10-MEM-②: panel ping-pong 复用。链内 p%2 串行依赖——p 的 panel 在
+  // p+1 的 prepare 前已 GEMM 完毕, buf 可覆盖; 跨链 p 同步 (不能共享)。
+  // pb[3][6] → pb[3][2], 节省 2.9GB (12 panel slot 容量)。
+  // 容量保证: 预备时按本 stage max(K_j) 一次 reserve, im2col 内部
+  // 严格不缩/不重分配, data() 指针跨 p 复用期间稳定。
+  // E10-MEM-②: tA+tB 跨偶/奇 depth 共享两 buffer T0/T1 (12 张量 → 6 张量),
+  // 保留 cur/tin 分离 (lrelu 数学序与原版 100% 等价)。
+  //   链内 p 串行依赖 (amx_chain_run 显式建模) 保证覆盖安全:
+  //   - T0 跨 p=0,1,4,5 写 (m=0,2 conv1 + m=0,2 conv2 共 4 次)
+  //   - T1 跨 p=2,3 写 (m=1 conv1 + m=1 conv2 共 2 次)
   struct ResBatchScratch {
-    Tensor2D cur[3], tin[3], tA[3][2], tB[3][2];
-    kern::AmxPanel pb[3][6];
+    Tensor2D cur[3], tin[3];
+    Tensor2D T0[3], T1[3];
+    kern::AmxPanel pb[3][2];
   };
 
   // batch_ms 输出本次批量派发耗时 (含 prepare+gemm)。
@@ -101,19 +113,86 @@ class Generator {
             !resblocks[stage][j].convs2[m].amx_ready())
           return false;
 
+    // E10-MEM: 预算守卫。ResBatchScratch 静态复用 s.cur/tin/tA/tB (18×C*Tn
+    // floats = 72·C·Tn 字节) + 18 个 panel (nt·K·64+64)。 10s 段 S2 (C=192,
+    // T=102400) 总占用 ~3GB+ → 16GB 机器上多段叠加 phys_footprint 失控。 超过
+    // 预算回退串行 (后者 thread_local + 临时分配, 峰值小)。 默认 3GB
+    // (ResBatchScratch 主贡献; Conv1d::forward / textfront / encoder 另计
+    // 在外), 环境变量 GSV_SOVITS_BUDGET_MB 覆盖。
+    static const size_t kBudgetBytes = []() {
+      long mb = 3L * 1024L * 1024L * 1024L;  // 3 GiB 默认
+      if (const char* e = std::getenv("GSV_SOVITS_BUDGET_MB")) {
+        char* end = nullptr;
+        long v = std::strtol(e, &end, 10);
+        if (end && *end == '\0' && v > 0) mb = v * 1024L * 1024L;
+      }
+      return static_cast<size_t>(mb);
+    }();
+    // 预算精账: 2 panel per j (ping-pong, p%2 复用) + 18 张量。
+    // 容量按本 stage 所有 j 中最大 K 一次 reserve, K 取 convs1 dil={1,3,5}
+    // + convs2 dil=1 中 k*in_c+1 最大 (同 j)。
+    const size_t nt = (Tn + 31) / 32;
+    size_t panel_total = 0;
+    for (size_t j = 0; j < kResKernels; ++j) {
+      const ResBlock1& rb = resblocks[stage][j];
+      // convs1 与 convs2 共享 in_c/out_c, 取最大 k 即可覆盖两种 panel
+      const size_t k_max = std::max(rb.convs1[0].k,
+                              std::max(rb.convs1[1].k,
+                                       std::max(rb.convs1[2].k,
+                                                std::max(rb.convs2[0].k,
+                                                  std::max(rb.convs2[1].k,
+                                                           rb.convs2[2].k)))));
+      const size_t K = rb.convs1[0].in_c * k_max + 1;
+      // 每 j 2 panel slot (ping-pong p%2)
+      panel_total += 2 * (nt * K * 64 + 64);
+    }
+    const size_t tensor_total = 12 * C * Tn * sizeof(float);
     // 单飞安全: SoVITS stage 为单线程 FIFO, amx_batch_run 阻塞至完成;
     // 静态存活使 pb/张量容量跨调用复用 (免 prepare 内分配)。
+    // E10-MEM: 避免 shrink 触发 realloc churn; 容量足仅 size 调, 容量
+    // 不够才 resize (capacity 翻倍策略, 后续调用走 size-only 免费)。
+    // 静态 s 提前到本块顶部声明, 使预算守卫能访问并主动释放超容的 s
+    // (避免大 stage 调大后 OS 仍记 1 页高水位, 后续小 stage 调不到
+    // 较紧 footprint)。
     static ResBatchScratch s;
     auto ensure = [](Tensor2D& t, size_t c, size_t tt) {
-      t.C = c; t.T = tt; t.d.resize(c * tt);
+      const size_t need = c * tt;
+      if (t.d.capacity() < need) t.d.resize(need);
+      else if (t.d.size() < need) t.d.resize(need);
+      t.C = c; t.T = tt;
     };
+    if (panel_total + tensor_total > kBudgetBytes) {
+      if (sov_timing_enabled()) {
+        std::fprintf(stderr,
+            "[sovits-dec-budget] stage=%zu T=%zu C=%zu panel=%zumiB "
+            "tensor=%zumiB total=%zumiB > budget=%zumiB → fallback serial\n",
+            stage, Tn, C, panel_total >> 20, tensor_total >> 20,
+            (panel_total + tensor_total) >> 20, kBudgetBytes >> 20);
+      }
+      // 主动释放 s: 避免上一调大后 OS 仍记 1 页高水位。仅释放一次, 后续
+      // 小 stage 调不到预算也不会重新触发。
+      static thread_local bool released = false;
+      if (!released) {
+        for (size_t j = 0; j < kResKernels; ++j) {
+          for (size_t p = 0; p < 2; ++p) {
+            s.pb[j][p].buf.clear();
+            s.pb[j][p].buf.shrink_to_fit();
+          }
+          // 12 张量 (cur+tin+T0+T1) 缩回 0 容量, 让 OS 回收。
+          for (auto* t : {&s.cur[j], &s.tin[j], &s.T0[j], &s.T1[j]}) {
+            std::vector<float>().swap(t->d);
+            t->C = t->T = 0;
+          }
+        }
+        released = true;
+      }
+      return false;
+    }
     for (size_t j = 0; j < kResKernels; ++j) {
       ensure(s.cur[j], C, Tn);
       ensure(s.tin[j], C, Tn);
-      for (int h = 0; h < 2; ++h) {
-        ensure(s.tA[j][h], C, Tn);
-        ensure(s.tB[j][h], C, Tn);
-      }
+      ensure(s.T0[j], C, Tn);
+      ensure(s.T1[j], C, Tn);
     }
 
     const float* xn = x.d.data();
@@ -128,11 +207,14 @@ class Generator {
         const Conv1d& cv = even ? rb.convs1[m] : rb.convs2[m];
         // MUST set rows/K before node creation: amx_chain_run validates
         // pb->rows==N && pa->K==pb->K before prepare hook runs.
-        kern::AmxPanel& pb = s.pb[j][p];
+        // E10-MEM-②: ping-pong, 每 j 2 slot 复用 (p%2)。 容量已在 ensure
+        // 阶段按 max(K_j) reserve 一次到位, im2col 内部不会重 alloc,
+        // data() 跨 p 复用期间稳定。
+        kern::AmxPanel& pb = s.pb[j][p & 1];
         pb.rows = Tn;
         pb.K = cv.in_c * cv.k + 1;
-        float* outp = even ? s.tA[j][m & 1].d.data()
-                           : s.tB[j][m & 1].d.data();
+        const bool use_T1 = (m == 1);  // T0 槽 0/2 (m=0,2 conv1 + m=0,2 conv2)
+        float* outp = use_T1 ? s.T1[j].d.data() : s.T0[j].d.data();
         kern::AmxChainLink nd;
         nd.chain_id = static_cast<int>(j);
         nd.depth = static_cast<int>(p);
@@ -141,23 +223,25 @@ class Generator {
         nd.c = outp;
         nd.M = cv.out_c;
         nd.N = Tn;
-        nd.prepare = [j, p, m, even, Tn, nn, xn, cvl = &cv]() {
-          kern::AmxPanel& pbl = s.pb[j][p];
+        nd.prepare = [j, p, m, even, Tn, nn, xn, use_T1, cvl = &cv]() {
+          kern::AmxPanel& pbl = s.pb[j][p & 1];
           if (even) {
-            // cur 初始化/累加, 然后 lrelu(cur) → tin, im2col → panel
+            // cur 初始化/累加, 然后 lrelu_write(cur, tin), im2col(tin) 读
             if (m == 0) {
               std::memcpy(s.cur[j].d.data(), xn, nn * sizeof(float));
             } else {
-              add_inplace(s.cur[j].d.data(),
-                          s.tB[j][(m - 1) & 1].d.data(), nn);
+              // 累加: m=1 读 T0 (p=1 末 conv2_0 输出), m=2 读 T1 (p=3 末 conv2_1)
+              float* prev = (m == 1) ? s.T0[j].d.data() : s.T1[j].d.data();
+              add_inplace(s.cur[j].d.data(), prev, nn);
             }
             leaky_relu_write(s.cur[j].d.data(), s.tin[j].d.data(), nn, 0.1f);
             im2col_to_panel_f16(s.tin[j].d.data(), cvl->in_c, Tn,
                                 cvl->k, cvl->dilation, pbl.buf, true);
           } else {
-            // tA 就地 lrelu 后产 panel (与串行序一致)
-            leaky_relu_io(s.tA[j][m & 1].d.data(), nn, 0.1f);
-            im2col_to_panel_f16(s.tA[j][m & 1].d.data(), cvl->in_c, Tn,
+            // T[m] 就地 lrelu 后产 panel (与串行序一致)
+            float* tm = use_T1 ? s.T1[j].d.data() : s.T0[j].d.data();
+            leaky_relu_io(tm, nn, 0.1f);
+            im2col_to_panel_f16(tm, cvl->in_c, Tn,
                                 cvl->k, cvl->dilation, pbl.buf, true);
           }
         };
@@ -169,9 +253,10 @@ class Generator {
     kern::amx_chain_run(nodes.data(), nodes.size());
     *batch_ms = now_ms_e6() - tb;
 
-    // 三链 sum 累加 (主线程): cur += convs2[2] 输出; sum += cur/3
+    // 三链 sum 累加 (主线程): cur += convs2[2] 输出 (p=5 写 T0, m=2 落 T0);
+    // sum += cur/3
     for (size_t j = 0; j < kResKernels; ++j) {
-      add_inplace(s.cur[j].d.data(), s.tB[j][0].d.data(), nn);
+      add_inplace(s.cur[j].d.data(), s.T0[j].d.data(), nn);
       if (j == 0) {
         mul_write(sum.d.data(), s.cur[j].d.data(), nn, kInv);
       } else {
@@ -259,20 +344,24 @@ class Generator {
         if (prof) T.dec_res += batch_ms;
       } else {
         static thread_local Tensor2D cur, t_in, t_a, t_b;
+        // E10-MEM: 静态 thread_local 跨调用复用; 只增长 capacity, 避免小
+        // 调用收缩触发 realloc churn (与 res_forward_batched 同样的策略)
+        auto ensure_tl = [](Tensor2D& t, size_t c, size_t tt) {
+          const size_t need = c * tt;
+          if (t.d.capacity() < need) t.d.resize(need);
+          else if (t.d.size() < need) t.d.resize(need);
+          t.C = c; t.T = tt;
+        };
         bool first = true;
         for (size_t j = 0; j < kResKernels; ++j) {
           const ResBlock1& rb = resblocks[i][j];
-          cur.C = x.C;
-          cur.T = x.T;
-          cur.d.resize(x.d.size());
+          ensure_tl(cur, x.C, x.T);
           std::memcpy(cur.d.data(), x.d.data(), x.d.size() * sizeof(float));
           for (size_t jj = 0; jj < 3; ++jj) {
             // torch: xt=lrelu(x); xt=c1(xt); xt=lrelu(xt); xt=c2(xt); x=xt+x
             // (lrelu 不污染残差分支 — 用独立缓冲 t_in)
             double te = tic();
-            t_in.C = cur.C;
-            t_in.T = cur.T;
-            t_in.d.resize(cur.d.size());
+            ensure_tl(t_in, cur.C, cur.T);
             leaky_relu_write(cur.d.data(), t_in.d.data(), cur.d.size(), 0.1f);
             if (prof) T.res_ew += now_ms_e6() - te;
             t0 = tic();
