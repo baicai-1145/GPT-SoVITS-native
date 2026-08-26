@@ -198,9 +198,11 @@ void parallel_for(size_t n, size_t grain,
 }
 
 bool gemv_use_e_cores() {
+  // E11-4 验收裁决: 端到端无收益(5.76 vs 5.82 不可区分, L2复用已超4核流式带宽),
+  // 默认关闭; GSV_GEMV_E_ENABLE=1 实验开启
   static const bool b = []() {
-    const char* e = std::getenv("GSV_GEMV_E_DISABLE");
-    return e == nullptr || e[0] != '1';
+    const char* e = std::getenv("GSV_GEMV_E_ENABLE");
+    return e != nullptr && e[0] == '1';
   }();
   return b;
 }
