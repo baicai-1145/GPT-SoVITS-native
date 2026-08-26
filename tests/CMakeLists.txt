@@ -17,6 +17,23 @@ gsv_add_test(test_accel)
 
 # E8: BERT AMX 路径一致性(无权重/无AMX时 SKIP; 有权重时跑数值对照)
 gsv_add_test(test_bert_amx)
+add_executable(test_langsegment textfront/test_langsegment.cpp)
+target_compile_definitions(test_langsegment PRIVATE
+  FE_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/textfront/fixtures/"
+  FE_DATA_DIR="${CMAKE_SOURCE_DIR}"
+  FE_LID_BIN="/Volumes/2T/GPT-SoVITS-CPUFast/GPT_SoVITS/pretrained_models/fast_langdetect/lid.176.bin")
+target_sources(test_langsegment PRIVATE ${CMAKE_SOURCE_DIR}/src/runtime/mini_json.cpp)
+target_include_directories(test_langsegment PRIVATE ${CMAKE_SOURCE_DIR}/src/textfront)
+target_link_libraries(test_langsegment PRIVATE gsv_textfront)
+add_test(NAME test_langsegment COMMAND test_langsegment)
+
+add_executable(fuzz_langsegment textfront/fuzz_langsegment.cpp)
+target_sources(fuzz_langsegment PRIVATE ${CMAKE_SOURCE_DIR}/src/runtime/mini_json.cpp)
+target_include_directories(fuzz_langsegment PRIVATE ${CMAKE_SOURCE_DIR}/src/textfront)
+target_compile_definitions(fuzz_langsegment PRIVATE
+  FE_FUZZ_JSON="/tmp/lid_fuzz2.json"
+  FE_DATA_DIR="${CMAKE_SOURCE_DIR}")
+target_link_libraries(fuzz_langsegment PRIVATE gsv_textfront)
 
 # 层验证 harness(由 tools/layer0_check.py 驱动, 不注册 ctest)
 add_executable(layer0_check layer0_check.cpp)
