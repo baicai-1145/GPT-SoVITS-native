@@ -72,6 +72,7 @@ void printHelp(const char* argv0) {
       "  --sample-seed S   采样种子(默认随机)\n"
       "  --amx-bert        BERT dense 层启用 AMX fp16 GEMM(实验; 默认关;\n"
       "                    影响文本前端 roberta/G2PW 计算时长, 数值位级一致)\n"
+      "  --amx-enc         HuBERT dense 层启用 AMX(参考音频编码; 默认关)\n"
       "  -h/--help         本帮助\n",
       argv0);
 }
@@ -140,6 +141,11 @@ int main(int argc, char** argv) {
       // E8: BERT dense 层切换 AMX (roberta/G2PW 共用); 权重 panel 在
       // Linear::load 期预打包, 与 SoVITS AMX 解耦开关。
       opt.bert_amx = true;
+#endif
+    } else if (a == "--amx-enc") {
+#if defined(GSV_AMX_GEMM)
+      // E12: HuBERT dense 层切换 AMX(参考音频编码侧); panel 在构造期预打包。
+      opt.enc_amx = true;
 #endif
     } else if (a == "--fp16") {
       opt.ar_fp16_kv = true;
