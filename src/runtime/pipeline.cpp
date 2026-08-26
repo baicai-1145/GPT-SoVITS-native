@@ -291,9 +291,12 @@ bool Pipeline::buildReference(const std::string& refWavPath, SynthResult* out,
     std::vector<float> fbank =
         encoder::kaldi_fbank_80(a16cond.data(), a16cond.size(), nullptr);
     size_t frames80 = fbank.size() / 80;
+    const double sv0 = nowMs();
     sv_->forward3(fbank.data(), frames80);
+    if (std::getenv("GSV_REF_TIMING")) std::fprintf(stderr, "[ref] sv.forward3=%.1fms frames=%zu\n", nowMs()-sv0, frames80);
     std::vector<float> svEmb(sv_->emb_out());  // [20480]
 
+    const double hb_setup0 = nowMs();
     // prompt_semantic: 原始音频直接 → 16k (+9600 零) → HuBERT → ssl_proj → RVQ
     Resampler to16raw;
     to16raw.init(int(w.sample_rate), 16000);
@@ -314,7 +317,10 @@ bool Pipeline::buildReference(const std::string& refWavPath, SynthResult* out,
     // HuBERT: 零尾填充与 CPUFast 一致 (cat[wav16k, zeros(9600)])
     std::vector<float> hubIn(wav16k);
     hubIn.insert(hubIn.end(), kSilence, 0.f);  // 0.3s@32k 的零段, CPUFast 同款
+    if (std::getenv("GSV_REF_TIMING")) std::fprintf(stderr, "[ref] 重采样+fbank=%.1fms\n", nowMs()-hb_setup0);
+    const double hb0 = nowMs();
     const size_t T = hubert_->run(hubIn.data(), hubIn.size());
+    if (std::getenv("GSV_REF_TIMING")) std::fprintf(stderr, "[ref] hubert.run=%.1fms T=%zu\n", nowMs()-hb0, T);
     const std::vector<float>& hidden = hubert_->out();  // [T,768]
 
     // extract_latent: v2ProPlus semantic_frame_rate="25hz" ⇒
