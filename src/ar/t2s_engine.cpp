@@ -10,11 +10,133 @@
 
 #include "kern/gemv_fmlal.hpp"
 
+#include <arm_neon.h>
 #include <chrono>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+
+// ---- E11-1: SDPA NEON helpers (decode + prefill 共享) ----
+// 数值纪律:
+//   fp32 路径: 4-lane 独立累加 → 树形归约 (a0+a1)+(a2+a3) → 水平求和
+//   (等价于 8 个 vdot 等价 FMA 但顺序可比, 保留 G1/G2 数值容差)
+//   fp16 KV 路径: vld1q_f16×2 升位 fp32 后 FMA, 避免标量升位瓶颈
+// 性能纪律: HD=32 (AR 默认 512/16) 时全部走 4-lane×8vec 主路径, 无尾循环
+namespace {
+namespace ar_neon {
+
+// fp32 dot: qv[0..HD) · kv[0..HD), 4-lane tree reduce
+inline float dot_f32(const float* qv, const float* kv, size_t HD) {
+  float32x4_t a0 = vdupq_n_f32(0.f);
+  float32x4_t a1 = vdupq_n_f32(0.f);
+  float32x4_t a2 = vdupq_n_f32(0.f);
+  float32x4_t a3 = vdupq_n_f32(0.f);
+  size_t e = 0;
+  // 主路径: 16 元素一组 (4 vec × 4 lanes) — AR 默认 HD=32 时一轮吃完
+  for (; e + 16 <= HD; e += 16) {
+    a0 = vfmaq_f32(a0, vld1q_f32(qv + e + 0),  vld1q_f32(kv + e + 0));
+    a1 = vfmaq_f32(a1, vld1q_f32(qv + e + 4),  vld1q_f32(kv + e + 4));
+    a2 = vfmaq_f32(a2, vld1q_f32(qv + e + 8),  vld1q_f32(kv + e + 8));
+    a3 = vfmaq_f32(a3, vld1q_f32(qv + e + 12), vld1q_f32(kv + e + 12));
+  }
+  // 4-lane 树形归约: (a0+a1)+(a2+a3)
+  float32x4_t s01 = vaddq_f32(a0, a1);
+  float32x4_t s23 = vaddq_f32(a2, a3);
+  float32x4_t s = vaddq_f32(s01, s23);
+  // 水平求和: pairwise add
+  float32x2_t lo = vget_low_f32(s);
+  float32x2_t hi = vget_high_f32(s);
+  float32x2_t sum2 = vadd_f32(lo, hi);
+  float32x2_t sum1 = vpadd_f32(sum2, sum2);
+  float dot = vget_lane_f32(sum1, 0);
+  // 尾元素 (HD 非 16 倍数时; AR 实际 HD=32/64 走不到这里)
+  for (; e < HD; ++e) dot += qv[e] * kv[e];
+  return dot;
+}
+
+// fp16 KV dot: qv[fp32] · k16[fp16] 升位累加
+inline float dot_f16kv(const float* qv, const uint16_t* k16, size_t HD) {
+  float32x4_t a0 = vdupq_n_f32(0.f);
+  float32x4_t a1 = vdupq_n_f32(0.f);
+  float32x4_t a2 = vdupq_n_f32(0.f);
+  float32x4_t a3 = vdupq_n_f32(0.f);
+  size_t e = 0;
+  for (; e + 16 <= HD; e += 16) {
+    // 每 8 个 fp16 装一 NEON half 向量; 一组 16 fp16 = 2 个 half vec
+    float16x8_t h0 = vld1q_f16(reinterpret_cast<const __fp16*>(k16 + e));
+    float16x8_t h1 = vld1q_f16(reinterpret_cast<const __fp16*>(k16 + e + 8));
+    a0 = vfmaq_f32(a0, vld1q_f32(qv + e + 0),
+                   vcvt_f32_f16(vget_low_f16(h0)));
+    a1 = vfmaq_f32(a1, vld1q_f32(qv + e + 4),
+                   vcvt_f32_f16(vget_high_f16(h0)));
+    a2 = vfmaq_f32(a2, vld1q_f32(qv + e + 8),
+                   vcvt_f32_f16(vget_low_f16(h1)));
+    a3 = vfmaq_f32(a3, vld1q_f32(qv + e + 12),
+                   vcvt_f32_f16(vget_high_f16(h1)));
+  }
+  float32x4_t s01 = vaddq_f32(a0, a1);
+  float32x4_t s23 = vaddq_f32(a2, a3);
+  float32x4_t s = vaddq_f32(s01, s23);
+  float32x2_t lo = vget_low_f32(s);
+  float32x2_t hi = vget_high_f32(s);
+  float32x2_t sum2 = vadd_f32(lo, hi);
+  float32x2_t sum1 = vpadd_f32(sum2, sum2);
+  float dot = vget_lane_f32(sum1, 0);
+  for (; e < HD; ++e) {
+    __fp16 h;
+    __builtin_memcpy(&h, k16 + e, 2);
+    dot += qv[e] * static_cast<float>(h);
+  }
+  return dot;
+}
+
+// ov[0..HD) += p * vv[0..HD)  (fp32)
+inline void accum_f32(float* ov, const float* vv, float p, size_t HD) {
+  float32x4_t p4 = vdupq_n_f32(p);
+  // 4-lane 独立累加 → 加到 ov
+  // 注意: vv 是只读, ov 是读写; 4-lane 分组保持 4×4 网格, 末尾归并到 ov
+  // 简化: 16 元素一组, 累加后立即归并 (HD=32 时仅一轮)
+  size_t e = 0;
+  for (; e + 16 <= HD; e += 16) {
+    float32x4_t a0 = vmulq_f32(p4, vld1q_f32(vv + e + 0));
+    float32x4_t a1 = vmulq_f32(p4, vld1q_f32(vv + e + 4));
+    float32x4_t a2 = vmulq_f32(p4, vld1q_f32(vv + e + 8));
+    float32x4_t a3 = vmulq_f32(p4, vld1q_f32(vv + e + 12));
+    // ov 加载 + 累加
+    vst1q_f32(ov + e + 0,  vaddq_f32(vld1q_f32(ov + e + 0),  a0));
+    vst1q_f32(ov + e + 4,  vaddq_f32(vld1q_f32(ov + e + 4),  a1));
+    vst1q_f32(ov + e + 8,  vaddq_f32(vld1q_f32(ov + e + 8),  a2));
+    vst1q_f32(ov + e + 12, vaddq_f32(vld1q_f32(ov + e + 12), a3));
+  }
+  for (; e < HD; ++e) ov[e] += p * vv[e];
+}
+
+// ov[0..HD) += p * vv16[0..HD)  (fp16 KV)
+inline void accum_f16kv(float* ov, const uint16_t* v16, float p, size_t HD) {
+  float32x4_t p4 = vdupq_n_f32(p);
+  size_t e = 0;
+  for (; e + 16 <= HD; e += 16) {
+    float16x8_t h0 = vld1q_f16(reinterpret_cast<const __fp16*>(v16 + e));
+    float16x8_t h1 = vld1q_f16(reinterpret_cast<const __fp16*>(v16 + e + 8));
+    float32x4_t a0 = vmulq_f32(p4, vcvt_f32_f16(vget_low_f16(h0)));
+    float32x4_t a1 = vmulq_f32(p4, vcvt_f32_f16(vget_high_f16(h0)));
+    float32x4_t a2 = vmulq_f32(p4, vcvt_f32_f16(vget_low_f16(h1)));
+    float32x4_t a3 = vmulq_f32(p4, vcvt_f32_f16(vget_high_f16(h1)));
+    vst1q_f32(ov + e + 0,  vaddq_f32(vld1q_f32(ov + e + 0),  a0));
+    vst1q_f32(ov + e + 4,  vaddq_f32(vld1q_f32(ov + e + 4),  a1));
+    vst1q_f32(ov + e + 8,  vaddq_f32(vld1q_f32(ov + e + 8),  a2));
+    vst1q_f32(ov + e + 12, vaddq_f32(vld1q_f32(ov + e + 12), a3));
+  }
+  for (; e < HD; ++e) {
+    __fp16 h;
+    __builtin_memcpy(&h, v16 + e, 2);
+    ov[e] += p * static_cast<float>(h);
+  }
+}
+
+}  // namespace ar_neon
+}  // namespace
 
 namespace gsv::ar {
 
@@ -181,7 +303,7 @@ void T2SEngine::block_prefill_impl(size_t l, float* x, size_t S, size_t pos,
   // SDPA: 掩码 allowed(q,k) = k<text_len || k<=q —— 文本块双向互见(text_len>0 时
   // 对 q<text_len 自动覆盖全部文本 key), 音频行因果。text_len==0 ⇒ 纯因果。
   // torch 侧为全行 softmax(-inf 掩蔽); 此处紧致遍历 allowed 集, 数学等价。
-  // KV16 读出: 每 key 行先升位到 kvrow_(fp32), 计算全 fp32。
+  // E11-1: 标量 → NEON 4-lane 树形 (同 decode)
   scores_.resize(S);
   probs_.resize(S);
   attn_.assign(S * D, 0.f);
@@ -193,15 +315,12 @@ void T2SEngine::block_prefill_impl(size_t l, float* x, size_t S, size_t pos,
       size_t n = 0;
       for (size_t k = 0; k < n_max; ++k) {
         if (!(k < text_len || k <= q)) continue;
-        const float* kv;
+        float dot;
         if constexpr (KV16) {
-          accel::f16_to_f32(k16 + (pos + k) * D + h * HD, kvrow_.data(), HD);
-          kv = kvrow_.data();
+          dot = ar_neon::dot_f16kv(qv, k16 + (pos + k) * D + h * HD, HD);
         } else {
-          kv = kf32 + (pos + k) * D + h * HD;
+          dot = ar_neon::dot_f32(qv, kf32 + (pos + k) * D + h * HD, HD);
         }
-        float dot = 0.f;
-        for (size_t e = 0; e < HD; ++e) dot += qv[e] * kv[e];
         scores_[n++] = dot * scale;
       }
       gsv::kern::softmax(scores_.data(), probs_.data(), n);
@@ -210,14 +329,11 @@ void T2SEngine::block_prefill_impl(size_t l, float* x, size_t S, size_t pos,
       for (size_t k = 0; k < n_max; ++k) {
         if (!(k < text_len || k <= q)) continue;
         const float p = probs_[idx++];
-        const float* vv;
         if constexpr (KV16) {
-          accel::f16_to_f32(v16 + (pos + k) * D + h * HD, kvrow_.data(), HD);
-          vv = kvrow_.data();
+          ar_neon::accum_f16kv(ov, v16 + (pos + k) * D + h * HD, p, HD);
         } else {
-          vv = vf32 + (pos + k) * D + h * HD;
+          ar_neon::accum_f32(ov, vf32 + (pos + k) * D + h * HD, p, HD);
         }
-        for (size_t e = 0; e < HD; ++e) ov[e] += p * vv[e];
       }
     }
   }
@@ -272,36 +388,31 @@ void T2SEngine::block_decode_impl(size_t l, float* x, size_t pos, size_t len,
     std::memcpy(vf32 + pos * D, qkv + 2 * D, D * sizeof(float));
   }
 
-  // SDPA 单 query 对 len 个 key(KV16: 每 key 升位 fp32 后计算)
+  // SDPA 单 query 对 len 个 key — E11-1: 标量 → NEON 4-lane 树形
   scores_.resize(len);
   attn_.assign(D, 0.f);
   if constexpr (KV16) kvrow_.resize(D);
   for (size_t h = 0; h < H; ++h) {
     const float* qv = qkv + h * HD;
     for (size_t k = 0; k < len; ++k) {
-      const float* kv;
+      float dot;
       if constexpr (KV16) {
-        accel::f16_to_f32(k16 + k * D + h * HD, kvrow_.data(), HD);
-        kv = kvrow_.data();
+        // 原地升位 + dot (避免中间缓冲跳跳; 升位为 inline 热路径)
+        dot = ar_neon::dot_f16kv(qv, k16 + k * D + h * HD, HD);
       } else {
-        kv = kf32 + k * D + h * HD;
+        dot = ar_neon::dot_f32(qv, kf32 + k * D + h * HD, HD);
       }
-      float dot = 0.f;
-      for (size_t e = 0; e < HD; ++e) dot += qv[e] * kv[e];
       scores_[k] = dot * scale;
     }
     gsv::kern::softmax(scores_.data(), scores_.data(), len);  // 就地稳定 softmax
     float* ov = attn_.data() + h * HD;
     for (size_t k = 0; k < len; ++k) {
       const float p = scores_[k];
-      const float* vv;
       if constexpr (KV16) {
-        accel::f16_to_f32(v16 + k * D + h * HD, kvrow_.data(), HD);
-        vv = kvrow_.data();
+        ar_neon::accum_f16kv(ov, v16 + k * D + h * HD, p, HD);
       } else {
-        vv = vf32 + k * D + h * HD;
+        ar_neon::accum_f32(ov, vf32 + k * D + h * HD, p, HD);
       }
-      for (size_t e = 0; e < HD; ++e) ov[e] += p * vv[e];
     }
   }
 
