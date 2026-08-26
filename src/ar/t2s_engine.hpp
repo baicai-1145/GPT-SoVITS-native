@@ -21,7 +21,7 @@
 #pragma once
 
 #include "kern/accel.hpp"
-#include "kern/gemm_f16_amx.hpp"  // E11-2: prefill AMX 预打包面板
+#include "kern/gemm_f16_amx.hpp"  // E11-2: prefill AMX 预打包面板; E11-5: prefill SDPA AMX
 #include "kern/kern.hpp"
 #include "runtime/gsv_loader.hpp"
 
@@ -166,6 +166,16 @@ class T2SEngine {
   void block_decode_impl(size_t l, float* x, size_t pos, size_t len,
                          float* kf32, uint16_t* k16, float* vf32,
                          uint16_t* v16);
+#ifdef GSV_AMX_GEMM
+  // E11-5: prefill SDPA 走 AMX (Q·K^T + P·V 两次 GEMM per head, 16 头串行复用 scratch)
+  // attn_out 布局 [S, D] 行主, head h 段不连续 (stride D), 内部分散写入。
+  template <bool KV16>
+  void sdpa_amx_prefill(size_t H, size_t S, size_t HD, float scale,
+                        size_t text_len, const float* qkv_buf,
+                        const float* kf32, const uint16_t* k16,
+                        const float* vf32, const uint16_t* v16,
+                        float* attn_out);
+#endif
 
   // generate() 内部使用的 logits 投影(尊重 fp16.gemv)
   void predict_layer_fp(const float* x, float* y);
@@ -192,6 +202,14 @@ class T2SEngine {
   std::vector<uint16_t> prefill_xh_;        // 激活 f16 暂存 [cap_prefill_max*D]
   size_t prefill_cap_ = 0;                  // 已分配 cap(按 S 重分配)
   bool prefill_amx_in_use_ = false;          // 构造期 amx_gemm_available() 快照
+
+  // E11-5: prefill SDPA AMX 路径 scratch — per-head 拼接缓冲与 panel 复用
+  // sdpa_scores_/sdpa_probs_: [S, S] 行主, 16 头串行复用同一片
+  // sdpa_xh_: [max(S,D)] fp16 复用 (供 P fp16 转换 + pack)
+  std::vector<float> sdpa_scores_;
+  std::vector<float> sdpa_probs_;
+  std::vector<uint16_t> sdpa_xh_;
+  size_t sdpa_cap_ = 0;
 
   // scratch(generate 内复用)
   std::vector<std::vector<float>> kc_, vc_; // 每层 KV cache [cap*D] (fp32 模式)
