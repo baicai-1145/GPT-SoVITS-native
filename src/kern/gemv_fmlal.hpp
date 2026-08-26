@@ -6,6 +6,7 @@
 // ARCHITECTURE §3 两步走第二步的设计噪声来源。
 #pragma once
 
+#include <arm_neon.h>
 #include <cstddef>
 #include <stdint.h>
 
@@ -13,6 +14,12 @@ namespace gsv::kern {
 
 // fp32 → fp16 位型批量转换(NEON vcvth_f16, 就近舍入)
 void f32_to_f16(const float* src, uint16_t* dst, size_t n);
+
+// E8: 单点 fp32 → fp16 位型转换(vcvth_f16, 就近舍入; 与批量版同位级)
+inline uint16_t f32_to_f16_scalar(float v) {
+  const float16x4_t h = vcvt_f16_f32(vdupq_n_f32(v));
+  return vget_lane_u16(vreinterpret_u16_f16(h), 0);
+}
 
 // 热路径 GEMV: y[out] = W[out,in]·xh[in]; W/xh 均 fp16 raw(row-major),
 // FMLAL(fp16×fp16→fp32) 累加, 累加器与输出 fp32。in 建议为 8 的倍数(尾部标量兜底)。

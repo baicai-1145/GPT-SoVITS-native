@@ -52,6 +52,7 @@ struct PipelineOptions {
   // E4: AR 采样对齐 python (--sample; 空=贪心默认, golden 位级口径)
   ar::SamplingParams ar_sampling;   // 默认 mode=Greedy
   bool ar_sample_on = false;        // true 时把 ar_sampling 传给 generate
+  bool bert_amx = false;   // E8: BERT dense 接入 AMX 后端 (--amx-bert; 默认关)
 };
 
 struct SegmentResult {

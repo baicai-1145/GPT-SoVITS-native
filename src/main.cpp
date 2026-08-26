@@ -26,6 +26,9 @@
 
 #include "runtime/pipeline.hpp"
 #include "sovits/wav_writer.hpp"
+#if defined(GSV_AMX_GEMM)
+#include "bert/bert_ops.hpp"
+#endif
 
 namespace {
 
@@ -64,6 +67,8 @@ void printHelp(const char* argv0) {
       "  --sample          AR 采样对齐 python(top_k=15/pen=1.35, 根治长文本复读; 默认贪心=位级口径)\n"
       "  --sample-top-k N  自定义 top_k (隐含 --sample)\n"
       "  --sample-seed S   采样种子(默认随机)\n"
+      "  --amx-bert        BERT dense 层启用 AMX fp16 GEMM(实验; 默认关;\n"
+      "                    影响文本前端 roberta/G2PW 计算时长, 数值位级一致)\n"
       "  -h/--help         本帮助\n",
       argv0);
 }
@@ -119,6 +124,12 @@ int main(int argc, char** argv) {
       opt.overlap = true;
     } else if (a == "--amx") {
       opt.sovits_amx = true;
+    } else if (a == "--amx-bert") {
+#if defined(GSV_AMX_GEMM)
+      // E8: BERT dense 层切换 AMX (roberta/G2PW 共用); 权重 panel 在
+      // Linear::load 期预打包, 与 SoVITS AMX 解耦开关。
+      opt.bert_amx = true;
+#endif
     } else if (a == "--fp16") {
       opt.ar_fp16_kv = true;
     } else if (a == "--fp16-all") {
