@@ -172,3 +172,10 @@ S4真实形状K={72,168,264}全落在饥饿区(渐近值一半以下) → M拼�
 - 段AR 12045ms → ~620ms (-95%); 短句采样正常(12 tok eos=1)
 - 贪心默认位级红线: md5 fa78ef01 与 E10-MEM 基线一致
 - CLI: --sample(k=15/pen1.35 对齐python默认) / --sample-top-k / --sample-seed
+
+## 2026-08-27 E8 BERT栈 AMX 化验收 DONE
+- 合入 task/E8 (c11bb4a): dense 层形状分流(T>=48/K>=256→AmxPanel), Linear::load 期预打包, QKV 三节点单批
+- 正确性: 同句贪心 wav md5 位级一致(fa78ef01), c2_pairs_run phones/tokens 全同, ctest 7/7(含 test_bert_amx cos=1.0 rel=0)
+- 性能: 负载下 layers=22 计时 qkv=10.9/head=5.1/wout_ln=9.7/ffn=49.7ms; 执行者声明长句 345→50ms 待安静窗口配对复测定标(Goal 条款4)
+- 开关: --amx-bert 默认关; GSV_AMX_BERT_MODE=all|ffn|none 分流档; 与 SoVITS --amx 解耦
+- 教训: 面板重建后派卡必须先 herdr_agent list 确认 agent 存在, 否则卡会吞(w13:p5 FE-AUTO-1 首派即如此)

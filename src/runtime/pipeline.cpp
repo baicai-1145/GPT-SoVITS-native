@@ -12,9 +12,6 @@
 #include <filesystem>
 #include <initializer_list>
 #include <random>
-#if defined(GSV_AMX_GEMM)
-#include "bert/bert_ops.hpp"  // E8: amx_bert_enabled() 探针接线
-#endif
 
 #include "runtime/threadpool.hpp"
 #include "runtime/wav.hpp"
@@ -196,10 +193,6 @@ bool Pipeline::load(const std::string& weightsDir, const std::string& dataDir,
     profMark("tokenizer_vocab", &tStage);
 
     bert_.cfg = bert::BertConfig{};  // roberta-wwm-ext-large 默认即此
-#if defined(GSV_AMX_GEMM)
-    // E8: 装载前使能 — Linear::load 据此决定是否预打包 AMX 权重 panel。
-    bert::amx_bert_enabled() = opt_.bert_amx;
-#endif
     fBert_ = std::make_unique<rt::GsvFile>(
         joinPath(weightsDir, "roberta_wwm_ext_large.gsv"));
     fBert_->prefetch();  // GsvFile 内映射续期 WILLNEED (幂等)
@@ -378,22 +371,16 @@ Feat featurize(const textfront::TextFrontend* tf,
                const textfront::ChineseG2p* g2pNorm, const BertTokenizer* tok,
                const bert::BertModel& bm, const std::string& utf8,
                std::string* /*err*/) {
-  // E8: GSV_FRONT_TIMING 探针 — 拆分 text 段为 jieba+g2p / roberta forward /
-  //     特征抽取 阶段(stderr)。决策者口径: roberta 21 层 forward 占 ~98%
-  //     (长句 L=54 实测 213ms); 切到 AMX 后应显著下降。
-  const double tFeat0 = nowMs();
-  const bool ft = (std::getenv("GSV_FRONT_TIMING") != nullptr);
+  const double tf0 = nowMs();
   textfront::TextFrontend::Result one;
   if (!tf->process(utf8, &one, /*cutMethod=*/0))
     throw std::runtime_error(one.error);
-  const double tFeat1 = nowMs();
+  if (std::getenv("GSV_FRONT_TIMING"))
+    std::fprintf(stderr, "[front] tf.process(jieba+g2pw规则+g2pwBERT)=%.1fms\n", nowMs()-tf0);
   Feat f;
   f.phones.assign(one.phones.begin(), one.phones.end());
   f.word2ph = one.word2ph;
-  if (f.phones.empty()) {
-    if (ft) std::fprintf(stderr, "[front-timing] text='%s' jieba+g2p=%.2f bert=0.00 (empty)\n", utf8.c_str(), tFeat1 - tFeat0);
-    return f;
-  }
+  if (f.phones.empty()) return f;
   if (f.word2ph.empty()) throw std::runtime_error("word2ph 为空: " + utf8);
 
   // BERT 输入文本必须与 word2ph 同基准: process(cut0) 会按 splitSentences
@@ -404,6 +391,7 @@ Feat featurize(const textfront::TextFrontend* tf,
   std::vector<int64_t> ids, tt, amask;
   tok->encode(f.normU8, &ids, &tt, &amask);
   // roberta forward 至 layer21 输出 (hidden_states[-3]); 权重只读复用。
+  const double bt0 = nowMs();
   const size_t Ln = ids.size(), C = bm.cfg.hidden;
   bert::Matrix x;
   x.reset(Ln, C);
@@ -416,27 +404,16 @@ Feat featurize(const textfront::TextFrontend* tf,
   std::vector<float> ext(Ln);
   for (size_t j = 0; j < Ln; ++j)
     ext[j] = (1.f - float(amask[j])) * bm.cfg.mask_neg;
-  const double tFeat2 = nowMs();
   bert::Matrix y, scr, ctxh;
+  struct FrontBertTiming { double v = 0; };
+  static thread_local double s_bert_ms = 0; (void)s_bert_ms;
   const size_t stopAt = bm.cfg.layers - 3;
-  if (bert::bert_layer_timing_on()) {
-    auto& lt = bert::last_layer_timing();
-    lt.qkv = lt.head = lt.wout_ln = lt.ffn = 0;
-  }
   for (size_t i = 0; i <= stopAt; ++i) {
     bm.stack[i].forward(x, ext, y, scr, ctxh);
     x.d.swap(y.d);
   }
-  const double tFeat3 = nowMs();
-  if (bert::bert_layer_timing_on()) {
-    // featurize 直接驱动 stack.forward (不经过 BertModel::forward),
-    // 此处汇总同一 probe 的累计值。
-    const auto& lt = bert::last_layer_timing();
-    std::fprintf(stderr,
-                 "[bert-layer-timing] layers=%zu qkv=%.1f head=%.1f "
-                 "wout_ln=%.1f ffn=%.1f (ms)\n",
-                 stopAt + 1, lt.qkv, lt.head, lt.wout_ln, lt.ffn);
-  }
+  if (std::getenv("GSV_FRONT_TIMING"))
+    std::fprintf(stderr, "[front] roberta 21层 forward=%.1fms (L=%zu)\n", nowMs()-bt0, Ln);
 
   const size_t nPhones = f.phones.size();
   f.bert.assign(nPhones * 1024, 0.f);
@@ -445,7 +422,10 @@ Feat featurize(const textfront::TextFrontend* tf,
     // 混合中英段: B10 的 EN 片词 word2ph 是"每词 token"粒度(总和仍=phones),
     // 与 get_bert_feature 的按字符索引不兼容 —— CPUFast 对非 zh 语言本就置零
     // (get_bert_inf)。此处同样置零并告警; 契约细化待决策者/B6 裁定。
-    if (ft) std::fprintf(stderr, "[front-timing] text='%s' jieba+g2p=%.2f bert=%.2f feat=0.00 (mixed-zh)\n", utf8.c_str(), tFeat1 - tFeat0, tFeat3 - tFeat2);
+    std::fprintf(stderr,
+                 "[pipeline] 警告: 混合/英文段 word2ph(%zu)!=字符数(%zu), "
+                 "该段 BERT 特征置零 (%s)\n",
+                 f.word2ph.size(), charN, f.normU8.c_str());
     return f;
   }
   if (Ln >= charN + 2) {
@@ -460,14 +440,6 @@ Feat featurize(const textfront::TextFrontend* tf,
   } else {
     std::fprintf(stderr, "[pipeline] 警告: token 数不足, BERT 特征置零 (%s)\n",
                  f.normU8.c_str());
-  }
-  const double tFeat4 = nowMs();
-  if (ft) {
-    std::fprintf(stderr,
-                 "[front-timing] text='%s' Ln=%zu jieba+g2p=%.2f "
-                 "bert=%.2f feat=%.2f total=%.2f\n",
-                 utf8.c_str(), Ln, tFeat1 - tFeat0, tFeat3 - tFeat2,
-                 tFeat4 - tFeat3, tFeat4 - tFeat0);
   }
   return f;
 }
