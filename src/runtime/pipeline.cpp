@@ -16,6 +16,10 @@
 #include "runtime/threadpool.hpp"
 #include "runtime/wav.hpp"
 #include "sovits/wav_writer.hpp"
+#if defined(GSV_AMX_GEMM)
+#include "encoder/hubert.hpp"  // E12: amx_hubert_enabled() 装载期接线
+#include "encoder/sv.hpp"     // E12: amx_sv_enabled() 装载期接线
+#endif
 
 namespace gsv::rt::pipeline {
 
@@ -237,7 +241,21 @@ bool Pipeline::load(const std::string& weightsDir, const std::string& dataDir,
     profMark("sovits_load(460MB+pack)", &tStage);
     cond_.load(*fSov_);
     profMark("cond_load", &tStage);
+#if defined(GSV_AMX_GEMM)
+    // E12: SV 装载前使能 — SvEngine 构造期据此预打包 conv panel。
+    // GSV_AMX_ENC_SUB=nosv 可关掉 SV(隔离验收用)
+    const char* sub2 = std::getenv("GSV_AMX_ENC_SUB");
+    const bool no_sv = sub2 && std::string(sub2).find("nosv") != std::string::npos;
+    encoder::amx_sv_enabled() = opt_.enc_amx && !no_sv;
+#endif
     fHub_ = std::make_unique<rt::GsvFile>(joinPath(weightsDir, "hubert_base.gsv"));
+#if defined(GSV_AMX_GEMM)
+    // E12: 装载前使能 — HubertEngine 构造期据此预打包 dense panel。
+    // GSV_AMX_ENC_SUB=nohub 可关掉 HuBERT(隔离验收用)
+    const char* sub = std::getenv("GSV_AMX_ENC_SUB");
+    const bool no_hub = sub && std::string(sub).find("nohub") != std::string::npos;
+    encoder::amx_hubert_enabled() = opt_.enc_amx && !no_hub;
+#endif
     hubert_ = std::make_unique<encoder::HubertEngine>(*fHub_);
     profMark("hubert_load(531MB)", &tStage);
     fSv_ = std::make_unique<rt::GsvFile>(
@@ -270,6 +288,9 @@ bool Pipeline::buildReference(const std::string& refWavPath, SynthResult* out,
   }
 
   try {
+    // E12: GSV_REF_TIMING 探针 — 编码侧分段耗时(--no-cache 口径 stderr 输出)。
+    const bool refTim = std::getenv("GSV_REF_TIMING") != nullptr;
+    const double tRef0 = nowMs();
     // ---- 解码源文件 (mono float @原采样率) ----
     rt::wav::WavFile w = rt::wav::load_wav(refWavPath);
     if (w.samples.empty()) throw std::runtime_error("空音频: " + refWavPath);
@@ -291,12 +312,11 @@ bool Pipeline::buildReference(const std::string& refWavPath, SynthResult* out,
     std::vector<float> fbank =
         encoder::kaldi_fbank_80(a16cond.data(), a16cond.size(), nullptr);
     size_t frames80 = fbank.size() / 80;
-    const double sv0 = nowMs();
+    const double tSv0 = nowMs();
     sv_->forward3(fbank.data(), frames80);
-    if (std::getenv("GSV_REF_TIMING")) std::fprintf(stderr, "[ref] sv.forward3=%.1fms frames=%zu\n", nowMs()-sv0, frames80);
+    const double tSv1 = nowMs();
     std::vector<float> svEmb(sv_->emb_out());  // [20480]
 
-    const double hb_setup0 = nowMs();
     // prompt_semantic: 原始音频直接 → 16k (+9600 零) → HuBERT → ssl_proj → RVQ
     Resampler to16raw;
     to16raw.init(int(w.sample_rate), 16000);
@@ -313,14 +333,21 @@ bool Pipeline::buildReference(const std::string& refWavPath, SynthResult* out,
 
     // 条件链 (spec → ref_enc → ge/ge_text)
     cond_.compute(a32.data(), a32.size(), svEmb.data(), &out->cond);
+    const double tCond = nowMs();
 
     // HuBERT: 零尾填充与 CPUFast 一致 (cat[wav16k, zeros(9600)])
     std::vector<float> hubIn(wav16k);
     hubIn.insert(hubIn.end(), kSilence, 0.f);  // 0.3s@32k 的零段, CPUFast 同款
-    if (std::getenv("GSV_REF_TIMING")) std::fprintf(stderr, "[ref] 重采样+fbank=%.1fms\n", nowMs()-hb_setup0);
-    const double hb0 = nowMs();
     const size_t T = hubert_->run(hubIn.data(), hubIn.size());
-    if (std::getenv("GSV_REF_TIMING")) std::fprintf(stderr, "[ref] hubert.run=%.1fms T=%zu\n", nowMs()-hb0, T);
+    const double tHub = nowMs();
+    if (refTim) {
+      std::fprintf(stderr,
+                   "[ref-timing] sv.forward3=%.0fms(%zu帧) cond=%.0fms "
+                   "hubert.run=%.0fms(T=%zu) 前处理(resample+fbank+load)=%.0fms "
+                   "合计=%.0fms\n",
+                   tSv1 - tSv0, frames80, tCond - tSv1, tHub - tCond, T,
+                   tSv0 - tRef0, tHub - tRef0);
+    }
     const std::vector<float>& hidden = hubert_->out();  // [T,768]
 
     // extract_latent: v2ProPlus semantic_frame_rate="25hz" ⇒

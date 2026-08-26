@@ -18,6 +18,9 @@
 
 #include "kern/accel.hpp"
 #include "kern/gemv_fmlal.hpp"
+#if defined(GSV_AMX_GEMM)
+#include "kern/gemm_f16_amx.hpp"
+#endif
 
 #include <cstddef>
 #include <vector>
@@ -29,6 +32,13 @@ class GsvFile;
 namespace gsv::encoder {
 
 namespace accel = kern::accel;
+
+// E12: 进程级 HuBERT AMX 使能(--amx-enc; 装载前设置)。分流模式同 E8:
+// all = QKV/OUT/W1/W2 全切; ffn = 仅 FFN; none = 全 FMLAL。
+bool& amx_hubert_enabled();
+
+enum class AmxEncMode { kAll, kFfnOnly, kNone };
+AmxEncMode& amx_hubert_mode();
 
 class HubertEngine {
  public:
@@ -57,9 +67,16 @@ class HubertEngine {
   void conv_layer(int li, const std::vector<float>& in, int in_c, size_t in_len,
                   std::vector<float>& out, int& out_c, size_t& out_len);
 
+  // E12: 进程级 AMX 使能(--amx-enc 开关; 装载前设置), 分流门槛同 E8 bert 口径。
+  friend bool& amx_hubert_enabled();
+
   struct Dense {
     accel::DenseF16 w;
     std::vector<float> b;
+#if defined(GSV_AMX_GEMM)
+    kern::AmxPanel w_panel;      // E12: 装载期预打包(生命周期 = GsvFile 同域)
+    bool w_panel_ready = false;
+#endif
   };
 
   struct Layer {
@@ -72,6 +89,14 @@ class HubertEngine {
   int conv_dim_[7]{}, conv_kernel_[7]{}, conv_stride_[7]{};
   int conv_pos_k_ = 128, conv_pos_groups_ = 16;
   double ln_eps_ = 1e-5;
+
+#if defined(GSV_AMX_GEMM)
+  bool layer_qkv_batch_ready(const Layer& L) const;  // 定义在 .cpp (Layer 完整型后)
+  // E12: AMX dense 前向 y[T,out] = x·Wᵀ+b; 激活 panel 缓冲由调用方复用。
+  void dense_amx(const Dense& d, const float* x, size_t T, float* y,
+                 std::vector<uint8_t>& act_scratch, size_t in_dim,
+                 const std::vector<float>& bias) const;
+#endif
 
   struct ConvL {
     const uint16_t* w16 = nullptr;  // [out, in*k] fp16 直读
@@ -94,6 +119,9 @@ class HubertEngine {
   size_t cnn_t_ = 0;
   std::vector<uint16_t> xh_;      // fp16 激活暂存(DenseF16 view FMLAL 前向复用)
   std::vector<uint16_t> cols16_;  // fp16 im2col 暂存(CNN/pos_conv FMLAL 用)
+#if defined(GSV_AMX_GEMM)
+  std::vector<uint8_t> hub_act_scratch_;  // E12: AMX 激活 panel 缓冲(容量复用)
+#endif
   // 对拍捕获
   std::vector<float> cap_pos_, cap_encln_, cap_l0attn_, cap_l0ln1_, cap_l0ffn_,
       cap_l0ln2_;

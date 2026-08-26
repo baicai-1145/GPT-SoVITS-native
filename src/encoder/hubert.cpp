@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -14,6 +15,26 @@ namespace gsv::encoder {
 
 using rt::GsvFile;
 using rt::TensorView;
+
+// E12: 进程级 AMX 开关与分流模式(与 E8 bert 同口径)
+bool& amx_hubert_enabled() {
+  static bool b = false;
+  return b;
+}
+AmxEncMode& amx_hubert_mode() {
+  static AmxEncMode m = [] {
+    const char* e = std::getenv("GSV_AMX_HUBERT_MODE");
+    if (!e) return AmxEncMode::kAll;
+    if (e[0] == 'f') return AmxEncMode::kFfnOnly;
+    if (e[0] == 'n') return AmxEncMode::kNone;
+    return AmxEncMode::kAll;
+  }();
+  return m;
+}
+
+// E12 分流门槛(与 E8 bert 一致): T≥48(tile 半填充以上)且 K≥256
+constexpr size_t kAmxEncMinRows = 48;
+constexpr size_t kAmxEncMinK = 256;
 
 HubertEngine::HubertEngine(const GsvFile& f) {
   // ---- config JSON(版本锁: 形状全部来自配置) ----
@@ -64,6 +85,17 @@ HubertEngine::HubertEngine(const GsvFile& f) {
       throw std::runtime_error(std::string(name) + ": 形状/f16 段不符");
     Dense d;
     d.w = accel::DenseF16::view_f16(t.data_f16_raw(), rows, cols);  // 零拷贝 FMLAL
+#if defined(GSV_AMX_GEMM)
+    // E12: 装载期预打包权重 panel(生命周期与 GsvFile 映射同域); 小 K 不打。
+    if (amx_hubert_enabled() && amx_hubert_mode() == AmxEncMode::kAll &&
+        kern::amx_gemm_available() && cols >= kAmxEncMinK &&
+        rows >= kAmxEncMinK) {
+      d.w_panel.rows = rows;
+      d.w_panel.K = cols;
+      kern::amx_pack_into(t.data_f16_raw(), rows, cols, d.w_panel.buf);
+      d.w_panel_ready = true;
+    }
+#endif
     return d;
   };
 
@@ -129,10 +161,93 @@ HubertEngine::HubertEngine(const GsvFile& f) {
   }
 }
 
+#if defined(GSV_AMX_GEMM)
+namespace {
+
+// E12: 与 E8 bert::cast_pack_B_f32_to_panel 同构的 fp32 激活 → panel 直写
+// (含尾 tile 补零; 热路径 reserve+resize 免重复 memset)。
+void cast_pack_B_f32(const float* x_fp32, size_t T, size_t K,
+                     std::vector<uint8_t>& out_buf) {
+  const size_t nt = (T + 31) / 32;
+  const size_t need = nt * K * 64 + 64;
+  if (out_buf.capacity() < need) out_buf.reserve(need);
+  out_buf.resize(need);
+  const uintptr_t p = (uintptr_t)out_buf.data();
+  uint8_t* dst = out_buf.data() + ((64 - (p & 63)) & 63);
+  if (const size_t tr_last = T - (nt - 1) * 32; tr_last < 32) {
+    uint8_t* d_tail = dst + (nt - 1) * K * 64;
+    const size_t zoff = tr_last * 2;
+    for (size_t k = 0; k < K; ++k)
+      std::memset(d_tail + k * 64 + zoff, 0, 64 - zoff);
+  }
+  for (size_t t = 0; t < nt; ++t) {
+    const size_t r0 = t * 32;
+    const size_t tr = std::min<size_t>(32, T - r0);
+    uint8_t* d = dst + t * K * 64;
+    if (tr == 32) {
+      for (size_t r = 0; r < 32; ++r) {
+        const float* src = x_fp32 + (r0 + r) * K;
+        uint16_t* col = reinterpret_cast<uint16_t*>(d + r * 2);
+        size_t k = 0;
+        for (; k + 8 <= K; k += 8) {
+          // 8k 跨步写: dst[k*64+r*2] 连续相邻不重叠 — 标量足够(打包占 GEMM <5%)
+          for (int j = 0; j < 8; ++j)
+            col[(k + j) * 32] = kern::f32_to_f16_scalar(src[k + j]);
+        }
+        for (; k < K; ++k) col[k * 32] = kern::f32_to_f16_scalar(src[k]);
+      }
+    } else {
+      for (size_t r = 0; r < tr; ++r) {
+        const float* src = x_fp32 + (r0 + r) * K;
+        uint16_t* col = reinterpret_cast<uint16_t*>(d + r * 2);
+        for (size_t k = 0; k < K; ++k) col[k * 32] = kern::f32_to_f16_scalar(src[k]);
+      }
+      // 尾行已在顶部统一补零; 此处无需再清
+    }
+  }
+}
+
+}  // namespace
+#endif  // GSV_AMX_GEMM
+
 void HubertEngine::gelu(float* x, size_t n) {
   for (size_t i = 0; i < n; ++i)
     x[i] = 0.5f * x[i] * (1.0f + std::erf(x[i] * static_cast<float>(M_SQRT1_2)));
 }
+
+#if defined(GSV_AMX_GEMM)
+// E12: AMX dense — y[T,out] = x[T,in]·W[out,in]ᵀ + bias(与 FMLAL 同口径逐元素加)
+// 注: pb.buf 用 swap 而非 move — amx_batch_run 返回后面板寿命结束,
+// 缓冲容量经 pb 析构流回调用方(act_scratch), 容量跨调用复用免反复 malloc。
+void HubertEngine::dense_amx(const Dense& d, const float* x, size_t T, float* y,
+                             std::vector<uint8_t>& act_scratch, size_t in_dim,
+                             const std::vector<float>& bias) const {
+  cast_pack_B_f32(x, T, in_dim, act_scratch);
+  kern::AmxPanel pb;
+  pb.rows = T;
+  pb.K = in_dim;
+  // 契约: buf 首地址需 64B 对齐 — cast_pack_B 已保证 data() 对齐基址。
+  pb.buf.swap(act_scratch);
+  kern::AmxBatchNode nd;
+  nd.phase = 0;
+  nd.pa = &pb;          // 激活侧 [T,K]
+  nd.pb = &d.w_panel;   // 权重侧 [out,K]
+  nd.c = y;
+  nd.M = T;
+  nd.N = d.w_panel.rows;
+  kern::amx_batch_run(&nd, 1);
+  pb.buf.swap(act_scratch);  // 收回容量
+  if (!bias.empty()) {
+    const size_t out = d.w_panel.rows;
+    for (size_t t = 0; t < T; ++t)
+      for (size_t o = 0; o < out; ++o) y[t * out + o] += bias[o];
+  }
+}
+
+bool HubertEngine::layer_qkv_batch_ready(const Layer& L) const {
+  return L.q.w_panel_ready && L.k.w_panel_ready && L.v.w_panel_ready;
+}
+#endif
 
 // CNN 单层: valid 卷积(fp16 路径)。im2col 量化到 fp16 cols16_, 权重 fp16 直读,
 // gemm_f16x_fmlal: out[out_c, T] = W[out_c, in*k]·colsᵀ (FMLAL 融合 fp32 累加,
@@ -199,8 +314,16 @@ size_t HubertEngine::run(const float* waveform, size_t n) {
                          proj_ln_b_.data(), tmp_.data() + t * conv_dim_[6], conv_dim_[6],
                          ln_eps_);
   x_.resize(T * hidden_);
-  proj_.w.forward(tmp_.data(), T, x_.data(), xh_);
-  for (size_t i = 0; i < T * hidden_; ++i) x_[i] += proj_.b[i % hidden_];
+#if defined(GSV_AMX_GEMM)
+  if (proj_.w_panel_ready && T >= kAmxEncMinRows) {
+    dense_amx(proj_, tmp_.data(), T, x_.data(), hub_act_scratch_, conv_dim_[6],
+              proj_.b);
+  } else
+#endif
+  {
+    proj_.w.forward(tmp_.data(), T, x_.data(), xh_);
+    for (size_t i = 0; i < T * hidden_; ++i) x_[i] += proj_.b[i % hidden_];
+  }
   proj_o_ = x_;
 
   // ---- pos_conv: 分组卷积(pad=K/2 双侧, 输出 T+1 帧) → SamePad 去尾 → GELU → x += · ----
@@ -267,14 +390,45 @@ size_t HubertEngine::run(const float* waveform, size_t n) {
     float* qp = qkv_.data();
     float* kp = qp + T * hidden_;
     float* vp = kp + T * hidden_;
-    L.q.w.forward(x_.data(), T, qp, xh_);
-    L.k.w.forward(x_.data(), T, kp, xh_);
-    L.v.w.forward(x_.data(), T, vp, xh_);
-    for (size_t t = 0; t < T; ++t) {
-      for (int i = 0; i < hidden_; ++i) {
-        qp[t * hidden_ + i] += L.q.b[static_cast<size_t>(i)];
-        kp[t * hidden_ + i] += L.k.b[static_cast<size_t>(i)];
-        vp[t * hidden_ + i] += L.v.b[static_cast<size_t>(i)];
+#if defined(GSV_AMX_GEMM)
+    if (layer_qkv_batch_ready(L) && T >= kAmxEncMinRows) {
+      // E12: QKV 同批三联派发(共享激活 panel, 省两次池往返 — E8 同配方)
+      cast_pack_B_f32(x_.data(), T, size_t(hidden_), hub_act_scratch_);
+      kern::AmxPanel pb;
+      pb.rows = T;
+      pb.K = size_t(hidden_);
+      pb.buf.swap(hub_act_scratch_);
+      kern::AmxBatchNode nd[3];
+      for (int i = 0; i < 3; ++i) {
+        const Dense& d = i == 0 ? L.q : (i == 1 ? L.k : L.v);
+        nd[i].phase = 0;
+        nd[i].pa = &pb;
+        nd[i].pb = &d.w_panel;
+        nd[i].c = i == 0 ? qp : (i == 1 ? kp : vp);
+        nd[i].M = T;
+        nd[i].N = d.w_panel.rows;
+      }
+      kern::amx_batch_run(nd, 3);
+      pb.buf.swap(hub_act_scratch_);
+      auto addb = [&](float* p, const std::vector<float>& b) {
+        for (size_t t2 = 0; t2 < T; ++t2)
+          for (int i2 = 0; i2 < hidden_; ++i2) p[t2 * hidden_ + i2] += b[size_t(i2)];
+      };
+      addb(qp, L.q.b);
+      addb(kp, L.k.b);
+      addb(vp, L.v.b);
+    } else
+#endif
+    {
+      L.q.w.forward(x_.data(), T, qp, xh_);
+      L.k.w.forward(x_.data(), T, kp, xh_);
+      L.v.w.forward(x_.data(), T, vp, xh_);
+      for (size_t t = 0; t < T; ++t) {
+        for (int i = 0; i < hidden_; ++i) {
+          qp[t * hidden_ + i] += L.q.b[static_cast<size_t>(i)];
+          kp[t * hidden_ + i] += L.k.b[static_cast<size_t>(i)];
+          vp[t * hidden_ + i] += L.v.b[static_cast<size_t>(i)];
+        }
       }
     }
     // SDPA(无掩码): 每 head 独立
@@ -299,8 +453,15 @@ size_t HubertEngine::run(const float* waveform, size_t n) {
     }
     // out proj + 残差 + post-LN
     resid_ = x_;                                   // attn_residual
-    L.o.w.forward(att_.data(), T, x_.data(), xh_);
-    for (size_t i = 0; i < T * hidden_; ++i) x_[i] += L.o.b[i % hidden_];
+#if defined(GSV_AMX_GEMM)
+    if (L.o.w_panel_ready && T >= kAmxEncMinRows) {
+      dense_amx(L.o, att_.data(), T, x_.data(), hub_act_scratch_, size_t(hidden_), L.o.b);
+    } else
+#endif
+    {
+      L.o.w.forward(att_.data(), T, x_.data(), xh_);
+      for (size_t i = 0; i < T * hidden_; ++i) x_[i] += L.o.b[i % hidden_];
+    }
     if (l == 0) cap_l0attn_.assign(x_.begin(), x_.begin() + static_cast<long>(T * hidden_));
     for (size_t i = 0; i < T * hidden_; ++i) x_[i] += resid_[i];
     for (size_t t = 0; t < T; ++t)
@@ -309,12 +470,26 @@ size_t HubertEngine::run(const float* waveform, size_t n) {
     if (l == 0) cap_l0ln1_ = x_;
     // FFN(GELU) + 残差 + final LN
     ff_.resize(T * inter_);
-    L.f1.w.forward(x_.data(), T, ff_.data(), xh_);
-    for (size_t i = 0; i < T * inter_; ++i) ff_[i] += L.f1.b[i % inter_];
+#if defined(GSV_AMX_GEMM)
+    if (L.f1.w_panel_ready && T >= kAmxEncMinRows) {
+      dense_amx(L.f1, x_.data(), T, ff_.data(), hub_act_scratch_, size_t(hidden_), L.f1.b);
+    } else
+#endif
+    {
+      L.f1.w.forward(x_.data(), T, ff_.data(), xh_);
+      for (size_t i = 0; i < T * inter_; ++i) ff_[i] += L.f1.b[i % inter_];
+    }
     gelu(ff_.data(), ff_.size());
     resid_ = x_;
-    L.f2.w.forward(ff_.data(), T, x_.data(), xh_);
-    for (size_t i = 0; i < T * hidden_; ++i) x_[i] += L.f2.b[i % hidden_];
+#if defined(GSV_AMX_GEMM)
+    if (L.f2.w_panel_ready && T >= kAmxEncMinRows) {
+      dense_amx(L.f2, ff_.data(), T, x_.data(), hub_act_scratch_, size_t(inter_), L.f2.b);
+    } else
+#endif
+    {
+      L.f2.w.forward(ff_.data(), T, x_.data(), xh_);
+      for (size_t i = 0; i < T * hidden_; ++i) x_[i] += L.f2.b[i % hidden_];
+    }
     if (l == 0) cap_l0ffn_.assign(x_.begin(), x_.begin() + static_cast<long>(T * hidden_));
     for (size_t i = 0; i < T * hidden_; ++i) x_[i] += resid_[i];
     for (size_t t = 0; t < T; ++t)

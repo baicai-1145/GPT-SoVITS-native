@@ -16,6 +16,11 @@
 // 激活 ReLU 实为 Hardtanh(0,20): 上界 20 必须钳位。
 #pragma once
 
+#include "kern/gemv_fmlal.hpp"
+#if defined(GSV_AMX_GEMM)
+#include "kern/gemm_f16_amx.hpp"
+#endif
+
 #include <cstddef>
 #include <vector>
 
@@ -24,6 +29,9 @@ class GsvFile;
 }
 
 namespace gsv::encoder {
+
+// E12: 进程级 SV AMX 使能(--amx-enc 与 HuBERT 共用开关; 装载前设置)。
+bool& amx_sv_enabled();
 
 class SvEngine {
  public:
@@ -48,10 +56,18 @@ class SvEngine {
     const uint16_t* w2 = nullptr;  // [C,inter] 1x1 卷积权重(fp16 直读)
     std::vector<uint16_t> w2_own;  // 无 f16 段时的一次性量化副本(fp16 常驻, 拥有权)
     std::vector<float> b1, b2;  // 两个 1x1 卷积的 bias(local_att Conv2d bias=True!)
+#if defined(GSV_AMX_GEMM)
+    kern::AmxPanel w1_panel, w2_panel;  // E12: 装载期预打包(1x1=dense GEMM)
+    bool w1_panel_ready = false, w2_panel_ready = false;
+#endif
     Bn bn1, bn2;
     int inter = 0, ch = 0;
     void apply(const float* x, const float* ds, float* out, int h, int w,
-               std::vector<uint16_t>& xh, std::vector<uint16_t>& xh2);
+               std::vector<uint16_t>& xh, std::vector<uint16_t>& xh2
+#if defined(GSV_AMX_GEMM)
+               , std::vector<uint8_t>& amx_scratch
+#endif
+               );
     // scratch / 对拍
     std::vector<float> cat_, att_, att_t_;
     std::vector<float> last_out;  // 最近一次 apply 的输出 xo
@@ -63,6 +79,14 @@ class SvEngine {
     const uint16_t* conv1_w = nullptr;  // 1x1 权重摊平 [Co,Ci] (fp16 直读)
     const uint16_t* conv3_w = nullptr;  // 1x1 权重摊平 [exp,Ci] (fp16 直读)
     std::vector<const uint16_t*> convs_w;  // 3x3 权重摊平 [width,width*9] (fp16 直读)
+#if defined(GSV_AMX_GEMM)
+    // E12: 预打包面板 — conv1/conv3/shortcut 为 1x1(=dense); convs_w(3x3)按
+    // 形状分流(S>=kAmxEncMinRows 且 K=in_c*9>=kAmxEncMinK 才打)。
+    kern::AmxPanel conv1_panel, conv3_panel, sc_panel;
+    std::vector<kern::AmxPanel> convs_panels;
+    std::vector<bool> convs_panels_ready;   // 与 convs_w 一一对应
+    bool conv1_panel_ready = false, conv3_panel_ready = false, sc_panel_ready = false;
+#endif
     std::vector<Bn> bns;
     Bn bn1, bn3;
     std::vector<Aff> fuses;                       // scale-1 个(AFF 块才有)
@@ -88,6 +112,10 @@ class SvEngine {
   std::vector<float> conv1_w_;  // [64, 9] stem conv (fp32 常驻, 仅 576 参)
   Bn bn1_;
   const uint16_t* l3ds_w_ = nullptr;   // [2048, 1024*9] fp16 直读
+#if defined(GSV_AMX_GEMM)
+  kern::AmxPanel l3ds_panel_;          // E12: 装载期预打包(形状分流后)
+  bool l3ds_panel_ready_ = false;
+#endif
   Aff fuse34_;
   std::vector<Block> stages_[5];  // 1..4
   int c_after_[5]{};              // 各 stage 输出通道
@@ -98,6 +126,9 @@ class SvEngine {
   std::vector<std::vector<float>> o_layer_;
   std::vector<uint16_t> xh_, xh2_;    // fp16 激活暂存(AFF 转置量化复用)
   std::vector<uint16_t> cols16_;      // fp16 im2col 暂存(conv2d_f16)
+#if defined(GSV_AMX_GEMM)
+  std::vector<uint8_t> sv_act_scratch_;   // E12: AMX 激活 panel 缓冲(容量复用)
+#endif
 
   // 静态 conv2d(fp32 权重, im2col → sgemm('N','T')); 仅 stem conv1(fp32-only 段)使用
   static void conv2d(const float* in, int c_in, int h, int w, const float* wt,
@@ -107,6 +138,12 @@ class SvEngine {
   void conv2d_f16(const float* in, int c_in, int h, int w, const uint16_t* w16,
                   int c_out, int kh, int kw, int stride, int pad,
                   std::vector<float>& cols_unused, std::vector<float>& out);
+#if defined(GSV_AMX_GEMM)
+  // E12: AMX 卷积(激活 panel 直写; 与 conv2d_f16 输出布局位级可对照)
+  void conv2d_amx(const kern::AmxPanel& w_panel, const float* in,
+                  int c_in, int h, int w, int kh, int kw, int stride,
+                  int pad, int c_out, std::vector<float>& out);
+#endif
 };
 
 }  // namespace gsv::encoder
