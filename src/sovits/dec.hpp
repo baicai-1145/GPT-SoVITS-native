@@ -88,8 +88,14 @@ class Generator {
   // pb[3][6] → pb[3][2], 节省 2.9GB (12 panel slot 容量)。
   // 容量保证: 预备时按本 stage max(K_j) 一次 reserve, im2col 内部
   // 严格不缩/不重分配, data() 指针跨 p 复用期间稳定。
+  // E10-MEM-②: tA+tB 跨偶/奇 depth 共享两 buffer T0/T1 (12 张量 → 6 张量),
+  // 保留 cur/tin 分离 (lrelu 数学序与原版 100% 等价)。
+  //   链内 p 串行依赖 (amx_chain_run 显式建模) 保证覆盖安全:
+  //   - T0 跨 p=0,1,4,5 写 (m=0,2 conv1 + m=0,2 conv2 共 4 次)
+  //   - T1 跨 p=2,3 写 (m=1 conv1 + m=1 conv2 共 2 次)
   struct ResBatchScratch {
-    Tensor2D cur[3], tin[3], tA[3][2], tB[3][2];
+    Tensor2D cur[3], tin[3];
+    Tensor2D T0[3], T1[3];
     kern::AmxPanel pb[3][2];
   };
 
@@ -140,7 +146,7 @@ class Generator {
       // 每 j 2 panel slot (ping-pong p%2)
       panel_total += 2 * (nt * K * 64 + 64);
     }
-    const size_t tensor_total = 18 * C * Tn * sizeof(float);
+    const size_t tensor_total = 12 * C * Tn * sizeof(float);
     // 单飞安全: SoVITS stage 为单线程 FIFO, amx_batch_run 阻塞至完成;
     // 静态存活使 pb/张量容量跨调用复用 (免 prepare 内分配)。
     // E10-MEM: 避免 shrink 触发 realloc churn; 容量足仅 size 调, 容量
@@ -172,9 +178,8 @@ class Generator {
             s.pb[j][p].buf.clear();
             s.pb[j][p].buf.shrink_to_fit();
           }
-          // 18 张量也缩回 0 容量, 让 OS 回收 (cur/tin/tA/tB 共 18 个)。
-          for (auto* t : {&s.cur[j], &s.tin[j], &s.tA[j][0], &s.tA[j][1],
-                          &s.tB[j][0], &s.tB[j][1]}) {
+          // 12 张量 (cur+tin+T0+T1) 缩回 0 容量, 让 OS 回收。
+          for (auto* t : {&s.cur[j], &s.tin[j], &s.T0[j], &s.T1[j]}) {
             std::vector<float>().swap(t->d);
             t->C = t->T = 0;
           }
@@ -186,10 +191,8 @@ class Generator {
     for (size_t j = 0; j < kResKernels; ++j) {
       ensure(s.cur[j], C, Tn);
       ensure(s.tin[j], C, Tn);
-      for (int h = 0; h < 2; ++h) {
-        ensure(s.tA[j][h], C, Tn);
-        ensure(s.tB[j][h], C, Tn);
-      }
+      ensure(s.T0[j], C, Tn);
+      ensure(s.T1[j], C, Tn);
     }
 
     const float* xn = x.d.data();
@@ -210,8 +213,8 @@ class Generator {
         kern::AmxPanel& pb = s.pb[j][p & 1];
         pb.rows = Tn;
         pb.K = cv.in_c * cv.k + 1;
-        float* outp = even ? s.tA[j][m & 1].d.data()
-                           : s.tB[j][m & 1].d.data();
+        const bool use_T1 = (m == 1);  // T0 槽 0/2 (m=0,2 conv1 + m=0,2 conv2)
+        float* outp = use_T1 ? s.T1[j].d.data() : s.T0[j].d.data();
         kern::AmxChainLink nd;
         nd.chain_id = static_cast<int>(j);
         nd.depth = static_cast<int>(p);
@@ -220,23 +223,25 @@ class Generator {
         nd.c = outp;
         nd.M = cv.out_c;
         nd.N = Tn;
-        nd.prepare = [j, p, m, even, Tn, nn, xn, cvl = &cv]() {
+        nd.prepare = [j, p, m, even, Tn, nn, xn, use_T1, cvl = &cv]() {
           kern::AmxPanel& pbl = s.pb[j][p & 1];
           if (even) {
-            // cur 初始化/累加, 然后 lrelu(cur) → tin, im2col → panel
+            // cur 初始化/累加, 然后 lrelu_write(cur, tin), im2col(tin) 读
             if (m == 0) {
               std::memcpy(s.cur[j].d.data(), xn, nn * sizeof(float));
             } else {
-              add_inplace(s.cur[j].d.data(),
-                          s.tB[j][(m - 1) & 1].d.data(), nn);
+              // 累加: m=1 读 T0 (p=1 末 conv2_0 输出), m=2 读 T1 (p=3 末 conv2_1)
+              float* prev = (m == 1) ? s.T0[j].d.data() : s.T1[j].d.data();
+              add_inplace(s.cur[j].d.data(), prev, nn);
             }
             leaky_relu_write(s.cur[j].d.data(), s.tin[j].d.data(), nn, 0.1f);
             im2col_to_panel_f16(s.tin[j].d.data(), cvl->in_c, Tn,
                                 cvl->k, cvl->dilation, pbl.buf, true);
           } else {
-            // tA 就地 lrelu 后产 panel (与串行序一致)
-            leaky_relu_io(s.tA[j][m & 1].d.data(), nn, 0.1f);
-            im2col_to_panel_f16(s.tA[j][m & 1].d.data(), cvl->in_c, Tn,
+            // T[m] 就地 lrelu 后产 panel (与串行序一致)
+            float* tm = use_T1 ? s.T1[j].d.data() : s.T0[j].d.data();
+            leaky_relu_io(tm, nn, 0.1f);
+            im2col_to_panel_f16(tm, cvl->in_c, Tn,
                                 cvl->k, cvl->dilation, pbl.buf, true);
           }
         };
@@ -248,9 +253,10 @@ class Generator {
     kern::amx_chain_run(nodes.data(), nodes.size());
     *batch_ms = now_ms_e6() - tb;
 
-    // 三链 sum 累加 (主线程): cur += convs2[2] 输出; sum += cur/3
+    // 三链 sum 累加 (主线程): cur += convs2[2] 输出 (p=5 写 T0, m=2 落 T0);
+    // sum += cur/3
     for (size_t j = 0; j < kResKernels; ++j) {
-      add_inplace(s.cur[j].d.data(), s.tB[j][0].d.data(), nn);
+      add_inplace(s.cur[j].d.data(), s.T0[j].d.data(), nn);
       if (j == 0) {
         mul_write(sum.d.data(), s.cur[j].d.data(), nn, kInv);
       } else {
