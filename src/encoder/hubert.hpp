@@ -125,6 +125,22 @@ class HubertEngine {
   // 对拍捕获
   std::vector<float> cap_pos_, cap_encln_, cap_l0attn_, cap_l0ln1_, cap_l0ffn_,
       cap_l0ln2_;
+
+  // ---- E13 探针(纯观测, 不改行为) ----
+  struct ConvTrace {
+    int in_c, in_len, out_c, k, s, out_len;
+    double ms;
+  };
+  std::vector<ConvTrace> conv_traces_;  // 每次 run 重置; conv_layer 末尾追加
+
+ public:
+  const std::vector<ConvTrace>& conv_traces() const { return conv_traces_; }
+  double sdpa_ms() const { return sdpa_ms_; }
+  bool& sdpa_timing_enabled() { return sdpaTim; }
+
+ private:
+  double sdpa_ms_ = 0.0;
+  bool sdpaTim = false;
 };
 
 }  // namespace gsv::encoder

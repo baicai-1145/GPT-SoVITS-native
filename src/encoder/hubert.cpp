@@ -5,7 +5,9 @@
 #include "runtime/gsv_loader.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -254,6 +256,11 @@ bool HubertEngine::layer_qkv_batch_ready(const Layer& L) const {
 // 通道主输出零转置, 后续 GroupNorm/下一层卷积直接消费)。
 void HubertEngine::conv_layer(int li, const std::vector<float>& in, int in_c, size_t in_len,
                               std::vector<float>& out, int& out_c, size_t& out_len) {
+  // E13 探针: GSV_BERT_CONV_TIMING=1 时逐 CNN 层计时与形状收集(只计时不改行为)
+  using clk = std::chrono::steady_clock;
+  static thread_local clk::time_point tp_conv0;
+  const bool convTim = std::getenv("GSV_BERT_CONV_TIMING") != nullptr;
+  if (convTim) tp_conv0 = clk::now();
   const int k = conv_kernel_[li], s = conv_stride_[li];
   const size_t T = (in_len - static_cast<size_t>(k)) / static_cast<size_t>(s) + 1;
   out_c = conv_dim_[li];
@@ -271,10 +278,30 @@ void HubertEngine::conv_layer(int li, const std::vector<float>& in, int in_c, si
   kern::gemm_f16x_fmlal(convs_[li].w16, cols16_.data(), out.data(),
                         static_cast<size_t>(out_c), T, KK);
   out_len = T;
+  if (convTim) {
+    const double gemm_ms = std::chrono::duration<double, std::milli>(
+                               clk::now() - tp_conv0).count();
+    ConvTrace t;
+    t.in_c = in_c;
+    t.in_len = static_cast<int>(in_len);
+    t.out_c = out_c;
+    t.k = k;
+    t.s = s;
+    t.out_len = static_cast<int>(T);
+    t.ms = gemm_ms;
+    conv_traces_.push_back(t);
+  }
 }
 
 size_t HubertEngine::run(const float* waveform, size_t n) {
+  // E13 探针: GSV_BERT_CONV_TIMING=1 时清空上一轮 trace, GSV_HUBERT_SDPA_TIMING=1 计 SDPA
+  using clk = std::chrono::steady_clock;
+  conv_traces_.clear();
+  sdpa_ms_ = 0.0;
+  sdpaTim = std::getenv("GSV_HUBERT_SDPA_TIMING") != nullptr;
+  const auto tp_run0 = clk::now();
   // ---- CNN 栈 ----
+  const auto tp_cnn_start = clk::now();
   cur_.assign(waveform, waveform + n);  // [1, N] 通道×时间布局
   int c = 1;
   size_t len = n;
@@ -302,6 +329,7 @@ size_t HubertEngine::run(const float* waveform, size_t n) {
   }
   cnn_ = cur_;       // [512, T'] 通道主
   cnn_t_ = len;
+  const auto tp_cnn1 = clk::now();
 
   // ---- feature_projection: 转置到帧主 [T,512] → LN(512) → Linear(+bias) ----
   const size_t T = len;
@@ -371,6 +399,7 @@ size_t HubertEngine::run(const float* waveform, size_t n) {
     for (size_t t = 0; t < T; ++t)                   // SamePadLayer: 去掉最后一帧
       for (int i = 0; i < hidden_; ++i) x_[t * hidden_ + i] += pos_out_[t * hidden_ + i];
   }
+  const auto tp_pos1 = clk::now();
   cap_pos_.assign(pos_out_.begin(), pos_out_.begin() + static_cast<long>(T * hidden_));
 
   // ---- encoder.layer_norm(dropout=identity) ----
@@ -432,6 +461,7 @@ size_t HubertEngine::run(const float* waveform, size_t n) {
       }
     }
     // SDPA(无掩码): 每 head 独立
+    const auto tp_sdpa0 = sdpaTim ? clk::now() : clk::time_point{};
     att_.assign(T * hidden_, 0.f);
     for (int h = 0; h < heads_; ++h) {
       for (size_t q = 0; q < T; ++q) {
@@ -451,6 +481,8 @@ size_t HubertEngine::run(const float* waveform, size_t n) {
         }
       }
     }
+    if (sdpaTim)
+      sdpa_ms_ += std::chrono::duration<double, std::milli>(clk::now() - tp_sdpa0).count();
     // out proj + 残差 + post-LN
     resid_ = x_;                                   // attn_residual
 #if defined(GSV_AMX_GEMM)
@@ -502,6 +534,32 @@ size_t HubertEngine::run(const float* waveform, size_t n) {
   }
 
   last_ = x_;
+  // E13 探针: 输出本轮 CNN 逐层与 SDPA 耗时(仅 stderr, 不改行为)
+  if (std::getenv("GSV_BERT_CONV_TIMING") != nullptr)
+    std::fprintf(stderr,
+                 "[hubert-seg] cnn_stack=%.1fms(pos_conv=%.1fms enc_ln%.1fms) "
+                 "sdpa=%.1fms\n",
+                 std::chrono::duration<double, std::milli>(tp_cnn1 - tp_cnn_start).count(),
+                 std::chrono::duration<double, std::milli>(tp_pos1 - tp_cnn1).count(),
+                 std::chrono::duration<double, std::milli>(clk::now() - tp_pos1).count() - sdpa_ms_,
+                 sdpa_ms_);
+  if (sdpaTim)
+    std::fprintf(stderr, "[hubert-sdpa] sdpa_total=%.1fms T=%zu layers=%d\n",
+                 sdpa_ms_, T, n_layers_);
+  if (!conv_traces_.empty()) {
+    double tot = 0.0;
+    for (const auto& t : conv_traces_) tot += t.ms;
+    std::fprintf(stderr, "[hubert-conv] total_gemm=%.1fms\n", tot);
+    for (size_t i = 0; i < conv_traces_.size(); ++i) {
+      const auto& t = conv_traces_[i];
+      std::fprintf(stderr,
+                   "[hubert-conv] L%zu c%d*len%d k%ds%d -> out[c%d,len%d] fmlal=%.1fms\n",
+                   i, t.in_c, t.in_len, t.k, t.s, t.out_c, t.out_len, t.ms);
+    }
+    (void)tp_run0;
+  } else {
+    (void)tp_run0;
+  }
   return T;
 }
 

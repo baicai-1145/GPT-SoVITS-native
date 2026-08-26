@@ -1,7 +1,10 @@
 // pipeline_condition.cpp — C2: decode-condition 数值实现 (口径见 .hpp)
 #include "runtime/pipeline_condition.hpp"
 
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <numbers>
 
@@ -217,19 +220,26 @@ void ConditionBuilder::conv1dGlu(const float* in, size_t T, int layer,
 
 void ConditionBuilder::refEnc(const float* condIn, size_t T,
                               std::vector<float>& pooled) const {
+  // E13 探针: ref_enc 内部分段(GSV_COND_TIMING 门控, 只计时不改行为)
+  using clk = std::chrono::steady_clock;
+  const bool condTim = std::getenv("GSV_COND_TIMING") != nullptr;
+  auto cms = [](clk::time_point a, clk::time_point b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+  };
   // condIn: [T][704] → spectral → [T][128]
   std::vector<float> h(T * 128), tmp(T * 128);
+  const auto tr0 = clk::now();
   for (size_t t = 0; t < T; ++t) sp0_.run(condIn + t * 704, h.data() + t * 128);
   for (size_t t = 0; t < T; ++t) {
     float* r = h.data() + t * 128;
     for (size_t c = 0; c < 128; ++c) r[c] = mish(r[c]);
   }
-  for (size_t t = 0; t < T; ++t)
-    sp3_.run(h.data() + t * 128, tmp.data() + t * 128);
+  for (size_t t = 0; t < T; ++t) sp3_.run(h.data() + t * 128, tmp.data() + t * 128);
   for (size_t t = 0; t < T; ++t) {
     float* r = tmp.data() + t * 128;
     for (size_t c = 0; c < 128; ++c) r[c] = mish(r[c]);
   }
+  const auto tr1 = clk::now();
 
   // temporal: 转成 [C,T] 做 conv, 再转回 [T,C]
   std::vector<float> ct(128 * T), co(128 * T), tt(T * 128);
@@ -237,6 +247,7 @@ void ConditionBuilder::refEnc(const float* condIn, size_t T,
     for (size_t c = 0; c < 128; ++c) ct[c * T + t] = tmp[t * 128 + c];
   conv1dGlu(ct.data(), T, 0, co.data());
   conv1dGlu(co.data(), T, 1, ct.data());
+  const auto tr2 = clk::now();
   for (size_t t = 0; t < T; ++t)
     for (size_t c = 0; c < 128; ++c) tt[t * 128 + c] = ct[c * T + t];
 
@@ -247,6 +258,7 @@ void ConditionBuilder::refEnc(const float* condIn, size_t T,
     attWk_.run(tt.data() + t * 128, k.data() + t * 128);
     attWv_.run(tt.data() + t * 128, v.data() + t * 128);
   }
+  const auto tr3 = clk::now();  // MHA 线性(q/k/v)结束
   const double temperature = std::sqrt(128.0);
   for (int head = 0; head < 2; ++head) {
     const size_t off = size_t(head) * 64;
@@ -273,6 +285,7 @@ void ConditionBuilder::refEnc(const float* condIn, size_t T,
       }
     }
   }
+  const auto tr4 = clk::now();  // attention 核心结束
   // output = fc(attnO) + residual
   std::vector<float> fo(T * 128);
   for (size_t t = 0; t < T; ++t) {
@@ -280,6 +293,7 @@ void ConditionBuilder::refEnc(const float* condIn, size_t T,
     for (size_t c = 0; c < 128; ++c)
       fo[t * 128 + c] += tt[t * 128 + c];
   }
+  const auto tr5 = clk::now();  // attFc 结束
   // fc → [T,1024], 时间平均池化
   std::vector<double> pool(1024, 0.0);
   std::vector<float> row(1024);
@@ -289,23 +303,40 @@ void ConditionBuilder::refEnc(const float* condIn, size_t T,
   }
   pooled.assign(1024, 0.f);
   for (size_t c = 0; c < 1024; ++c) pooled[c] = float(pool[c] / double(T));
+  if (condTim)
+    std::fprintf(stderr,
+                 "[refenc-timing] spectral=%.1fms temporal_conv=%.1fms "
+                 "qkv_lin=%.1fms attn_core=%.1fms attfc=%.1fms fc_pool=%.1fms T=%zu\n",
+                 cms(tr0, tr1), cms(tr1, tr2), cms(tr2, tr3), cms(tr3, tr4),
+                 cms(tr4, tr5), cms(tr5, clk::now()), T);
 }
 
 void ConditionBuilder::compute(const float* audio32k, size_t n,
                                const float* svEmb20480,
                                DecodeCondition* out) const {
+  // E13 探针: GSV_COND_TIMING=1 时 stderr 输出 cond 链各段耗时(只加计时, 不改行为)
+  using clk = std::chrono::steady_clock;
+  const bool condTim = std::getenv("GSV_COND_TIMING") != nullptr;
+  const auto tp_all = clk::now();
+  auto cms = [](clk::time_point a, clk::time_point b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+  };
   std::vector<float> spec;
   size_t frames = 0;
+  const auto tp0 = clk::now();
   spectrogram(audio32k, n, spec, frames);
+  const auto tp1 = clk::now();
   // 条件输入 = spec[:704] 每帧列 → 转置为 [T][704]
   std::vector<float> condIn(frames * 704);
   for (size_t t = 0; t < frames; ++t)
     for (size_t b = 0; b < 704; ++b)
       condIn[t * 704 + b] = spec[b * frames + t];
+  const auto tp2 = clk::now();
 
   out->ge.assign(1024, 0.f);
   std::vector<float> gePre(1024);
   refEnc(condIn.data(), frames, gePre);
+  const auto tp3 = clk::now();
   // + sv_proj(sv_emb)
   std::vector<float> svProj(1024);
   svProj_.run(svEmb20480, svProj.data());
@@ -313,8 +344,16 @@ void ConditionBuilder::compute(const float* audio32k, size_t n,
     double g = double(gePre[c]) + double(svProj[c]);
     out->ge[c] = g < 0 ? float(g * preluSlope_[c]) : float(g);  // PReLU
   }
+  const auto tp4 = clk::now();
   out->ge_text.resize(512);
   geTo512_.run(out->ge.data(), out->ge_text.data());  // ge^T→Linear→(ge_text)^T
+  const auto tp5 = clk::now();
+  if (condTim)
+    std::fprintf(stderr,
+                 "[cond-timing] spectrogram=%.1fms transpose=%.1fms ref_enc=%.1fms "
+                 "svproj_prelu=%.1fms ge_to512=%.1fms TOTAL=%.1fms frames=%zu\n",
+                 cms(tp0, tp1), cms(tp1, tp2), cms(tp2, tp3), cms(tp3, tp4),
+                 cms(tp4, tp5), cms(tp_all, tp5), frames);
 }
 
 }  // namespace gsv::rt::pipeline

@@ -352,11 +352,13 @@ bool Pipeline::buildReference(const std::string& refWavPath, SynthResult* out,
 
     // extract_latent: v2ProPlus semantic_frame_rate="25hz" ⇒
     //   ssl_proj = Conv1d(768,768,k=2,stride=2) 帧率减半, 再最近码字。
+    const double tLat0 = refTim ? nowMs() : 0.0;  // E13 探针: extract_latent 段计时
     rt::GsvFile sovF(joinPath(weightsDir_, "sovits_v2ProPlus.gsv"));
     std::vector<float> sslW, sslB;  // W[768,768,2](out,in,tap), b[768]
     sovits::load_tensor_f32(sovF, "ssl_proj.weight", sslW);
     sovits::load_tensor_f32(sovF, "ssl_proj.bias", sslB);
     const size_t Tq = (T >= 2) ? ((T - 2) / 2 + 1) : 0;  // floor((L-k)/s)+1
+    const double tLatOpen = refTim ? nowMs() : 0.0;  // E13: gsv 重开+读权重
     std::vector<float> proj(Tq * 768);
     {  // im2col: 相邻两输入帧拼 [Tq,1536]; 权重按 tap 展平 [768,1536]
       std::vector<float> w2(size_t(768) * 1536);
@@ -370,6 +372,7 @@ bool Pipeline::buildReference(const std::string& refWavPath, SynthResult* out,
       for (size_t t = 0; t < Tq; ++t)
         for (size_t c = 0; c < 768; ++c) proj[t * 768 + c] += sslB[c];
     }
+    const double tLatProj = refTim ? nowMs() : 0.0;  // E13: im2col+sgemm+bias
     std::vector<float> embed;  // [1024,768]
     sovits::load_tensor_f32(sovF, "quantizer.vq.layers.0._codebook.embed",
                             embed, {1024, 768});
@@ -391,6 +394,12 @@ bool Pipeline::buildReference(const std::string& refWavPath, SynthResult* out,
       }
       out->prompt_semantic[t] = best;
     }
+    if (refTim)  // E13 探针: extract_latent 三段(open/proj/rvq)
+      std::fprintf(stderr,
+                   "[ref-timing] extract_latent=%.0fms(Tq=%zu) = open%.0f + "
+                   "proj%.0f + rvq%.0f\n",
+                   nowMs() - tLat0, Tq, tLatOpen - tLat0, tLatProj - tLatOpen,
+                   nowMs() - tLatProj);
 
     if (opt_.use_ref_cache) {
       encoder::RefEntry e;

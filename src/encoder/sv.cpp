@@ -7,8 +7,13 @@
 #include "kern/kern.hpp"
 #include "runtime/gsv_loader.hpp"
 
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <algorithm>
+#include <map>
 #include <stdexcept>
 #include <string>
 
@@ -109,6 +114,24 @@ const uint16_t* load_conv_w(const GsvFile& f, const std::string& name,
 }  // namespace
 
 // ---- Bn ----
+namespace {
+// E13 探针: GSV_SV_INNER_TIMING=1 时聚合 conv2d / conv2d_f16 内 sgemm/fmlal 累计耗时
+struct SvInnerTimers {
+  double conv2d_ms = 0.0;
+  double conv2d_f16_ms = 0.0;
+  double aff1_ms = 0.0;
+  double aff2_ms = 0.0;
+  double blkconv1_ms = 0.0;
+  int aff_n = 0;
+  long blkconv1_s = 0;
+  // 按形状聚合的 FMLAL 回退耗时(key= "cin,h,w k,kw s -> cout")
+  std::map<std::string, std::pair<int, double>> f16_by_shape;
+  double stage_ms[5] = {0.0, 0.0, 0.0, 0.0, 0.0};  // stage1..4 分段
+};
+thread_local SvInnerTimers g_sv_inner;
+bool sv_inner_tim() { return std::getenv("GSV_SV_INNER_TIMING") != nullptr; }
+}  // namespace
+
 void SvEngine::Bn::apply(float* x, int c, size_t s) const {
   constexpr double eps = 1e-5;  // torch BatchNorm2d 默认(eval: running stats)
   for (int ci = 0; ci < c; ++ci) {
@@ -146,8 +169,13 @@ void SvEngine::conv2d(const float* in, int c_in, int h, int w, const float* wt,
           }
     }
   out.assign(static_cast<size_t>(c_out) * S, 0.f);
+  const auto tp_sg0 = sv_inner_tim() ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
   accel::sgemm('N', 'T', c_out, static_cast<int>(S), K, 1.0f, wt, K, cols.data(), K,
                0.0f, out.data(), static_cast<int>(S));
+  if (sv_inner_tim())
+    g_sv_inner.conv2d_ms += std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - tp_sg0).count();
 }
 
 // fp16 直读版 conv2d: im2col 量化到 cols16_(fp16) + gemm_f16x_fmlal
@@ -179,8 +207,21 @@ void SvEngine::conv2d_f16(const float* in, int c_in, int h, int w, const uint16_
           }
     }
   out.assign(static_cast<size_t>(c_out) * S, 0.f);
+  const auto tp_fl0 = sv_inner_tim() ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
   kern::gemm_f16x_fmlal(w16, cols16_.data(), out.data(), static_cast<size_t>(c_out),
                         S, K);
+  if (sv_inner_tim()) {
+    g_sv_inner.conv2d_f16_ms += std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now() - tp_fl0).count();
+    char key[80];
+    std::snprintf(key, sizeof key, "%d,%d,%d k%ds%d->%d", c_in, h, w, kh, kw,
+                  c_out);
+    auto& e = g_sv_inner.f16_by_shape[key];
+    e.first++;
+    e.second += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - tp_fl0).count();
+  }
 }
 
 #if defined(GSV_AMX_GEMM)
@@ -311,9 +352,16 @@ void SvEngine::Aff::apply(const float* x, const float* ds, float* out, int h, in
     // FMAL 回退: 转置量化 cat→[S,2ch]fp16 后 gemm(A=W1, B=catᵀ)
     if (xh.size() < 2 * static_cast<size_t>(ch) * s) xh.resize(2 * static_cast<size_t>(ch) * s);
     kern::f32_trans_to_f16(cat_.data(), xh.data(), 2 * ch, s);
+    const auto tp_aff1 = sv_inner_tim() ? std::chrono::steady_clock::now()
+                                        : std::chrono::steady_clock::time_point{};
     kern::gemm_f16x_fmlal(w1, xh.data(), att_.data(),
                           static_cast<size_t>(inter), s,
                           2 * static_cast<size_t>(ch));
+    if (sv_inner_tim()) {
+      g_sv_inner.aff1_ms += std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - tp_aff1).count();
+      ++g_sv_inner.aff_n;
+    }
   }
 #ifdef C1_TRACE
   std::fprintf(stderr, "    [aff gemm1 done]\n");
@@ -349,9 +397,15 @@ void SvEngine::Aff::apply(const float* x, const float* ds, float* out, int h, in
   {
     if (xh2.size() < static_cast<size_t>(inter) * s) xh2.resize(static_cast<size_t>(inter) * s);
     kern::f32_trans_to_f16(att_.data(), xh2.data(), inter, s);  // [inter,S]→[S,inter]fp16
+    const auto tp_aff2 = sv_inner_tim() ? std::chrono::steady_clock::now()
+                                        : std::chrono::steady_clock::time_point{};
     kern::gemm_f16x_fmlal(w2, xh2.data(), att_t_.data(),
                           static_cast<size_t>(ch), s,
                           static_cast<size_t>(inter));
+    if (sv_inner_tim()) {
+      g_sv_inner.aff2_ms += std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - tp_aff2).count();
+    }
   }
 #ifdef C1_TRACE
   std::fprintf(stderr, "    [aff gemm2 done]\n");
@@ -399,9 +453,16 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
       eng.xh_.resize(static_cast<size_t>(c_in) * s);
     kern::f32_trans_to_f16(in, eng.xh_.data(), c_in, s);
     eng.nxt_.resize(static_cast<size_t>(co1) * s);
+    const auto tp_c1 = sv_inner_tim() ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
     kern::gemm_f16x_fmlal(conv1_w, eng.xh_.data(), eng.nxt_.data(),
                           static_cast<size_t>(co1), s,
                           static_cast<size_t>(c_in));
+    if (sv_inner_tim()) {
+      g_sv_inner.blkconv1_ms += std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - tp_c1).count();
+      g_sv_inner.blkconv1_s += long(s);
+    }
   } else {
     eng.conv2d_f16(in, c_in, h, w, conv1_w, co1, 1, 1, stride, 0, eng.cols_, eng.nxt_);
     h = (h - 1) / stride + 1;
@@ -666,12 +727,17 @@ size_t SvEngine::forward3(const float* fbk, size_t frames) {
       cur_[static_cast<size_t>(fch) * T + t] = fbk[static_cast<size_t>(t) * F + fch];
 
   // conv1(3x3 p1 s1) + bn1 + ReLU20
+  const auto tp_fwd0 = sv_inner_tim() ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
   conv2d(cur_.data(), 1, F, T, conv1_w_.data(), 64, 3, 3, 1, 1, cols_, tmp_);
   const int m_ch = static_cast<int>(bn1_.g.size());
   bn1_.apply(tmp_.data(), m_ch, static_cast<size_t>(F) * T);
   // 注意: 主干入口是 F.relu(torch.nn.functional), 不是块内的 Hardtanh(0,20)
   for (float& v : tmp_) v = v < 0.f ? 0.f : v;
   o_conv1_ = tmp_;
+  const auto tp_stem = sv_inner_tim() ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
+  std::chrono::steady_clock::time_point tp_stage_last = tp_stem;
 
   // layer1..4(逐 stage 跟踪分辨率)
   int h = F, w = T, c = m_ch;
@@ -697,6 +763,13 @@ size_t SvEngine::forward3(const float* fbk, size_t frames) {
       h3 = h;
       w3 = w;
     }
+    if (sv_inner_tim())
+      g_sv_inner.stage_ms[static_cast<size_t>(l)] +=
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() -
+              (l == 1 ? tp_stem : tp_stage_last)).count();
+    tp_stage_last = sv_inner_tim() ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point{};
   }
 
   // layer3_ds(1024→2048, k3, s2, p1) 作用在 layer3 输出上(fp16 直读)
@@ -729,6 +802,35 @@ size_t SvEngine::forward3(const float* fbk, size_t frames) {
       for (int t = 0; t < w; ++t) acc += row[t];
       emb_[static_cast<size_t>(ci) * h + fy] = static_cast<float>(acc / w);
     }
+  // E13 探针: 输出本轮 conv2d/conv2d_f16 内核累计耗时(仅 stderr, 不改行为)
+  if (sv_inner_tim()) {
+    std::fprintf(stderr,
+                 "[sv-inner] conv2d_sgemm_total=%.1fms conv2d_f16_fmlal_total=%.1fms "
+                 "aff_w1=%.1fms(%d次) aff_w2=%.1fms blk_conv1=%.1fms(S=%ld) T=%d\n",
+                 g_sv_inner.conv2d_ms, g_sv_inner.conv2d_f16_ms,
+                 g_sv_inner.aff1_ms, g_sv_inner.aff_n, g_sv_inner.aff2_ms,
+                 g_sv_inner.blkconv1_ms, g_sv_inner.blkconv1_s, T);
+    std::vector<std::pair<std::string, std::pair<int, double>>> ranked(
+        g_sv_inner.f16_by_shape.begin(), g_sv_inner.f16_by_shape.end());
+    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+      return a.second.second > b.second.second;
+    });
+    double cum = 0.0;
+    for (int i = 0; i < int(ranked.size()) && i < 14; ++i) {
+      cum += ranked[size_t(i)].second.second;
+      std::fprintf(stderr, "[sv-f16rank] #%d x%d %8.1fms(cum%7.1f) %s\n", i,
+                   ranked[size_t(i)].second.first, ranked[size_t(i)].second.second,
+                   cum, ranked[size_t(i)].first.c_str());
+    }
+    const auto clk_end = std::chrono::steady_clock::now();
+    std::fprintf(stderr,
+                 "[sv-seg] stem=%.1f stage1=%.1f stage2=%.1f stage3=%.1f "
+                 "stage4=%.1f l3ds_fuse34_emb=%.1fms\n",
+                 std::chrono::duration<double, std::milli>(tp_stem - tp_fwd0).count(),
+                 g_sv_inner.stage_ms[1], g_sv_inner.stage_ms[2],
+                 g_sv_inner.stage_ms[3], g_sv_inner.stage_ms[4],
+                 std::chrono::duration<double, std::milli>(clk_end - tp_stage_last).count());
+  }
   return emb_.size();
 }
 
