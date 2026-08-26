@@ -6,6 +6,7 @@
 #include "english.h"
 #include "g2pw.hpp"
 #include "g2pw_resolver.hpp"
+#include "langsegmenter.hpp"
 #include "polyphone_fix.h"
 #include "symbols2.hpp"
 
@@ -508,7 +509,9 @@ std::vector<LangPiece> langSplitAllZh(const U32& t) {
 bool TextFrontend::load(const std::string& triePath,
                         const std::string& pinyinPath, std::string* err,
                         const std::string& cmudictPath,
-                        const G2pwOptions* g2pw) {
+                        const G2pwOptions* g2pw,
+                        const std::string& langModelPath,
+                        const std::string& budouxDir) {
     if (!g2p_.load(triePath, pinyinPath, err)) return false;
     delete static_cast<EnglishG2p*>(en_);
     en_ = nullptr;
@@ -561,10 +564,26 @@ bool TextFrontend::load(const std::string& triePath,
     } else {
         g2p_.setResolver(nullptr);  // back to built-in pypinyin
     }
+    // FE-AUTO-1: 语种切分器(lid.176 + budoux)。可选: 缺省时 process 只能
+    // 走 AllZh; Auto 模式下报错。显式传入了路径即视为要求启用, 失败直接
+    // 报错以免静默降级。
+    auto* stale = static_cast<LangSegmenterCpp*>(langSeg_);
+    delete stale;
+    langSeg_ = nullptr;
+    if (!langModelPath.empty() || !budouxDir.empty()) {
+        auto seg = std::make_unique<LangSegmenterCpp>();
+        std::string why;
+        if (!seg->load(langModelPath, budouxDir, &why)) {
+            if (err) *err = "langsegmenter: " + why;
+            return false;
+        }
+        langSeg_ = seg.release();
+    }
     return true;
 }
 
 TextFrontend::~TextFrontend() {
+    delete static_cast<LangSegmenterCpp*>(langSeg_);
     delete static_cast<PolyphoneFixTable*>(polyFix_);
     delete static_cast<G2PWResolver*>(g2pwResolver_);
     delete static_cast<G2PWConverter*>(g2pwConv_);
@@ -572,7 +591,7 @@ TextFrontend::~TextFrontend() {
 }
 
 bool TextFrontend::process(const std::string& utf8Text, Result* out,
-                           int cutMethod) const {
+                           int cutMethod, TextLangMode mode) const {
     out->sentences.clear();
     out->phones.clear();
     out->word2ph.clear();
@@ -584,41 +603,97 @@ bool TextFrontend::process(const std::string& utf8Text, Result* out,
 
     auto segments = splitSentences(collapsed, cutMethod);
     for (auto& seg : segments) {
-        // TTS runtime: per segment, LangSegmenter.getTexts(seg,"zh") splits
-        // zh/en/digit pieces; zh goes through chinese2, en through english.
-        for (const auto& piece : langSplitAllZh(seg)) {
-            if (piece.isEn) {
-                if (!en_) {
-                    out->error =
-                        "english segment but no cmudict loaded: '" +
-                        enc(piece.text) + "'";
-                    return false;
-                }
-                std::vector<int> lens;
-                auto phones = static_cast<EnglishG2p*>(en_)->g2p(
-                    enc(piece.text), &lens);
-                for (const auto& ph : phones) {
-                    int id = symbols2Id(ph);
-                    if (id < 0) id = symbols2Id("UNK");
-                    out->phones.push_back(id);
-                }
-                // phone_units granularity: one word2ph entry per token with
-                // its pronunciation length (sum stays len(phones))
-                for (int n : lens) out->word2ph.push_back(n > 0 ? n : 1);
-                continue;
-            }
-            G2pResult r;
-            if (!g2p_.run(enc(piece.text), &r)) {
-                out->error = "segment '" + enc(piece.text) + "': " + r.error;
+        if (mode == TextLangMode::Auto) {
+            if (!langSeg_) {
+                out->error =
+                    "auto 模式需要 load() 时提供 lid.176.bin + budoux 模型";
                 return false;
             }
-            for (int id : r.phones) out->phones.push_back(id);
-            for (int w : r.word2ph) out->word2ph.push_back(w);
+            // FE-AUTO-1: getTexts(seg) 空参口径; zh 片走中文 G2P, en 片走
+            // cmudict; ja/ko/x/digit/punctuation 显式降级(stderr+跳过)。
+            auto pieces = static_cast<LangSegmenterCpp*>(langSeg_)->getTexts(enc(seg));
+            for (const auto& p : pieces) {
+                if (p.lang == "zh") {
+                    G2pResult r;
+                    if (!g2p_.run(p.text, &r)) {
+                        out->error = "segment '" + p.text + "': " + r.error;
+                        return false;
+                    }
+                    for (int id : r.phones) out->phones.push_back(id);
+                    for (int w : r.word2ph) out->word2ph.push_back(w);
+                } else if (p.lang == "en") {
+                    if (!en_) {
+                        out->error =
+                            "english segment but no cmudict loaded: '" +
+                            p.text + "'";
+                        return false;
+                    }
+                    std::vector<int> lens;
+                    auto phones = static_cast<EnglishG2p*>(en_)->g2p(
+                        p.text, &lens);
+                    for (const auto& ph : phones) {
+                        int id = symbols2Id(ph);
+                        if (id < 0) id = symbols2Id("UNK");
+                        out->phones.push_back(id);
+                    }
+                    for (int n : lens)
+                        out->word2ph.push_back(n > 0 ? n : 1);
+                } else {
+                    std::fprintf(stderr,
+                                 "[textfront] 警告: %s 片暂不支持已跳过: '%s'\n",
+                                 p.lang.c_str(), p.text.c_str());
+                }
+            }
+        } else {
+            // TTS runtime: per segment, LangSegmenter.getTexts(seg,"zh") splits
+            // zh/en/digit pieces; zh goes through chinese2, en through english.
+            for (const auto& piece : langSplitAllZh(seg)) {
+                if (piece.isEn) {
+                    if (!en_) {
+                        out->error =
+                            "english segment but no cmudict loaded: '" +
+                            enc(piece.text) + "'";
+                        return false;
+                    }
+                    std::vector<int> lens;
+                    auto phones = static_cast<EnglishG2p*>(en_)->g2p(
+                        enc(piece.text), &lens);
+                    for (const auto& ph : phones) {
+                        int id = symbols2Id(ph);
+                        if (id < 0) id = symbols2Id("UNK");
+                        out->phones.push_back(id);
+                    }
+                    // phone_units granularity: one word2ph entry per token with
+                    // its pronunciation length (sum stays len(phones))
+                    for (int n : lens) out->word2ph.push_back(n > 0 ? n : 1);
+                    continue;
+                }
+                G2pResult r;
+                if (!g2p_.run(enc(piece.text), &r)) {
+                    out->error = "segment '" + enc(piece.text) + "': " + r.error;
+                    return false;
+                }
+                for (int id : r.phones) out->phones.push_back(id);
+                for (int w : r.word2ph) out->word2ph.push_back(w);
+            }
         }
         out->sentences.push_back(enc(seg));
     }
     out->ok = true;
     return true;
+}
+
+std::vector<std::pair<std::string, std::string>> TextFrontend::getLangPieces(
+    const std::string& utf8Text, TextLangMode mode, std::string* error) const {
+    std::vector<std::pair<std::string, std::string>> pieces;
+    if (!langSeg_) {
+        if (error) *error = "langsegmenter 未加载(需 lid.176.bin + budoux)";
+        return pieces;
+    }
+    for (auto& p : static_cast<LangSegmenterCpp*>(langSeg_)->getTexts(utf8Text,
+                                      mode == TextLangMode::AllZh ? "zh" : ""))
+        pieces.emplace_back(p.lang, p.text);
+    return pieces;
 }
 
 }  // namespace gsv::textfront
