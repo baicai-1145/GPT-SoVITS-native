@@ -64,6 +64,8 @@
 | E8 | BERT栈FMLAL→AMX: 密集层AmxPanel预打包+形状分流 | E5-P2 | exec-ar-b36+决策者合并 | DONE | task/E8 | roberta长句345→50ms(负载下75ms); wav md5位级一致fa78ef01; ctest 7/7 |
 | E4 | 采样器对齐python: topk_sample(k=15/pen1.35)+--sample旋钮; greedy保默认 | C2 | exec-ar-b36+决策者接线 | DONE | task/E4 | 验收5/5自然eos(12045→620ms -95%); 贪心位级不变fa78ef01 |
 | FE-AUTO-1 | 前端auto切分位级移植(LangSegmenter空参口径): fasttext lid C++推理+数字归属规则+punctuation兜底; zh/en片直落现有G2P, ja/ko片显式降级告警; fixture langsegment_auto.json全过 | E4 | 未分配 | TODO | 移植重量: split_lang逻辑(~200行)+fasttext(~150行lid推理, 模型已在CPUFast); ja/ko G2P拆FE-AUTO-2/3 |
+| FE-AUTO-1 | 前端auto切分位级移植(lid+budoux+split_lang), 默认auto | E4 | exec-txt-b5+决策者合并 | DONE | task/FE-AUTO-1 | fixture 64/64位级全等; all_zh红线fa78ef01; ja/ko跳过待FE-AUTO-2/3; FE-AUTO-1.5(逐片BERT)待办 |
+| FE-AUTO-1.5 | auto混排段逐片BERT对齐python(torch.cat分片), 替代整段置零 | FE-AUTO-1 | 未分配 | TODO | python L336 get_phones_and_bert_with_phone_units 逐片 cat; zh片保留真特征提升混排听感 |
 | E5 | AMX 指令直接编程: fp16×fp16→fp32 矩阵协处理器后端(压榨CPU终极手段) | E2-SOV,E2-ENC | exec-ar | DONE(phase1) | task/E5 | 已合入(main默认OFF,-DGSV_AMX_GEMM=ON); 本机复验bench: amxpp 9/10形状反超sgemm 1.04-2.07x, cos=1.0全PASS; 实锤手写fmlal慢5-10x→E2-SOV的fmlal方案作废 |
 | E5-P2 | AMX接线: sovits conv按形状分流(M<64/T<64/dil>1→sgemm GEMV, 大块→amxpp+panel直写im2col), w_f16单副本, --amx开关默认关 | E5 | exec-sov | DONE | task/E5-P2 | 已合入; 本机复验: --amx热缓存RTF=0.508, off/on wav cos=0.999903(int16 maxdiff=2); G3全过(mel_rel最差0.00414); 内存裁决: --amx=速度模式(+120MB panel), 默认=省内存fp32 |
 
