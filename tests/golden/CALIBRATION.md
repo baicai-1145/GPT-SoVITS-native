@@ -166,3 +166,9 @@ S4真实形状K={72,168,264}全落在饥饿区(渐近值一半以下) → M拼�
 - E4 方案定案: greedy 保默认(golden 红线) + --sample(k=15/pen1.35) 对齐 python 产品行为
 - 收益: 100 phones 段 AR 12045ms → ~1.0s 量级; 消灭"重复念到天荒地老"
 - 另: python bert 布局 [1024,T] 通道在前, infer_panel_batch_infer List 语义 — 复现实验的坑已踩平
+
+## 2026-08-26 E4 验收 DONE
+- 复读文本(贪心1500 token eos=0) --sample 连跑5次: 98/88/109/95/96 tokens 全自然eos
+- 段AR 12045ms → ~620ms (-95%); 短句采样正常(12 tok eos=1)
+- 贪心默认位级红线: md5 fa78ef01 与 E10-MEM 基线一致
+- CLI: --sample(k=15/pen1.35 对齐python默认) / --sample-top-k / --sample-seed
