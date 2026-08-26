@@ -200,3 +200,10 @@ S4真实形状K={72,168,264}全落在饥饿区(渐近值一半以下) → M拼�
 - 反思: E5-P2 曾把 SoVITS conv 接上 AMX, 但 SV/HuBERT 这两个"参考侧专用引擎"从未被纳入 AMX 版图 — 架构盲区
 - E12 开卡: HuBERT 密集层抄 E8 配方(AmxPanel 预打包+形状分流); SV 1x1 conv=纯 GEMM 直吃 AMX, 3x3 按 E5-P2 分流
 - 位级红线: hubert hidden/RVQ codes 与基线逐位(或 cos)一致, 不过则保守档回退
+
+## 2026-08-27 E12 验收 DONE + b36 误报纠正
+- 性能: 参考音频编码 --no-cache 合计 4928→1980ms(-60%): hubert 3115→922ms(HuBERT AMX, 位级md5一致), sv 1629→949ms(SV AMX)
+- b36 报 "SV wav corr=-0.03 相位发散" 系无效对比 → 决策者复验: 波形corr=0.9994, mel包络rel=0.0019(G3门限1/26), 听感A/B无感
+- svEmb 1e-3 级差属 AMX tile 累加序固有 ulp 放大, 与 --amx(SoVITS) 同级, 非缺陷
+- 裁决: --amx-enc 统一开关(默认关, 同 --amx-bert 口径); GSV_AMX_ENC_SUB=nohub|nosv 隔离档
+- 教训: 跨进程 wav corr 对比在 v2Pro dec noise 下不可作为否决证据(第二次踩坑, 先例mel_rel=0.83), 必须走 mel 包络或固定noise重放
