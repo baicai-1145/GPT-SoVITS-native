@@ -16,6 +16,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <arm_neon.h>
 
 namespace gsv::encoder {
 
@@ -48,13 +49,55 @@ static unsigned amx_sv_skip_mask() {
   return m;
 }
 
-// E12 分流门槛(与 E8/E12-hubert 一致): S≥48 且 K≥256
+// E12 分流门槛(E12 原始): S≥48 且 K≥256
 constexpr size_t kAmxSvMinRows = 48;
 constexpr size_t kAmxSvMinK = 256;
+
+// E13-SV/T3 装载期权重预打包门槛(.tmp/t3_probe 同形实测):
+//   净赚者需要面板就绪; 面板内存/一次性成本极小(<百KB 级), 从宽。
+//   唯一确认的输家是 24ch 块 convs(K=216,M=24) —— 由 convs 派发点
+//   的原门槛(width*9≥256)排除, 此处无需特判。
+inline bool amx_sv_worth_packing(size_t rows, size_t K) {
+  return rows >= kAmxSvMinRows && K >= 64;
+}
+
+// E13-SV/T3 派发侧判据: 是否走 AMX(pp)。保证不 regress E12 原有任何
+// 已命中位点(原线优先返回 true), 在此基础上按微基准实测净赚域扩展:
+//   M=m_rows≥64 且 S≥2048 且 K≥64 —— 排除了两类实测输家:
+//   a) 薄 M(=inter 24, 如 L3.aff1 0.6x 打包成本>计算);
+//   b) 特小 S/K 组合(池往返+激活面板成本占比过高)。
+inline bool amx_sv_go(size_t m_rows, size_t s, size_t K) {
+  if (m_rows >= kAmxSvMinRows && s >= kAmxSvMinRows && K >= kAmxSvMinK)
+    return true;
+  return m_rows >= 64 && s >= 2048 && K >= 64;
+}
+
+namespace {
+// E13-SV 探针: GSV_SV_AMX_TRACE=1 时对 FMLAL 回退分支打印调用身份(零行为变更)
+inline bool amx_trace() {
+  static bool t = [] {
+    const char* e = std::getenv("GSV_SV_AMX_TRACE");
+    return e && *e;
+  }();
+  return t;
+}
+}  // namespace
 
 namespace {
 
 inline float relu20(float v) { return v < 0.f ? 0.f : (v > 20.f ? 20.f : v); }
+
+// E13-SV/T4: relu20 的 NEON 版(vmax/vmin 精确, 与标量语义一致)
+inline void relu20_neon(float* p, size_t n) {
+  const float32x4_t v0 = vdupq_n_f32(0.f);
+  const float32x4_t v20 = vdupq_n_f32(20.f);
+  const size_t rc = n & ~size_t(3);
+  size_t i = 0;
+  for (; i + 4 <= rc; i += 4) {
+    vst1q_f32(p + i, vmaxq_f32(vminq_f32(vld1q_f32(p + i), v20), v0));
+  }
+  for (; i < n; ++i) p[i] = relu20(p[i]);
+}
 
 // dtype 无关读取: 大矩阵为 f16 存储, 小张量(BN/LN/bias/stem conv 等)为 fp32 存储
 std::vector<float> vec_any(const GsvFile& f, const std::string& name) {
@@ -127,22 +170,64 @@ struct SvInnerTimers {
   // 按形状聚合的 FMLAL 回退耗时(key= "cin,h,w k,kw s -> cout")
   std::map<std::string, std::pair<int, double>> f16_by_shape;
   double stage_ms[5] = {0.0, 0.0, 0.0, 0.0, 0.0};  // stage1..4 分段
+  // E13-SV/T4: 非 GEMM 元操作分解(BN/ReLU/加法/拷贝/pool/im2col/panel打包/tanh门控)
+  double meta_bn_ms = 0.0, meta_relu_ms = 0.0, meta_add_ms = 0.0;
+  double meta_copy_ms = 0.0, meta_pool_ms = 0.0, meta_im2col_ms = 0.0;
+  double meta_pack_ms = 0.0, meta_aff_ms = 0.0;
 };
 thread_local SvInnerTimers g_sv_inner;
 bool sv_inner_tim() { return std::getenv("GSV_SV_INNER_TIMING") != nullptr; }
+// 计时起点: 关闭时返回零值 epoch(与现探针风格一致)
+inline std::chrono::steady_clock::time_point sv_tp() {
+  return sv_inner_tim() ? std::chrono::steady_clock::now()
+                        : std::chrono::steady_clock::time_point{};
+}
+inline void sv_acc(std::chrono::steady_clock::time_point t0, double& dst) {
+  if (sv_inner_tim())
+    dst += std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - t0).count();
+}
 }  // namespace
 
 void SvEngine::Bn::apply(float* x, int c, size_t s) const {
-  constexpr double eps = 1e-5;  // torch BatchNorm2d 默认(eval: running stats)
-  for (int ci = 0; ci < c; ++ci) {
-    const double a =
-        static_cast<double>(g[ci]) / std::sqrt(static_cast<double>(var[ci]) + eps);
-    const double beta = static_cast<double>(b[ci]);
-    const double mu = static_cast<double>(mean[ci]);
-    float* row = x + static_cast<size_t>(ci) * s;
-    for (size_t i = 0; i < s; ++i)
-      row[i] = static_cast<float>((static_cast<double>(row[i]) - mu) * a + beta);
+  const auto tp = sv_tp();
+  if (!amx_sv_enabled()) {
+    // 默认路径(旗关): 保持 C1 原双精度链位级不变(HANDOFF §6)
+    constexpr double eps0 = 1e-5;
+    for (int ci = 0; ci < c; ++ci) {
+      const double a0 = static_cast<double>(g[ci]) /
+                        std::sqrt(static_cast<double>(var[ci]) + eps0);
+      const double beta0 = static_cast<double>(b[ci]);
+      const double mu0 = static_cast<double>(mean[ci]);
+      float* row0 = x + static_cast<size_t>(ci) * s;
+      for (size_t i = 0; i < s; ++i)
+        row0[i] = static_cast<float>((static_cast<double>(row0[i]) - mu0) * a0 + beta0);
+    }
+    sv_acc(tp, g_sv_inner.meta_bn_ms);
+    return;
   }
+  // E13-SV/T4c(--amx-enc 档): 每 channel 预算一次 scale/beta(fp32), 行内
+  // NEON FMA。double 链属实现精度选择(非 torch 语义要求); 门禁 corr/mel。
+  constexpr float eps = 1e-5f;
+  const int rc = int(s & ~size_t(3));
+  for (int ci = 0; ci < c; ++ci) {
+    const float a = g[ci] / std::sqrt(var[ci] + eps);
+    const float beta = b[ci];
+    const float mu = mean[ci];
+    float* row = x + static_cast<size_t>(ci) * s;
+    const float32x4_t va = vdupq_n_f32(a);
+    const float32x4_t vmu = vdupq_n_f32(mu);
+    const float32x4_t vbeta = vdupq_n_f32(beta);
+    int i = 0;
+    for (; i + 4 <= rc; i += 4) {
+      const float32x4_t vc = vsubq_f32(vld1q_f32(row + i), vmu);
+      vst1q_f32(row + i, vfmaq_f32(vbeta, vc, va));  // beta + (x-mu)*a
+    }
+    // 尾部逐点(与主链同公式)
+    for (; i < int(s); ++i)
+      row[i] = (row[i] - mu) * a + beta;
+  }
+  sv_acc(tp, g_sv_inner.meta_bn_ms);
 }
 
 // ---- conv2d(im2col → sgemm('N','T') 直接产出通道主输出) ----
@@ -154,6 +239,7 @@ void SvEngine::conv2d(const float* in, int c_in, int h, int w, const float* wt,
   const size_t S = static_cast<size_t>(oh) * ow;
   const int K = c_in * kh * kw;
   cols.resize(S * K);
+  const auto tp_im = sv_tp();
   for (int oy = 0; oy < oh; ++oy)
     for (int ox = 0; ox < ow; ++ox) {
       float* row = cols.data() + (static_cast<size_t>(oy) * ow + ox) * K;
@@ -168,6 +254,7 @@ void SvEngine::conv2d(const float* in, int c_in, int h, int w, const float* wt,
                     : 0.f;
           }
     }
+  sv_acc(tp_im, g_sv_inner.meta_im2col_ms);
   out.assign(static_cast<size_t>(c_out) * S, 0.f);
   const auto tp_sg0 = sv_inner_tim() ? std::chrono::steady_clock::now()
                                      : std::chrono::steady_clock::time_point{};
@@ -189,23 +276,68 @@ void SvEngine::conv2d_f16(const float* in, int c_in, int h, int w, const uint16_
   const size_t S = static_cast<size_t>(oh) * ow;
   const size_t K = static_cast<size_t>(c_in) * kh * kw;
   cols16_.resize(S * K);
-  for (int oy = 0; oy < oh; ++oy)
-    for (int ox = 0; ox < ow; ++ox) {
-      uint16_t* row = cols16_.data() + (static_cast<size_t>(oy) * ow + ox) * K;
-      for (int c = 0; c < c_in; ++c)
-        for (int ky = 0; ky < kh; ++ky)
-          for (int kx = 0; kx < kw; ++kx) {
-            const int iy = oy * stride - pad + ky;
-            const int ix = ox * stride - pad + kx;
-            const __fp16 hv =
-                (iy >= 0 && iy < h && ix >= 0 && ix < w)
-                    ? static_cast<__fp16>(
-                          in[(static_cast<size_t>(c) * h + iy) * w + ix])
-                    : __fp16(0);
-            std::memcpy(row + (static_cast<size_t>(c) * kh + ky) * kw + kx, &hv,
-                        sizeof hv);
-          }
+  const auto tp_im2 = sv_tp();
+  // E13-SV/T4d: k3s3p1 情形整张量一次向量 FCVT(位级同标量), im2col 时
+  // 只做 f16 散布写 —— 转换次数从 S*K=9*S*W² 降到 C*H*W(约 /9·C/W 倍),
+  // w24 convs(FMLAL 保留族)的回退成本大头即在此。
+  if (kh == 3 && kw == 3 && stride == 1 && pad == 1 && h > 2 && w > 2) {
+    const size_t total = size_t(c_in) * h * w;
+    if (cvt16_.size() < total) cvt16_.resize(total);
+    {
+      size_t i = 0;
+      const float* sp = in;
+      uint16_t* dp = cvt16_.data();
+      for (; i + 8 <= total; i += 8, sp += 8, dp += 8) {
+        const float32x4_t v0 = vld1q_f32(sp);
+        const float32x4_t v1 = vld1q_f32(sp + 4);
+        vst1q_f16(reinterpret_cast<__fp16*>(dp),
+                  vcombine_f16(vcvt_f16_f32(v0), vcvt_f16_f32(v1)));
+      }
+      for (; i < total; ++i, ++sp, ++dp)
+        *dp = kern::f32_to_f16_scalar(*sp);
     }
+    size_t s_idx2 = 0;
+    for (int oy = 0; oy < oh; ++oy)
+      for (int ox = 0; ox < ow; ++ox, ++s_idx2) {
+        uint16_t* row = cols16_.data() + s_idx2 * K;
+        for (int c = 0; c < c_in; ++c) {
+          const uint16_t* plane = cvt16_.data() + (size_t)c * h * w;
+          for (int ky = 0; ky < 3; ++ky) {
+            const int iy = oy + ky - 1;
+            uint16_t* dk = row + (size_t)c * 9 + size_t(ky) * 3;
+            if (iy < 0 || iy >= h) {
+              dk[0] = dk[1] = dk[2] = 0;  // 复用缓冲: 越界行必须显式补零
+              continue;
+            }
+            const uint16_t* rowp = plane + (size_t)iy * w;
+            for (int kx = 0; kx < 3; ++kx) {
+              const int ix = ox + kx - 1;
+              dk[kx] = (ix >= 0 && ix < w) ? rowp[ix] : 0;
+            }
+          }
+        }
+      }
+    sv_acc(tp_im2, g_sv_inner.meta_im2col_ms);
+  } else {
+    for (int oy = 0; oy < oh; ++oy)
+      for (int ox = 0; ox < ow; ++ox) {
+        uint16_t* row = cols16_.data() + (static_cast<size_t>(oy) * ow + ox) * K;
+        for (int c = 0; c < c_in; ++c)
+          for (int ky = 0; ky < kh; ++ky)
+            for (int kx = 0; kx < kw; ++kx) {
+              const int iy = oy * stride - pad + ky;
+              const int ix = ox * stride - pad + kx;
+              const __fp16 hv =
+                  (iy >= 0 && iy < h && ix >= 0 && ix < w)
+                      ? static_cast<__fp16>(
+                            in[(static_cast<size_t>(c) * h + iy) * w + ix])
+                      : __fp16(0);
+              std::memcpy(row + (static_cast<size_t>(c) * kh + ky) * kw + kx, &hv,
+                          sizeof hv);
+            }
+      }
+    sv_acc(tp_im2, g_sv_inner.meta_im2col_ms);
+  }
   out.assign(static_cast<size_t>(c_out) * S, 0.f);
   const auto tp_fl0 = sv_inner_tim() ? std::chrono::steady_clock::now()
                                      : std::chrono::steady_clock::time_point{};
@@ -229,6 +361,71 @@ void SvEngine::conv2d_f16(const float* in, int c_in, int h, int w, const uint16_
 // 逻辑同 conv2d_f16 的 im2col, 但写到 panel 布局而非中间行主缓冲 —— 免一次
 // S*K 中间写和重复分配(热路径 reserve+resize)。输出: nt 个 tile, 每 tile
 // 每 k 一行 64B(k = c_in*kh*kw 展平; 与 kern::pack_panel 同构)。
+namespace {
+// E13-SV/T4: k1/s1 快速路径 —— 源在通道内连续(s 主序), panel 对固定 c 是
+// 步长 32 半字的等值散布。四宽 FCVT(RNE, 与标量 static_cast<__fp16> 位级一致)
+// + 8B 向量存。
+void pack_k1s1_rows_neon(const float* in, int c_in, size_t S,
+                         size_t rend, uint16_t* tb) {
+  const int rc = int(rend & ~size_t(3));
+  for (int c = 0; c < c_in; ++c) {
+    const float* chp = in + (size_t)c * S;
+    uint16_t* crow = tb + (size_t)c * 32;
+    int r = 0;
+    for (; r + 4 <= rc; r += 4) {
+      const float32x4_t v = vld1q_f32(chp + r);
+      vst1_u16(crow + r, vreinterpret_u16_f16(vcvt_f16_f32(v)));
+    }
+    for (; r < int(rend); ++r)
+      crow[r] = kern::f32_to_f16_scalar(chp[r]);
+  }
+}
+
+// E13-SV/T4: 3x3 s1 p1 快速路径。张量已整批向量 FCVT 到 f16(位级与标量
+// 一致)。注意 j0 起的 32 个展平样本可能跨源行边界(w=737 时 tile 跨 1~2
+// 行)，按「同行连续段」分段处理，段内做三条水平窗拷贝。
+void pack_3x3s1_scatter_neon(const std::vector<uint16_t>& tmp16, int c_in,
+                             int h, int w, size_t j0, size_t rend,
+                             uint16_t* tb) {
+  // 注意: 激活面板缓冲跨调用复用容量, 无效 k 位必须显式写零
+  // (与标量路径的全覆盖语义一致), 不得残留上一次的字节。
+  size_t r = 0;
+  while (r < rend) {
+    const size_t flat = j0 + r;
+    const int yy = int(flat / w);
+    const int x0 = int(flat % w);
+    const size_t seg =
+        std::min(rend - r, size_t(w) - size_t(x0));  // 本段同行长度
+    for (int c = 0; c < c_in; ++c) {
+      const uint16_t* plane = tmp16.data() + (size_t)c * h * w;
+      uint16_t* crow = tb + (size_t)(c * 9) * 32;
+      for (int ky = 0; ky < 3; ++ky) {
+        const int iy = yy + ky - 1;
+        const uint16_t* row =
+            (iy >= 0 && iy < h) ? plane + (size_t)iy * w : nullptr;
+        for (int kx = 0; kx < 3; ++kx) {
+          const int d = kx - 1;
+          uint16_t* dk = crow + (size_t(ky * 3 + kx) * 32);
+          // 与标量参考同义: 每个 panel 位必写一次, 源越界写 0。
+          // 有效 q 区间: 0 ≤ x0+q+d < w 且行在界内
+          const int qlo = std::max(0, -(x0 + d));       // sx≥0
+          const int qhi = std::min(int(seg), w - x0 - d);  // sx<w exclusive
+          for (int q = 0; q < qlo; ++q) dk[r + q] = 0;
+          const int qe2 = std::max(qhi, qlo);
+          if (row) {
+            for (int q = qlo; q < qe2; ++q) dk[r + q] = row[x0 + d + q];
+            for (int q = qe2; q < int(seg); ++q) dk[r + q] = 0;
+          } else {
+            for (int q = qlo; q < int(seg); ++q) dk[r + q] = 0;
+          }
+        }
+      }
+    }
+    r += seg;
+  }
+}
+}  // namespace
+
 void pack_conv_cols_to_panel(const float* in, int c_in, int h, int w,
                              int kh, int kw, int stride, int pad, size_t S, size_t K,
                              std::vector<uint8_t>& buf) {
@@ -244,6 +441,47 @@ void pack_conv_cols_to_panel(const float* in, int c_in, int h, int w,
     for (size_t k = 0; k < K; ++k)
       std::memset(d_tail + k * 64 + zoff, 0, 64 - zoff);
   }
+#if defined(GSV_AMX_GEMM)
+  // E13-SV 临时调试开关: 置位时禁用两条快速打包路径(对拍用)
+  const bool force_scalar = [] { const char* e = std::getenv("GSV_SV_PACK_SCALAR"); return e && *e; }();
+  // T4: 1x1 s1 卷积的 im2col=恒等映射(h/w 平铺与展平空间同序) —
+  // 全部 AMX 激活体积的大头(L1-L4 全部 conv3/sc/AFF/中后期 conv1)走此路。
+  if (!force_scalar && kh == 1 && kw == 1 && stride == 1 && pad == 0) {
+    for (size_t t = 0; t < nt; ++t) {
+      const size_t j0 = t * 32;
+      const size_t rend = std::min(size_t(32), S - j0);
+      pack_k1s1_rows_neon(in + j0, c_in, S, rend,
+                          reinterpret_cast<uint16_t*>(dst + t * K * 64));
+    }
+    return;
+  }
+  // T4b: 3x3 s1 p1(convs 组形状)。h/w 平铺展平序下窗口仅含垂直两个
+  // 整行越界情形, 其余访问是三条水平连续段 —— 行级 cvt 一次复用三窗。
+  if (!force_scalar && kh == 3 && kw == 3 && stride == 1 && pad == 1 && h > 2 && w > 2) {
+    // 整张量一次向量 FCVT(约 im2col 转换量的 1/9)，逐 tile 只做散布拷贝
+    const size_t total = size_t(c_in) * h * w;
+    thread_local std::vector<uint16_t> t_cvt3;
+    if (t_cvt3.size() < total) t_cvt3.resize(total);
+    {
+      size_t i = 0;
+      const float* sp = in;
+      uint16_t* dp = t_cvt3.data();
+      for (; i + 4 <= total; i += 4, sp += 4, dp += 4) {
+        const float32x4_t v = vld1q_f32(sp);
+        vst1_u16(dp, vreinterpret_u16_f16(vcvt_f16_f32(v)));
+      }
+      for (; i < total; ++i, ++sp, ++dp)
+        *dp = kern::f32_to_f16_scalar(*sp);
+    }
+    for (size_t t = 0; t < nt; ++t) {
+      const size_t j0 = t * 32;
+      const size_t rend = std::min(size_t(32), S - j0);
+      pack_3x3s1_scatter_neon(t_cvt3, c_in, h, w, j0, rend,
+                              reinterpret_cast<uint16_t*>(dst + t * K * 64));
+    }
+    return;
+  }
+#endif
   // 输出位置: 对 panel 行 s(样本)与列 k(收缩维): dst[k*64+s_in_tile*2]
   // 逐输入通道扫不太自然(panel 布局按 s 外循环); 仍按 S 主序扫有效位置
   const int oh = (h + 2 * pad - kh) / stride + 1;
@@ -297,8 +535,12 @@ void SvEngine::conv2d_amx(const kern::AmxPanel& w_panel, const float* in,
       }
     }
   }
-  pack_conv_cols_to_panel(in, c_in, h, w, kh, kw, stride, pad, S, K,
-                          sv_act_scratch_);
+  {
+    const auto tp_pk = sv_tp();
+    pack_conv_cols_to_panel(in, c_in, h, w, kh, kw, stride, pad, S, K,
+                            sv_act_scratch_);
+    sv_acc(tp_pk, g_sv_inner.meta_pack_ms);
+  }
   kern::AmxPanel pb;
   pb.rows = S;
   pb.K = K;
@@ -350,6 +592,8 @@ void SvEngine::Aff::apply(const float* x, const float* ds, float* out, int h, in
 #endif
   {
     // FMAL 回退: 转置量化 cat→[S,2ch]fp16 后 gemm(A=W1, B=catᵀ)
+    if (amx_trace())
+      std::fprintf(stderr, "[sv-fb] aff1 ch=%d inter=%d S=%zu\n", ch, inter, s);
     if (xh.size() < 2 * static_cast<size_t>(ch) * s) xh.resize(2 * static_cast<size_t>(ch) * s);
     kern::f32_trans_to_f16(cat_.data(), xh.data(), 2 * ch, s);
     const auto tp_aff1 = sv_inner_tim() ? std::chrono::steady_clock::now()
@@ -366,10 +610,17 @@ void SvEngine::Aff::apply(const float* x, const float* ds, float* out, int h, in
 #ifdef C1_TRACE
   std::fprintf(stderr, "    [aff gemm1 done]\n");
 #endif
-  for (int e = 0; e < inter; ++e) {
-    float* row = att_.data() + static_cast<size_t>(e) * s;
-    const float b = b1[static_cast<size_t>(e)];
-    for (size_t i = 0; i < s; ++i) row[i] += b;
+  {
+    // E13-SV/T4: 偏置逐行 NEON 加法(精确同序, 逐元素加法无重排)
+    const int rc = int(s & ~size_t(3));
+    for (int e = 0; e < inter; ++e) {
+      float* row = att_.data() + static_cast<size_t>(e) * s;
+      const float32x4_t vb = vdupq_n_f32(b1[static_cast<size_t>(e)]);
+      int i = 0;
+      for (; i + 4 <= rc; i += 4)
+        vst1q_f32(row + i, vaddq_f32(vld1q_f32(row + i), vb));
+      for (; i < int(s); ++i) row[i] += b1[static_cast<size_t>(e)];
+    }
   }
   bn1.apply(att_.data(), inter, s);
   gsv::kern::silu(att_.data(), att_.data(), att_.size());
@@ -395,6 +646,8 @@ void SvEngine::Aff::apply(const float* x, const float* ds, float* out, int h, in
   } else
 #endif
   {
+    if (amx_trace())
+      std::fprintf(stderr, "[sv-fb] aff2 ch=%d inter=%d S=%zu\n", ch, inter, s);
     if (xh2.size() < static_cast<size_t>(inter) * s) xh2.resize(static_cast<size_t>(inter) * s);
     kern::f32_trans_to_f16(att_.data(), xh2.data(), inter, s);  // [inter,S]→[S,inter]fp16
     const auto tp_aff2 = sv_inner_tim() ? std::chrono::steady_clock::now()
@@ -410,15 +663,25 @@ void SvEngine::Aff::apply(const float* x, const float* ds, float* out, int h, in
 #ifdef C1_TRACE
   std::fprintf(stderr, "    [aff gemm2 done]\n");
 #endif
-  for (int e = 0; e < ch; ++e) {
-    float* row = att_t_.data() + static_cast<size_t>(e) * s;
-    const float b = b2[static_cast<size_t>(e)];
-    for (size_t i = 0; i < s; ++i) row[i] += b;
+  {
+    const int rc = int(s & ~size_t(3));
+    for (int e = 0; e < ch; ++e) {
+      float* row = att_t_.data() + static_cast<size_t>(e) * s;
+      const float32x4_t vb = vdupq_n_f32(b2[static_cast<size_t>(e)]);
+      int i = 0;
+      for (; i + 4 <= rc; i += 4)
+        vst1q_f32(row + i, vaddq_f32(vld1q_f32(row + i), vb));
+      for (; i < int(s); ++i) row[i] += b2[static_cast<size_t>(e)];
+    }
   }
   bn2.apply(att_t_.data(), ch, s);
-  for (size_t i = 0; i < static_cast<size_t>(ch) * s; ++i) {
-    const float t = std::tanh(att_t_[i]);
-    out[i] = x[i] * (1.0f + t) + ds[i] * (1.0f - t);
+  {
+    const auto tp_af = sv_tp();
+    for (size_t i = 0; i < static_cast<size_t>(ch) * s; ++i) {
+      const float t = std::tanh(att_t_[i]);
+      out[i] = x[i] * (1.0f + t) + ds[i] * (1.0f - t);
+    }
+    sv_acc(tp_af, g_sv_inner.meta_aff_ms);
   }
   last_out.assign(out, out + static_cast<size_t>(ch) * s);
 }
@@ -434,28 +697,37 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
   // conv1(k1, stride, p0) + bn1 + ReLU20
   // 注意: in 可能就是 eng.tmp_(调用方把主缓冲喂进来) —— 必须写入另一缓冲防别名。
   int h = h_in, w = w_in;
+  // E13-SV/T4: conv1 输出直写 eng.cur_, 消除原先 nxt_→cur_ 的整块拷贝
+  std::vector<float>& c1out = eng.cur_;
 #if defined(GSV_AMX_GEMM)
-  if (conv1_panel_ready && stride == 1 && !(amx_sv_skip_mask() & 1u) &&
-      static_cast<size_t>(h) * static_cast<size_t>(w) >= kAmxSvMinRows &&
-      static_cast<size_t>(c_in) >= kAmxSvMinK) {
-    // E12: 1x1 conv = dense GEMM; 激活 im2col=identity (转置直写面板)
-    const size_t s = static_cast<size_t>(h) * static_cast<size_t>(w);
-    eng.nxt_.resize(static_cast<size_t>(co1) * s);
-    eng.conv2d_amx(conv1_panel, in, c_in, h, w, 1, 1, 1, 0, co1, eng.nxt_);
+  if (conv1_panel_ready && !(amx_sv_skip_mask() & 1u) &&
+      amx_sv_go(size_t(co1), size_t(h_in) * w_in, size_t(c_in))) {
+    // E13-SV/T3: k1 卷积恒等 dense GEMM, k==1 时 im2col 无重叠复用,
+    // k1s2 与 k1s1 数学一致(每输出位置独立取单列, 边界零填等等价);
+    // 解除 E12 的 stride==1 分流限制, 入口块 conv1(s2) 走 AMX 直派。
+    // 派发门槛从 S/K≥48/256 收紧为 amx_sv_go(基于 t3_probe 实测净赚域)。
+    eng.conv2d_amx(conv1_panel, in, c_in, h_in, w_in, 1, 1, stride, 0, co1,
+                   c1out);
+    if (stride != 1) {  // 下游 BN/分块逻辑按新分辨率(与 else 分支同式)
+      h = (h_in - 1) / stride + 1;
+      w = (w_in - 1) / stride + 1;
+    }
   } else
 #endif
   if (stride == 1) {
     // 1x1 s1: 零 im2col。in 通道主 [c_in,S] → 转置量化 xh_[S,c_in];
-    // gemm(A=W[co1,c_in], B=xh) 直接得通道主 nxt_[co1,S] —— 不经 tmp_
+    // gemm(A=W[co1,c_in], B=xh) 直接得通道主输出 —— 不经 tmp_
     // (in 可能别名 eng.tmp_, 不得写回)。
     const size_t s = static_cast<size_t>(h) * w;
+    if (amx_trace())
+      std::fprintf(stderr, "[sv-fb] blk_conv1 cin=%d->%d S=%zu\n", c_in, co1, s);
     if (eng.xh_.size() < static_cast<size_t>(c_in) * s)
       eng.xh_.resize(static_cast<size_t>(c_in) * s);
     kern::f32_trans_to_f16(in, eng.xh_.data(), c_in, s);
-    eng.nxt_.resize(static_cast<size_t>(co1) * s);
+    c1out.resize(static_cast<size_t>(co1) * s);
     const auto tp_c1 = sv_inner_tim() ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
-    kern::gemm_f16x_fmlal(conv1_w, eng.xh_.data(), eng.nxt_.data(),
+    kern::gemm_f16x_fmlal(conv1_w, eng.xh_.data(), c1out.data(),
                           static_cast<size_t>(co1), s,
                           static_cast<size_t>(c_in));
     if (sv_inner_tim()) {
@@ -464,22 +736,26 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
       g_sv_inner.blkconv1_s += long(s);
     }
   } else {
-    eng.conv2d_f16(in, c_in, h, w, conv1_w, co1, 1, 1, stride, 0, eng.cols_, eng.nxt_);
+    eng.conv2d_f16(in, c_in, h, w, conv1_w, co1, 1, 1, stride, 0, eng.cols_, c1out);
     h = (h - 1) / stride + 1;
     w = (w - 1) / stride + 1;
   }
   const size_t s = static_cast<size_t>(h) * w;
-  bn1.apply(eng.nxt_.data(), co1, s);
-  for (float& v : eng.nxt_) v = relu20(v);
+  {
+    const auto tp_bn1 = sv_tp();
+    bn1.apply(c1out.data(), co1, s);
+    relu20_neon(c1out.data(), c1out.size());
+    sv_acc(tp_bn1, g_sv_inner.meta_relu_ms);  // bn1+relu20 合并窗口(见证据说明)
+  }
 #ifdef C1_TRACE
   std::fprintf(stderr, "  [conv1+bn ok s=%zu]\n", s);
 #endif
 
   // 分块处理链(torch 语义): sp 从原始块 0 出发, 每轮处理后作为下一轮 fuse/相加的左操作数
-  eng.cur_.assign(eng.nxt_.begin(), eng.nxt_.end());  // spx([co1,s])
-  eng.nxt_.clear();
+  // E13-SV/T4: conv1 已直写 eng.cur_(c1out), 此处无需再整块拷贝。
+  // 注意: c1out 语义 = [co1, s] 即 concat 的槽位 0..3 连续排布(chunk(i) 基址)。
+  eng.cur_.resize(static_cast<size_t>(co1) * s);      // conv1 输出恰好是 co1×s
   eng.tmp2_.resize(static_cast<size_t>(co1) * s);     // 拼接缓冲(槽位 i × width)
-  eng.nxt_.reserve(static_cast<size_t>(width) * s);
   auto chunk = [&](int i) -> const float* {
     return eng.cur_.data() + static_cast<size_t>(i) * width * s;
   };
@@ -499,7 +775,16 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
         );
         std::memcpy(sp.data(), fus.data(), sp.size() * sizeof(float));
       } else {
-        for (size_t j = 0; j < sp.size(); ++j) sp[j] += chunk(i)[j];
+        const auto tp_ad = sv_tp();
+        // E13-SV/T4: 向量四宽加法(load 完成后才 store, 别名安全; 精确同序)
+        const float* rp = chunk(i);
+        size_t j = 0;
+        const size_t rc = sp.size() & ~size_t(3);
+        for (; j + 4 <= rc; j += 4)
+          vst1q_f32(sp.data() + j,
+                    vaddq_f32(vld1q_f32(sp.data() + j), vld1q_f32(rp + j)));
+        for (; j < sp.size(); ++j) sp[j] += rp[j];
+        sv_acc(tp_ad, g_sv_inner.meta_add_ms);
       }
     }
     // convs[i](3x3 p1 s1) + bns + ReLU20 → 拼接槽位 i
@@ -513,28 +798,41 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
                      width, h, w, 3, 3, 1, 1, width, eng.nxt_);
     } else
 #endif
-    eng.conv2d_f16(i == 0 ? chunk(0) : sp.data(), width, h, w,
-                   convs_w[static_cast<size_t>(i)],
-                   width, 3, 3, 1, 1, eng.cols_, eng.nxt_);
+    {
+      if (amx_trace())
+        std::fprintf(stderr, "[sv-fb] convs i=%d w=%d S=%zu\n", i, width,
+                     static_cast<size_t>(h) * w);
+      eng.conv2d_f16(i == 0 ? chunk(0) : sp.data(), width, h, w,
+                     convs_w[static_cast<size_t>(i)],
+                     width, 3, 3, 1, 1, eng.cols_, eng.nxt_);
+    }
     bns[static_cast<size_t>(i)].apply(eng.nxt_.data(), width, s);
-    for (float& v : eng.nxt_) v = relu20(v);
-    std::memcpy(eng.tmp2_.data() + static_cast<size_t>(i) * width * s, eng.nxt_.data(),
-                eng.nxt_.size() * sizeof(float));
-    std::memcpy(sp.data(), eng.nxt_.data(), eng.nxt_.size() * sizeof(float));
+    {
+      const auto tp_rl = sv_tp();
+      relu20_neon(eng.nxt_.data(), eng.nxt_.size());
+      std::memcpy(eng.tmp2_.data() + static_cast<size_t>(i) * width * s,
+                  eng.nxt_.data(), eng.nxt_.size() * sizeof(float));
+      std::memcpy(sp.data(), eng.nxt_.data(), eng.nxt_.size() * sizeof(float));
+      sv_acc(tp_rl, g_sv_inner.meta_copy_ms);  // relu+双拷贝合并窗口
+    }
   }
 
   // conv3(k1) + bn3
 #if defined(GSV_AMX_GEMM)
   if (conv3_panel_ready && !(amx_sv_skip_mask() & 4u) &&
-      static_cast<size_t>(h) * static_cast<size_t>(w) >= kAmxSvMinRows &&
-      static_cast<size_t>(co1) >= kAmxSvMinK) {
+      amx_sv_go(size_t(exp_planes), s, size_t(co1))) {
     eng.nxt_.resize(static_cast<size_t>(exp_planes) * s);
     eng.conv2d_amx(conv3_panel, eng.tmp2_.data(), co1, h, w, 1, 1, 1, 0,
                    exp_planes, eng.nxt_);
   } else
 #endif
-  eng.conv2d_f16(eng.tmp2_.data(), co1, h, w, conv3_w, exp_planes, 1, 1, 1, 0,
-                 eng.cols_, eng.nxt_);
+  {
+    if (amx_trace())
+      std::fprintf(stderr, "[sv-fb] conv3 cin=%d->%d S=%zu\n", co1, exp_planes,
+                   static_cast<size_t>(h) * w);
+    eng.conv2d_f16(eng.tmp2_.data(), co1, h, w, conv3_w, exp_planes, 1, 1, 1, 0,
+                   eng.cols_, eng.nxt_);
+  }
   bn3.apply(eng.nxt_.data(), exp_planes, s);
 
 #ifdef C1_TRACE
@@ -542,27 +840,59 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
 #endif
   // shortcut(输入仍是 [c_in,h_in,w_in], 经 stride 下采样到输出分辨率 —— 必须用原始 h_in/w_in!)
   if (!has_shortcut) {
-    for (size_t j = 0; j < eng.nxt_.size(); ++j) eng.nxt_[j] += in[j];
+    const auto tp_ad2 = sv_tp();
+{
+      const float* bp = in;
+      const size_t n2 = eng.nxt_.size();
+      size_t j = 0;
+      const size_t rc = n2 & ~size_t(3);
+      for (; j + 4 <= rc; j += 4)
+        vst1q_f32(eng.nxt_.data() + j,
+                  vaddq_f32(vld1q_f32(eng.nxt_.data() + j), vld1q_f32(bp + j)));
+      for (; j < n2; ++j) eng.nxt_[j] += bp[j];
+    }
+    sv_acc(tp_ad2, g_sv_inner.meta_add_ms);
   } else {
 #if defined(GSV_AMX_GEMM)
     if (sc_panel_ready && !(amx_sv_skip_mask() & 8u) &&
-        static_cast<size_t>(h_in) * static_cast<size_t>(w_in) >= kAmxSvMinRows &&
-        static_cast<size_t>(c_in) >= kAmxSvMinK) {
+        amx_sv_go(size_t(exp_planes), size_t(h_in) * w_in, size_t(c_in))) {
       eng.tmp_.resize(static_cast<size_t>(exp_planes) * s);
       eng.conv2d_amx(sc_panel, in, c_in, h_in, w_in, 1, 1, stride, 0,
                      exp_planes, eng.tmp_);
     } else
 #endif
-    eng.conv2d_f16(in, c_in, h_in, w_in, sc_w, exp_planes, 1, 1, stride, 0, eng.cols_,
-                   eng.tmp_);
+    {
+      if (amx_trace())
+        std::fprintf(stderr, "[sv-fb] sc cin=%d->%d stride=%d S=%zu\n", c_in,
+                     exp_planes, stride, static_cast<size_t>(h_in) * w_in);
+      eng.conv2d_f16(in, c_in, h_in, w_in, sc_w, exp_planes, 1, 1, stride, 0, eng.cols_,
+                     eng.tmp_);
+    }
     sc_bn.apply(eng.tmp_.data(), exp_planes, s);
-    for (size_t j = 0; j < eng.nxt_.size(); ++j) eng.nxt_[j] += eng.tmp_[j];
+    {
+      const auto tp_ad3 = sv_tp();
+{
+      const float* bp = eng.tmp_.data();
+      const size_t n2 = eng.nxt_.size();
+      size_t j = 0;
+      const size_t rc = n2 & ~size_t(3);
+      for (; j + 4 <= rc; j += 4)
+        vst1q_f32(eng.nxt_.data() + j,
+                  vaddq_f32(vld1q_f32(eng.nxt_.data() + j), vld1q_f32(bp + j)));
+      for (; j < n2; ++j) eng.nxt_[j] += bp[j];
+    }
+      sv_acc(tp_ad3, g_sv_inner.meta_add_ms);
+    }
   }
-  for (float& v : eng.nxt_) v = relu20(v);
+  relu20_neon(eng.nxt_.data(), eng.nxt_.size());
 #ifdef C1_TRACE
   std::fprintf(stderr, "  [blk done]\n");
 #endif
-  last_out.assign(eng.nxt_.begin(), eng.nxt_.end());
+  {
+    const auto tp_asg = sv_tp();
+    last_out.assign(eng.nxt_.begin(), eng.nxt_.end());
+    sv_acc(tp_asg, g_sv_inner.meta_copy_ms);
+  }
 }
 
 // ---- 加载 ----
@@ -583,14 +913,25 @@ void SvEngine::load_block(int l, int i, bool expect_aff) {
   if (n_convs != blk.scale)
     throw std::runtime_error("sv block scale 与 convs 数量不符: " + p);
 
-  blk.conv1_w = load_conv_w(*f_, p + "conv1.weight");
+  const int co1_local = blk.width * blk.scale;
+  const int cin_conv1 = static_cast<int>(
+      f_->tensor((p + "conv1.weight").c_str())->dims[1]);
+  blk.conv1_w = load_conv_w(*f_, p + "conv1.weight", nullptr
+#if defined(GSV_AMX_GEMM)
+      , &blk.conv1_panel, size_t(co1_local), size_t(cin_conv1)
+#endif
+  );
   blk.bn1 = load_bn(*f_, p + "bn1");
   for (int j = 0; j < blk.scale; ++j) {
     blk.convs_w.push_back(
         load_conv_w(*f_, p + "convs." + std::to_string(j) + ".weight"));
     blk.bns.push_back(load_bn(*f_, p + "bns." + std::to_string(j)));
   }
-  blk.conv3_w = load_conv_w(*f_, p + "conv3.weight");
+  blk.conv3_w = load_conv_w(*f_, p + "conv3.weight", nullptr
+#if defined(GSV_AMX_GEMM)
+      , &blk.conv3_panel, size_t(blk.exp_planes), size_t(co1_local)
+#endif
+  );
   blk.bn3 = load_bn(*f_, p + "bn3");
   if (blk.aff) {
     for (int j = 0; j < blk.scale - 1; ++j) {
@@ -610,32 +951,33 @@ void SvEngine::load_block(int l, int i, bool expect_aff) {
   }
   blk.has_shortcut = f_->tensor((p + "shortcut.0.weight").c_str()) != nullptr;
   if (blk.has_shortcut) {
-    blk.sc_w = load_conv_w(*f_, p + "shortcut.0.weight");
+    const int cin_sc = static_cast<int>(
+        f_->tensor((p + "shortcut.0.weight").c_str())->dims[1]);
+    blk.sc_w = load_conv_w(*f_, p + "shortcut.0.weight", nullptr
+#if defined(GSV_AMX_GEMM)
+        , &blk.sc_panel, size_t(blk.exp_planes), size_t(cin_sc)
+#endif
+    );
     blk.sc_bn = load_bn(*f_, p + "shortcut.1");
   }
 
 #if defined(GSV_AMX_GEMM)
-  // E12: 装载期预打包 AMX 权重 panel。形状分流门槛与 E8 一致(K>=256)。
-  // 注意 c_in 需从上一 stage 推得: conv1 的 in = 上一层输出通道。
+  // E12: 装载期预打包 AMX 权重 panel。形状分流见 amx_sv_worth_packing(T3 收紧)。
   if (amx_sv_enabled() && kern::amx_gemm_available()) {
-    const int co1 = blk.width * blk.scale;
-    // conv1 输入通道: i==0 ? 上层 exp_planes : 同层上一块
-    const int cin_conv1 = f_->tensor((p + "conv1.weight").c_str())->dims[1];
-    const int co1_ck = static_cast<int>(f_->tensor((p + "conv1.weight").c_str())->dims[0]);
     auto try_pack = [&](kern::AmxPanel& panel, const uint16_t* w, size_t rows,
                         size_t K, bool& ready) {
-      if (rows >= kAmxSvMinRows && K >= kAmxSvMinK && w) {
+      if (amx_sv_worth_packing(rows, K) && w) {
         panel.rows = rows;
         panel.K = K;
         kern::amx_pack_into(w, rows, K, panel.buf);
         ready = true;
       }
     };
-    (void)co1; (void)co1_ck;
-    try_pack(blk.conv1_panel, blk.conv1_w, size_t(co1), size_t(cin_conv1),
+    (void)co1_local;
+    try_pack(blk.conv1_panel, blk.conv1_w, size_t(co1_local), size_t(cin_conv1),
              blk.conv1_panel_ready);
     try_pack(blk.conv3_panel, blk.conv3_w, size_t(blk.exp_planes),
-             size_t(co1), blk.conv3_panel_ready);
+             size_t(co1_local), blk.conv3_panel_ready);
     for (int j = 0; j < blk.scale; ++j) {
       kern::AmxPanel p3;
       bool ready = false;
@@ -697,7 +1039,7 @@ SvEngine::SvEngine(const GsvFile& f) : f_(&f) {
   if (amx_sv_enabled() && kern::amx_gemm_available()) {
     auto try_pack = [&](kern::AmxPanel& panel, const uint16_t* w, size_t rows,
                         size_t K, bool& ready) {
-      if (rows >= kAmxSvMinRows && K >= kAmxSvMinK && w) {
+      if (amx_sv_worth_packing(rows, K) && w) {
         panel.rows = rows;
         panel.K = K;
         kern::amx_pack_into(w, rows, K, panel.buf);
@@ -794,14 +1136,18 @@ size_t SvEngine::forward3(const float* fbk, size_t frames) {
 
   // flatten(C×F) → mean over T
   const int C = c_after_[4];  // 2048
-  emb_.assign(static_cast<size_t>(C) * h, 0.f);
-  for (int ci = 0; ci < C; ++ci)
-    for (int fy = 0; fy < h; ++fy) {
-      const float* row = o_fuse_.data() + (static_cast<size_t>(ci) * h + fy) * w;
-      double acc = 0.0;
-      for (int t = 0; t < w; ++t) acc += row[t];
-      emb_[static_cast<size_t>(ci) * h + fy] = static_cast<float>(acc / w);
-    }
+  {
+    const auto tp_pool = sv_tp();
+    emb_.assign(static_cast<size_t>(C) * h, 0.f);
+    for (int ci = 0; ci < C; ++ci)
+      for (int fy = 0; fy < h; ++fy) {
+        const float* row = o_fuse_.data() + (static_cast<size_t>(ci) * h + fy) * w;
+        double acc = 0.0;
+        for (int t = 0; t < w; ++t) acc += row[t];
+        emb_[static_cast<size_t>(ci) * h + fy] = static_cast<float>(acc / w);
+      }
+    sv_acc(tp_pool, g_sv_inner.meta_pool_ms);
+  }
   // E13 探针: 输出本轮 conv2d/conv2d_f16 内核累计耗时(仅 stderr, 不改行为)
   if (sv_inner_tim()) {
     std::fprintf(stderr,
@@ -810,6 +1156,13 @@ size_t SvEngine::forward3(const float* fbk, size_t frames) {
                  g_sv_inner.conv2d_ms, g_sv_inner.conv2d_f16_ms,
                  g_sv_inner.aff1_ms, g_sv_inner.aff_n, g_sv_inner.aff2_ms,
                  g_sv_inner.blkconv1_ms, g_sv_inner.blkconv1_s, T);
+    std::fprintf(stderr,
+                 "[sv-meta] bn=%.1f relu=%.1f add=%.1f copy=%.1f pool=%.1f "
+                 "im2col=%.1f pack=%.1f affgate=%.1f\n",
+                 g_sv_inner.meta_bn_ms, g_sv_inner.meta_relu_ms,
+                 g_sv_inner.meta_add_ms, g_sv_inner.meta_copy_ms,
+                 g_sv_inner.meta_pool_ms, g_sv_inner.meta_im2col_ms,
+                 g_sv_inner.meta_pack_ms, g_sv_inner.meta_aff_ms);
     std::vector<std::pair<std::string, std::pair<int, double>>> ranked(
         g_sv_inner.f16_by_shape.begin(), g_sv_inner.f16_by_shape.end());
     std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {

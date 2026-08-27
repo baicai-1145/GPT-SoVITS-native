@@ -126,6 +126,7 @@ class SvEngine {
   std::vector<std::vector<float>> o_layer_;
   std::vector<uint16_t> xh_, xh2_;    // fp16 激活暂存(AFF 转置量化复用)
   std::vector<uint16_t> cols16_;      // fp16 im2col 暂存(conv2d_f16)
+  std::vector<uint16_t> cvt16_;       // T4d: 3x3 im2col 整张量批量转换暂存
 #if defined(GSV_AMX_GEMM)
   std::vector<uint8_t> sv_act_scratch_;   // E12: AMX 激活 panel 缓冲(容量复用)
 #endif

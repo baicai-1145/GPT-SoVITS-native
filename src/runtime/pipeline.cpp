@@ -316,6 +316,16 @@ bool Pipeline::buildReference(const std::string& refWavPath, SynthResult* out,
     sv_->forward3(fbank.data(), frames80);
     const double tSv1 = nowMs();
     std::vector<float> svEmb(sv_->emb_out());  // [20480]
+    // E13-SV 探针: GSV_SV_EMB_DUMP=<path> 时落盘 svEmb(验证侧工具, 零行为变更)
+    if (const char* dp = std::getenv("GSV_SV_EMB_DUMP"); dp && *dp) {
+      if (FILE* fp = std::fopen(dp, "wb")) {
+        std::fwrite(svEmb.data(), sizeof(float), svEmb.size(), fp);
+        std::fclose(fp);
+        std::fprintf(stderr, "[sv-dump] %s (%zu floats)\n", dp, svEmb.size());
+      } else {
+        std::fprintf(stderr, "[sv-dump] 写失败: %s\n", dp);
+    }
+    }
 
     // prompt_semantic: 原始音频直接 → 16k (+9600 零) → HuBERT → ssl_proj → RVQ
     Resampler to16raw;
