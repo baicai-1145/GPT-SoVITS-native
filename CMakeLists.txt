@@ -101,6 +101,12 @@ if(GSV_AMX_GEMM)
   target_link_libraries(amx_batch_bench PRIVATE gsv_kern gsv_rt)
   add_executable(s2_tile_chain_bench tools/s2_tile_chain_bench.cpp)
   target_link_libraries(s2_tile_chain_bench PRIVATE gsv_kern gsv_rt)
+  # E13-SV T3 探针: 回退热榜形状核算(仅本地探针用, 文件不入库)
+  if(EXISTS "${CMAKE_SOURCE_DIR}/.tmp/t3_probe.cpp")
+    add_executable(t3_probe .tmp/t3_probe.cpp)
+    target_include_directories(t3_probe PRIVATE src)
+    target_link_libraries(t3_probe PRIVATE gsv_kern gsv_rt)
+  endif()
 endif()
 
 # ---- 全链路 CLI (task/C2) ----
