@@ -187,6 +187,7 @@ inline float ConditionBuilder::mish(float x) {
 void ConditionBuilder::conv1dGlu(const float* in, size_t T, int layer,
                                  float* out) const {
   // in/out 均为 [C=128][T]; conv 权重 [256,128,5], pad=2
+  // E13-MIX 前基线原样实现(默认路径位级红线; T8 从 818146b^ 原样恢复)
   const std::vector<float>& Wt = tc_[size_t(layer)];
   const std::vector<float>& B = tb_[size_t(layer)];
   std::vector<float> conv(size_t(256) * T, 0.f);
@@ -218,7 +219,43 @@ void ConditionBuilder::conv1dGlu(const float* in, size_t T, int layer,
   }
 }
 
+void ConditionBuilder::conv1dGluBatched(const float* in, size_t T, int layer,
+                                        float* out) const {
+  const std::vector<float>& Wt = tc_[size_t(layer)];
+  const std::vector<float>& B = tb_[size_t(layer)];
+  std::vector<float> x2(size_t(T) * 640, 0.f);
+  for (size_t ci = 0; ci < 128; ++ci)
+    for (int k = 0; k < 5; ++k) {
+      float* col = x2.data() + size_t(ci) * 5 + size_t(k);
+      for (size_t t = 0; t < T; ++t) {
+        const int64_t ti = int64_t(t) + k - 2;
+        if (ti < 0 || ti >= int64_t(T)) continue;  // 零填充(同基线)
+        col[size_t(t) * 640] = in[ci * T + size_t(ti)];
+      }
+    }
+  std::vector<float> y(size_t(T) * 256);
+  sgemm('N', 'T', int(T), 256, 640, 1.0f, x2.data(), 640, Wt.data(), 640,
+        0.0f, y.data(), 256);
+  // bias + GLU + 残差(基线同公式)
+  for (size_t t = 0; t < T; ++t) {
+    const float* yr = y.data() + t * 256;
+    for (size_t c = 0; c < 128; ++c) {
+      const float g = (yr[size_t(c)] + B[size_t(c)]) /
+                      (1.f + std::exp(-(yr[128 + size_t(c)] + B[128 + size_t(c)])));
+      out[size_t(c) * T + t] = g + in[size_t(c) * T + t];
+    }
+  }
+}
+
 void ConditionBuilder::refEnc(const float* condIn, size_t T,
+                              std::vector<float>& pooled) const {
+  // T8: amxEnc_ 派发 — 默认 false 走基线标量实现(位级红线),
+  //     --amx-enc 时走 T6 批量化实现(mel 门口径)。
+  if (amxEnc_) refEncBatched(condIn, T, pooled);
+  else         refEncScalar(condIn, T, pooled);
+}
+
+void ConditionBuilder::refEncScalar(const float* condIn, size_t T,
                               std::vector<float>& pooled) const {
   // E13 探针: ref_enc 内部分段(GSV_COND_TIMING 门控, 只计时不改行为)
   using clk = std::chrono::steady_clock;
@@ -311,6 +348,136 @@ void ConditionBuilder::refEnc(const float* condIn, size_t T,
                  cms(tr4, tr5), cms(tr5, clk::now()), T);
 }
 
+void ConditionBuilder::refEncBatched(const float* condIn, size_t T,
+                              std::vector<float>& pooled) const {
+  // E13 探针: ref_enc 内部分段(GSV_COND_TIMING 门控, 只计时不改行为)
+  using clk = std::chrono::steady_clock;
+  const bool condTim = std::getenv("GSV_COND_TIMING") != nullptr;
+  auto cms = [](clk::time_point a, clk::time_point b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+  };
+  // condIn: [T][704] → spectral → [T][128]
+  // T6: sp0_/sp3_ 逐行标量 sgemm(每行单次 M=1 调用) → 整批矩阵积(M=T 一次)
+  std::vector<float> h(T * 128), tmp(T * 128);
+  const auto tr0 = clk::now();
+  {  // h[T,128] = condIn[T,704] · W₀ᵀ + b₀ ; mish 原位
+    sgemm('N', 'T', int(T), 128, 704, 1.0f, condIn, 704, sp0_.W.data(), 704,
+          0.0f, h.data(), 128);
+    for (size_t t = 0; t < T; ++t) {
+      float* r = h.data() + t * 128;
+      for (int c = 0; c < 128; ++c) r[c] += sp0_.b[size_t(c)];
+      for (size_t c = 0; c < 128; ++c) r[c] = mish(r[c]);
+    }
+  }
+  {  // tmp[T,128] = h[T,128] · W₃ᵀ + b₃ ; mish
+    sgemm('N', 'T', int(T), 128, 128, 1.0f, h.data(), 128, sp3_.W.data(), 128,
+          0.0f, tmp.data(), 128);
+    for (size_t t = 0; t < T; ++t) {
+      float* r = tmp.data() + t * 128;
+      for (int c = 0; c < 128; ++c) r[c] += sp3_.b[size_t(c)];
+      for (size_t c = 0; c < 128; ++c) r[c] = mish(r[c]);
+    }
+  }
+  const auto tr1 = clk::now();
+
+  // temporal: 转成 [C,T] 做 conv, 再转回 [T,C]
+  std::vector<float> ct(128 * T), co(128 * T), tt(T * 128);
+  for (size_t t = 0; t < T; ++t)
+    for (size_t c = 0; c < 128; ++c) ct[c * T + t] = tmp[t * 128 + c];
+  conv1dGluBatched(ct.data(), T, 0, co.data());
+  conv1dGluBatched(co.data(), T, 1, ct.data());
+  const auto tr2 = clk::now();
+  for (size_t t = 0; t < T; ++t)
+    for (size_t c = 0; c < 128; ++c) tt[t * 128 + c] = ct[c * T + t];
+
+  // MHA (mask=None): q,k,v = Linear(x); 每 head 切片 64 维
+  // T6: q/k/v 按批 sgemm(每层一次 M=T 矩阵积)
+  std::vector<float> q(T * 128), k(T * 128), v(T * 128), attnO(T * 128);
+  sgemm('N', 'T', int(T), 128, 128, 1.0f, tt.data(), 128, attWq_.W.data(),
+        128, 0.0f, q.data(), 128);
+  sgemm('N', 'T', int(T), 128, 128, 1.0f, tt.data(), 128, attWk_.W.data(),
+        128, 0.0f, k.data(), 128);
+  sgemm('N', 'T', int(T), 128, 128, 1.0f, tt.data(), 128, attWv_.W.data(),
+        128, 0.0f, v.data(), 128);
+  // bias 批量加(q/k/v 各 [T,128])
+  for (std::vector<float>* qb : {&q, &k, &v}) {
+    const Lin& L = (qb == &q) ? attWq_ : (qb == &k) ? attWk_ : attWv_;
+    for (size_t t = 0; t < T; ++t) {
+      float* r = qb->data() + t * 128;
+      for (int c = 0; c < 128; ++c) r[c] += L.b[size_t(c)];
+    }
+  }
+  const auto tr3 = clk::now();  // MHA 线性(q/k/v)结束
+  const double temperature = std::sqrt(128.0);
+  // T6: attention 核心批量化 — 每头一次 QKᵀ sgemm([T,64]·[T,64]ᵀ→[T,T]) +
+  //     行内 softmax(max 减除后 exp, double 累加和与基线同式) + PV sgemm;
+  //     替换基线 2×T×(T×64 + T×64) 标量三重循环(15.6ms@T369)
+  {
+    std::vector<float> sc(size_t(T) * T);
+    for (int head = 0; head < 2; ++head) {
+      const size_t off = size_t(head) * 64;
+      sgemm('N', 'T', int(T), int(T), 64, 1.0f, q.data() + off, 128,
+            k.data() + off, 128, 0.0f, sc.data(), int(T));
+      // 温度缩放(逐元素, 与基线同为求和后除常量)
+      for (size_t idx = 0; idx < sc.size(); ++idx)
+        sc[idx] = float(double(sc[idx]) / temperature);
+      for (size_t ti = 0; ti < T; ++ti) {
+        float* row = sc.data() + ti * T;
+        double mx = -1e30;
+        for (size_t tj = 0; tj < T; ++tj)
+          if (double(row[tj]) > mx) mx = double(row[tj]);
+        double sum = 0.0;
+        for (size_t tj = 0; tj < T; ++tj) {
+          const double e = std::exp(double(row[tj]) - mx);
+          row[tj] = float(e);
+          sum += e;
+        }
+        const double inv = 1.0 / sum;
+        for (size_t tj = 0; tj < T; ++tj)
+          row[tj] = float(double(row[tj]) * inv);
+      }
+      // attnO 头块 = P·V_h
+      sgemm('N', 'N', int(T), 64, int(T), 1.0f, sc.data(), int(T),
+            v.data() + off, 128, 0.0f, attnO.data() + off, 128);
+    }
+  }
+  const auto tr4 = clk::now();  // attention 核心结束
+  // output = fc(attnO) + residual   (T6: 批量 sgemm)
+  std::vector<float> fo(T * 128);
+  {
+    sgemm('N', 'T', int(T), 128, 128, 1.0f, attnO.data(), 128,
+          attFc_.W.data(), 128, 0.0f, fo.data(), 128);
+    for (size_t t = 0; t < T; ++t) {
+      float* r = fo.data() + t * 128;
+      for (int c = 0; c < 128; ++c)
+        r[c] += attFc_.b[size_t(c)] + tt[t * 128 + size_t(c)];
+    }
+  }
+  const auto tr5 = clk::now();  // attFc 结束
+  // fc → [T,1024], 时间平均池化 (T6: 批量 sgemm + 双精度列累加与基线同口径)
+  {
+    std::vector<float> y(size_t(T) * 1024);
+    sgemm('N', 'T', int(T), 1024, 128, 1.0f, fo.data(), 128, fc_.W.data(),
+          128, 0.0f, y.data(), 1024);
+    std::vector<double> pool(1024, 0.0);
+    for (size_t t = 0; t < T; ++t) {
+      float* r = y.data() + t * 1024;
+      for (int c = 0; c < 1024; ++c) r[c] += fc_.b[size_t(c)];
+      for (int c = 0; c < 1024; ++c) pool[size_t(c)] += double(r[c]);
+    }
+    pooled.assign(1024, 0.f);
+    for (size_t c = 0; c < 1024; ++c) pooled[c] = float(pool[c] / double(T));
+  }
+  if (condTim) {
+    const auto tr6 = clk::now();
+    std::fprintf(stderr,
+                 "[refenc-timing] spectral=%.1fms temporal_conv=%.1fms "
+                 "qkv_lin=%.1fms attn_core=%.1fms attfc=%.1fms fc_pool=%.1fms "
+                 "T=%zu\n",
+                 cms(tr0, tr1), cms(tr1, tr2), cms(tr2, tr3), cms(tr3, tr4),
+                 cms(tr4, tr5), cms(tr5, tr6), T);
+  }
+}
 void ConditionBuilder::compute(const float* audio32k, size_t n,
                                const float* svEmb20480,
                                DecodeCondition* out) const {

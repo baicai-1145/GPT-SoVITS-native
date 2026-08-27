@@ -51,6 +51,10 @@ class ConditionBuilder {
   void compute(const float* audio32k, size_t n, const float* svEmb20480,
                DecodeCondition* out) const;
 
+  // T8: 批量化 ref_enc 开关(--amx-enc 门控, Pipeline 初始化时接线)。
+  //   默认 false = 原标量实现逐位口径(E13-MIX 前基线); true = T6 批量 sgemm 版。
+  void setAmxEnc(bool on) { amxEnc_ = on; }
+
   // 仅 ref_enc 主干 (供单测对 golden ref_enc 输出)
   void refEnc(const float* condIn, size_t T,
               std::vector<float>& pooled /*[1024]*/) const;
@@ -73,6 +77,17 @@ class ConditionBuilder {
   static inline float mish(float x);
   void conv1dGlu(const float* in /*[128,T]*/, size_t T, int layer,
                  float* out /*[128,T]*/) const;
+
+  // T8: 双实现共存 — refEnc 按 amxEnc_ 派发。
+  //   refEncScalar/conv1dGlu: E13-MIX 之前基线原样代码(默认路径位级红线);
+  //   refEncBatched/conv1dGluBatched: T6 批量化(--amx-enc 时走此路径, mel 门验议)。
+  void refEncScalar(const float* condIn, size_t T,
+                    std::vector<float>& pooled) const;
+  void refEncBatched(const float* condIn, size_t T,
+                     std::vector<float>& pooled) const;
+  void conv1dGluBatched(const float* in /*[128,T]*/, size_t T, int layer,
+                        float* out /*[128,T]*/) const;
+  bool amxEnc_ = false;
 };
 
 }  // namespace gsv::rt::pipeline
