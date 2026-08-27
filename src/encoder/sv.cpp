@@ -199,7 +199,19 @@ struct SvSite {
     e.second += std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - t0).count();
   }
-};// 计时起点: 关闭时返回零值 epoch(与现探针风格一致)
+};
+
+// E14-SV/C2: 对拍钩子开关。Block/Aff 的 last_out 全网无默认读者(c1_fixtures
+// 无 sv_l*b*.f32 逐块文件); 热路径整块拷贝(实测 blk_finalassign ~24.5ms)
+// 仅在未来逐块隔离时才需要 —— 由 GSV_SV_BLK_OUT=1 恢复。默认关闭属性能语义
+// 而非数值变更(last_out 不进任何下游计算)。
+inline bool sv_blk_out_on() {
+  static bool b = [] {
+    const char* e = std::getenv("GSV_SV_BLK_OUT");
+    return e && *e;
+  }();
+  return b;
+}// 计时起点: 关闭时返回零值 epoch(与现探针风格一致)
 inline std::chrono::steady_clock::time_point sv_tp() {
   return sv_inner_tim() ? std::chrono::steady_clock::now()
                         : std::chrono::steady_clock::time_point{};
@@ -745,8 +757,10 @@ void SvEngine::Aff::apply(const float* x, const float* ds, float* out, int h, in
     }
   }
   {
-    SvSite st("aff_lastout");
-    last_out.assign(out, out + static_cast<size_t>(ch) * s);
+    if (sv_blk_out_on()) {
+      SvSite st("aff_lastout");
+      last_out.assign(out, out + static_cast<size_t>(ch) * s);
+    }
   }
 }
 
@@ -823,12 +837,11 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
   auto chunk = [&](int i) -> const float* {
     return eng.cur_.data() + static_cast<size_t>(i) * width * s;
   };
-  std::vector<float> sp, fus;
+  std::vector<float> sp;
   {
-    SvSite st("blk_spfus_ctor");
+    SvSite st("blk_sp_ctor");
     // 等价于原 vector(n) 构造: 值初始化(零填充整块) — 探针归因此段耗时
     sp.resize(static_cast<size_t>(width) * s);
-    fus.resize(static_cast<size_t>(width) * s);
   }
   for (int i = 0; i < scale; ++i) {
     if (i > 0) {
@@ -836,13 +849,14 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
       if (aff) std::fprintf(stderr, "  [fuse i=%d]\n", i);
 #endif
       if (aff) {
-        fuses[static_cast<size_t>(i - 1)].apply(sp.data(), chunk(i), fus.data(), h, w,
+        // E14-SV/C2: 融合门控直接写回 sp(消 fus 双缓冲 + 整块拷贝; out 别名
+        // x 安全性同 Aff::apply —— 先读后写同下标)。
+        fuses[static_cast<size_t>(i - 1)].apply(sp.data(), chunk(i), sp.data(), h, w,
                                                eng.xh_, eng.xh2_
 #if defined(GSV_AMX_GEMM)
                                                , eng.sv_act_scratch_
 #endif
         );
-        std::memcpy(sp.data(), fus.data(), sp.size() * sizeof(float));
       } else {
         const auto tp_ad = sv_tp();
         // E13-SV/T4: 向量四宽加法(load 完成后才 store, 别名安全; 精确同序)
@@ -962,7 +976,7 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
 #ifdef C1_TRACE
   std::fprintf(stderr, "  [blk done]\n");
 #endif
-  {
+  if (sv_blk_out_on()) {
     const auto tp_asg = sv_tp();
     last_out.assign(eng.nxt_.begin(), eng.nxt_.end());
     if (sv_inner_tim()) {
