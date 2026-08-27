@@ -191,10 +191,23 @@ inline void sv_acc(std::chrono::steady_clock::time_point t0, double& dst) {
 
 void SvEngine::Bn::apply(float* x, int c, size_t s) const {
   const auto tp = sv_tp();
-  // E13-SV/T4c: 每 channel 预算一次 scale/beta(fp32), 行内 NEON FMA。
-  // 原实现是逐元素 double 链 (x-mu)*a+beta —— 属实现精度选择(非 torch
-  // 语义要求, torch CPU BN 本身就是 fp32 vectorized); 小步 A/B 门禁:
-  // svEmb corr 签名差 + wav mel 包络 ≤0.005。
+  if (!amx_sv_enabled()) {
+    // 默认路径(旗关): 保持 C1 原双精度链位级不变(HANDOFF §6)
+    constexpr double eps0 = 1e-5;
+    for (int ci = 0; ci < c; ++ci) {
+      const double a0 = static_cast<double>(g[ci]) /
+                        std::sqrt(static_cast<double>(var[ci]) + eps0);
+      const double beta0 = static_cast<double>(b[ci]);
+      const double mu0 = static_cast<double>(mean[ci]);
+      float* row0 = x + static_cast<size_t>(ci) * s;
+      for (size_t i = 0; i < s; ++i)
+        row0[i] = static_cast<float>((static_cast<double>(row0[i]) - mu0) * a0 + beta0);
+    }
+    sv_acc(tp, g_sv_inner.meta_bn_ms);
+    return;
+  }
+  // E13-SV/T4c(--amx-enc 档): 每 channel 预算一次 scale/beta(fp32), 行内
+  // NEON FMA。double 链属实现精度选择(非 torch 语义要求); 门禁 corr/mel。
   constexpr float eps = 1e-5f;
   const int rc = int(s & ~size_t(3));
   for (int ci = 0; ci < c; ++ci) {
