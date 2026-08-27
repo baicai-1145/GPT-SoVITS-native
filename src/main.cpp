@@ -72,7 +72,8 @@ void printHelp(const char* argv0) {
       "  --sample-seed S   采样种子(默认随机)\n"
       "  --amx-bert        BERT dense 层启用 AMX fp16 GEMM(实验; 默认关;\n"
       "                    影响文本前端 roberta/G2PW 计算时长, 数值位级一致)\n"
-      "  --amx-enc         HuBERT dense 层启用 AMX(参考音频编码; 默认关)\n"
+      "  --amx-enc         HuBERT dense + cond ref_enc 批量化(参考音频编码; 默认关;\n"
+      "                    数值: HuBERT 位级口径 / cond 走 mel 包络口径)\n"
       "  -h/--help         本帮助\n",
       argv0);
 }

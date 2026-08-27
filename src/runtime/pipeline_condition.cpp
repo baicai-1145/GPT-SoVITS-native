@@ -186,13 +186,41 @@ inline float ConditionBuilder::mish(float x) {
 
 void ConditionBuilder::conv1dGlu(const float* in, size_t T, int layer,
                                  float* out) const {
-  // in/out 均为 [C=128][T]; 权重 = .gsv 行主展平恒等视闬 [out=256][in=128,tap=5]
-  //   Wr[o][ci*5+k] = Wt_raw[o*640 + ci*5 + k] — 无需重排(与原标量实现
-  //   wbase=Wt+o*640, wbase[ci*5+k] 同一语义)
-  // T6: 标量四重循环(double 累加, 65ms@T369 两层) → 经典 im2col + 单次 sgemm:
-  //   x2[t][ci*5+k] = 零填充后的 in[ci][t+k-2]   ([T,640] 行主)
-  //   y[t][o] = Σ_j x2[t][j]·Wr[o][j] ⇒ sgemm('N','T', T,256,640)
-  //   GLU+残差: out[c][t] = (y[t][c]+b[c])·σ(y[t][128+c]+b[128+c]) + in[c][t]
+  // in/out 均为 [C=128][T]; conv 权重 [256,128,5], pad=2
+  // E13-MIX 前基线原样实现(默认路径位级红线; T8 从 818146b^ 原样恢复)
+  const std::vector<float>& Wt = tc_[size_t(layer)];
+  const std::vector<float>& B = tb_[size_t(layer)];
+  std::vector<float> conv(size_t(256) * T, 0.f);
+  for (size_t c = 0; c < 256; ++c) {
+    float* dst = conv.data() + c * T;
+    const float* wbase = Wt.data() + size_t(c) * 128 * 5;
+    for (size_t t = 0; t < T; ++t) {
+      double acc = double(B[c]);
+      for (int k = 0; k < 5; ++k) {
+        const int64_t ti = int64_t(t) + k - 2;
+        if (ti < 0 || ti >= int64_t(T)) continue;  // zero padding
+        double inner = 0.0;
+        for (size_t ci = 0; ci < 128; ++ci)
+          inner += double(wbase[size_t(ci) * 5 + size_t(k)]) *
+                   in[ci * T + size_t(ti)];
+        acc += inner;
+      }
+      dst[t] = float(acc);
+    }
+  }
+  // GLU: 前 128 半 × σ(后 128 半) + 残差
+  for (size_t c = 0; c < 128; ++c) {
+    const float* x1 = conv.data() + c * T;
+    const float* x2 = conv.data() + (128 + c) * T;
+    for (size_t t = 0; t < T; ++t) {
+      out[c * T + t] =
+          x1[t] / (1.f + std::exp(-x2[t])) + in[c * T + t];
+    }
+  }
+}
+
+void ConditionBuilder::conv1dGluBatched(const float* in, size_t T, int layer,
+                                        float* out) const {
   const std::vector<float>& Wt = tc_[size_t(layer)];
   const std::vector<float>& B = tb_[size_t(layer)];
   std::vector<float> x2(size_t(T) * 640, 0.f);
@@ -220,6 +248,107 @@ void ConditionBuilder::conv1dGlu(const float* in, size_t T, int layer,
 }
 
 void ConditionBuilder::refEnc(const float* condIn, size_t T,
+                              std::vector<float>& pooled) const {
+  // T8: amxEnc_ 派发 — 默认 false 走基线标量实现(位级红线),
+  //     --amx-enc 时走 T6 批量化实现(mel 门口径)。
+  if (amxEnc_) refEncBatched(condIn, T, pooled);
+  else         refEncScalar(condIn, T, pooled);
+}
+
+void ConditionBuilder::refEncScalar(const float* condIn, size_t T,
+                              std::vector<float>& pooled) const {
+  // E13 探针: ref_enc 内部分段(GSV_COND_TIMING 门控, 只计时不改行为)
+  using clk = std::chrono::steady_clock;
+  const bool condTim = std::getenv("GSV_COND_TIMING") != nullptr;
+  auto cms = [](clk::time_point a, clk::time_point b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+  };
+  // condIn: [T][704] → spectral → [T][128]
+  std::vector<float> h(T * 128), tmp(T * 128);
+  const auto tr0 = clk::now();
+  for (size_t t = 0; t < T; ++t) sp0_.run(condIn + t * 704, h.data() + t * 128);
+  for (size_t t = 0; t < T; ++t) {
+    float* r = h.data() + t * 128;
+    for (size_t c = 0; c < 128; ++c) r[c] = mish(r[c]);
+  }
+  for (size_t t = 0; t < T; ++t) sp3_.run(h.data() + t * 128, tmp.data() + t * 128);
+  for (size_t t = 0; t < T; ++t) {
+    float* r = tmp.data() + t * 128;
+    for (size_t c = 0; c < 128; ++c) r[c] = mish(r[c]);
+  }
+  const auto tr1 = clk::now();
+
+  // temporal: 转成 [C,T] 做 conv, 再转回 [T,C]
+  std::vector<float> ct(128 * T), co(128 * T), tt(T * 128);
+  for (size_t t = 0; t < T; ++t)
+    for (size_t c = 0; c < 128; ++c) ct[c * T + t] = tmp[t * 128 + c];
+  conv1dGlu(ct.data(), T, 0, co.data());
+  conv1dGlu(co.data(), T, 1, ct.data());
+  const auto tr2 = clk::now();
+  for (size_t t = 0; t < T; ++t)
+    for (size_t c = 0; c < 128; ++c) tt[t * 128 + c] = ct[c * T + t];
+
+  // MHA (mask=None): q,k,v = Linear(x); 每 head 切片 64 维
+  std::vector<float> q(T * 128), k(T * 128), v(T * 128), attnO(T * 128);
+  for (size_t t = 0; t < T; ++t) {
+    attWq_.run(tt.data() + t * 128, q.data() + t * 128);
+    attWk_.run(tt.data() + t * 128, k.data() + t * 128);
+    attWv_.run(tt.data() + t * 128, v.data() + t * 128);
+  }
+  const auto tr3 = clk::now();  // MHA 线性(q/k/v)结束
+  const double temperature = std::sqrt(128.0);
+  for (int head = 0; head < 2; ++head) {
+    const size_t off = size_t(head) * 64;
+    for (size_t ti = 0; ti < T; ++ti) {  // 对每个 query 位置
+      std::vector<double> score(T);
+      double mx = -1e30;
+      for (size_t tj = 0; tj < T; ++tj) {
+        double s = 0.0;
+        for (size_t d = 0; d < 64; ++d)
+          s += double(q[ti * 128 + off + d]) * k[tj * 128 + off + d];
+        score[tj] = s / temperature;
+        if (score[tj] > mx) mx = score[tj];
+      }
+      double sum = 0.0;
+      for (size_t tj = 0; tj < T; ++tj) {
+        score[tj] = std::exp(score[tj] - mx);
+        sum += score[tj];
+      }
+      for (size_t d = 0; d < 64; ++d) {
+        double acc = 0.0;
+        for (size_t tj = 0; tj < T; ++tj)
+          acc += (score[tj] / sum) * v[tj * 128 + off + d];
+        attnO[ti * 128 + off + d] = float(acc);
+      }
+    }
+  }
+  const auto tr4 = clk::now();  // attention 核心结束
+  // output = fc(attnO) + residual
+  std::vector<float> fo(T * 128);
+  for (size_t t = 0; t < T; ++t) {
+    attFc_.run(attnO.data() + t * 128, fo.data() + t * 128);
+    for (size_t c = 0; c < 128; ++c)
+      fo[t * 128 + c] += tt[t * 128 + c];
+  }
+  const auto tr5 = clk::now();  // attFc 结束
+  // fc → [T,1024], 时间平均池化
+  std::vector<double> pool(1024, 0.0);
+  std::vector<float> row(1024);
+  for (size_t t = 0; t < T; ++t) {
+    fc_.run(fo.data() + t * 128, row.data());
+    for (size_t c = 0; c < 1024; ++c) pool[c] += row[c];
+  }
+  pooled.assign(1024, 0.f);
+  for (size_t c = 0; c < 1024; ++c) pooled[c] = float(pool[c] / double(T));
+  if (condTim)
+    std::fprintf(stderr,
+                 "[refenc-timing] spectral=%.1fms temporal_conv=%.1fms "
+                 "qkv_lin=%.1fms attn_core=%.1fms attfc=%.1fms fc_pool=%.1fms T=%zu\n",
+                 cms(tr0, tr1), cms(tr1, tr2), cms(tr2, tr3), cms(tr3, tr4),
+                 cms(tr4, tr5), cms(tr5, clk::now()), T);
+}
+
+void ConditionBuilder::refEncBatched(const float* condIn, size_t T,
                               std::vector<float>& pooled) const {
   // E13 探针: ref_enc 内部分段(GSV_COND_TIMING 门控, 只计时不改行为)
   using clk = std::chrono::steady_clock;
@@ -255,8 +384,8 @@ void ConditionBuilder::refEnc(const float* condIn, size_t T,
   std::vector<float> ct(128 * T), co(128 * T), tt(T * 128);
   for (size_t t = 0; t < T; ++t)
     for (size_t c = 0; c < 128; ++c) ct[c * T + t] = tmp[t * 128 + c];
-  conv1dGlu(ct.data(), T, 0, co.data());
-  conv1dGlu(co.data(), T, 1, ct.data());
+  conv1dGluBatched(ct.data(), T, 0, co.data());
+  conv1dGluBatched(co.data(), T, 1, ct.data());
   const auto tr2 = clk::now();
   for (size_t t = 0; t < T; ++t)
     for (size_t c = 0; c < 128; ++c) tt[t * 128 + c] = ct[c * T + t];
@@ -349,7 +478,6 @@ void ConditionBuilder::refEnc(const float* condIn, size_t T,
                  cms(tr4, tr5), cms(tr5, tr6), T);
   }
 }
-
 void ConditionBuilder::compute(const float* audio32k, size_t n,
                                const float* svEmb20480,
                                DecodeCondition* out) const {

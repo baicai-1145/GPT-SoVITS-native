@@ -240,6 +240,11 @@ bool Pipeline::load(const std::string& weightsDir, const std::string& dataDir,
     sovits_->load(fSov_->path(), opt.sovits_amx);
     profMark("sovits_load(460MB+pack)", &tStage);
     cond_.load(*fSov_);
+#if defined(GSV_AMX_GEMM)
+    // T8: cond 批量化 ref_enc 收进 --amx-enc 门控(默认 false=基线标量位级口径);
+    //     T6 优化只在旗开时生效(mel 门口径验收)。
+    cond_.setAmxEnc(opt_.enc_amx);
+#endif
     profMark("cond_load", &tStage);
 #if defined(GSV_AMX_GEMM)
     // E12: SV 装载前使能 — SvEngine 构造期据此预打包 conv panel。
