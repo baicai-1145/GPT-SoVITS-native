@@ -64,6 +64,11 @@ class HubertEngine {
 
  private:
   static void gelu(float* x, size_t n);
+#if defined(GSV_AMX_GEMM)
+  // T12: AMX 旗后 SDPA 批量化(batched sgemm; 数值 = E12/cos+codes 谱系)
+  void sdpa_amx_sgemm(float* qp, float* kp, float* vp, size_t T, size_t hd,
+                      float scale, float* att_out);
+#endif
   void conv_layer(int li, const std::vector<float>& in, int in_c, size_t in_len,
                   std::vector<float>& out, int& out_c, size_t& out_len);
 
@@ -103,7 +108,12 @@ class HubertEngine {
     std::vector<float> w;           // 无 f16 段回退(不适用; 保留类型以防)
     bool has_gn = false;
     std::vector<float> gn_g, gn_b;
+#if defined(GSV_AMX_GEMM)
+    kern::AmxPanel conv_panel;      // T13: 装载期预打包(旗后)
+    bool conv_panel_ready = false;
+#endif
   };
+
   ConvL convs_[7];
   Dense proj_;
   std::vector<float> proj_ln_g_, proj_ln_b_;
@@ -115,12 +125,17 @@ class HubertEngine {
   // scratch(跨 run 复用)
   std::vector<float> cur_, nxt_, cnn_, cols_, tmp_, x_, pos_out_, qkv_, att_,
       ff_, resid_, smax_;
+  std::vector<float> sc_;   // T11: SDPA 全头分数缓冲 [heads·T·T]
+  std::vector<float> ovh_;  // T11: 单头 PV 输出暂存 [T·hd]
+  // T12: AMX 旗后 SDPA(batched sgemm) 滚动缓冲
+  std::vector<float> sdpasc_, sdpa_qg_, sdpa_kg_, sdpa_vtg_;
   std::vector<float> proj_o_, l0_, last_;
   size_t cnn_t_ = 0;
   std::vector<uint16_t> xh_;      // fp16 激活暂存(DenseF16 view FMLAL 前向复用)
   std::vector<uint16_t> cols16_;  // fp16 im2col 暂存(CNN/pos_conv FMLAL 用)
 #if defined(GSV_AMX_GEMM)
   std::vector<uint8_t> hub_act_scratch_;  // E12: AMX 激活 panel 缓冲(容量复用)
+  std::vector<uint8_t> hub_conv_act_;     // T13: CNN 激活 B 面板(容量复用)
 #endif
   // 对拍捕获
   std::vector<float> cap_pos_, cap_encln_, cap_l0attn_, cap_l0ln1_, cap_l0ffn_,

@@ -13,6 +13,8 @@
 #include <stdexcept>
 #include <string>
 
+#include <arm_neon.h>
+
 namespace gsv::encoder {
 
 using rt::GsvFile;
@@ -27,7 +29,8 @@ AmxEncMode& amx_hubert_mode() {
   static AmxEncMode m = [] {
     const char* e = std::getenv("GSV_AMX_HUBERT_MODE");
     if (!e) return AmxEncMode::kAll;
-    if (e[0] == 'f') return AmxEncMode::kFfnOnly;
+    // T11: 删除 'f'(ffn-only) 分支 —— 构造期仅 kAll 打包 panel,
+    // kFfnOnly 实为空开关(与 FMLAL 完全同路), 已实证(v1_codes)并裁定移除。
     if (e[0] == 'n') return AmxEncMode::kNone;
     return AmxEncMode::kAll;
   }();
@@ -114,6 +117,20 @@ HubertEngine::HubertEngine(const GsvFile& f) {
     if (!wv.has_f16())
       throw std::runtime_error("hubert conv 权重缺 f16 段: " + p);
     L.w16 = wv.data_f16_raw();  // fp16 直读(FMLAL)
+#if defined(GSV_AMX_GEMM)
+    // T13: CNN 权重装载期预打包(仅 kAll)。打包是装载期一次性成本,
+    // 运行时每次卷积都省 FMLAL 全量重算, 无需形状门槛抛股(除退化防护);
+    // 数值谱系 = E12/E5-P2(f16 im2col 输入位型不变, 归约序换 Z 长条链),
+    // 由 codes 56 段全量门禁裁决。
+    if (amx_hubert_enabled() && amx_hubert_mode() == AmxEncMode::kAll &&
+        kern::amx_gemm_available() && wv.numel() >= 4096) {
+      L.conv_panel.rows = static_cast<size_t>(out_c);
+      L.conv_panel.K = wv.numel() / static_cast<size_t>(out_c);
+      kern::amx_pack_into(L.w16, L.conv_panel.rows, L.conv_panel.K,
+                          L.conv_panel.buf);
+      L.conv_panel_ready = true;
+    }
+#endif
     if (li == 0) {
       L.has_gn = true;
       L.gn_g = vec_any((p + "layer_norm.weight").c_str());
@@ -210,12 +227,176 @@ void cast_pack_B_f32(const float* x_fp32, size_t T, size_t K,
 }
 
 }  // namespace
+
+// ---- T12: SDPA AMX 批量化(旗后; E11-5 配方 + 微基准裁决的 batched sgemm 路径) ----
+// 数值口径: 不位级(与 V1/E12 先例同谱系, codes 逐位为门禁)。
+//   每层每头两次 fp32 sgemm:
+//     QKT: C[T,T] = Q_h[T,HD] · K_h[T,HD]ᵀ  (gather 列切片后连续)
+//     PV : C[T,HD] = P[T,T] · VT_h[HD,T]ᵀ   (P 直接吃 softmax f32 输出,
+//                                              VT 为列转置 gather 布局)
+//   scale/softmax 与标量路径同一序: 先逐元素乘 scale 再 kern::softmax。
+void HubertEngine::sdpa_amx_sgemm(float* qp, float* kp, float* vp, size_t T,
+                                  size_t hd, float scale, float* att_out) {
+  const size_t D = hidden_;
+  if (sdpasc_.size() < T * hd) sdpasc_.resize(T * hd);
+  if (sdpa_qg_.size() < T * hd) sdpa_qg_.resize(T * hd);
+  if (sdpa_kg_.size() < T * hd) sdpa_kg_.resize(T * hd);
+  if (sdpa_vtg_.size() < hd * T) sdpa_vtg_.resize(hd * T);
+  if (sc_.size() < heads_ * T * T) sc_.resize(heads_ * T * T);
+  if (ovh_.size() < T * hd) ovh_.resize(T * hd);
+
+  for (int h = 0; h < heads_; ++h) {
+    const size_t off = size_t(h) * hd;
+    // gather Q/K 列切片 → 连续 [T,hd]
+    for (size_t t = 0; t < T; ++t) {
+      std::memcpy(sdpa_qg_.data() + t * hd, qp + t * D + off, hd * sizeof(float));
+      std::memcpy(sdpa_kg_.data() + t * hd, kp + t * D + off, hd * sizeof(float));
+    }
+    float* sc_head = sc_.data() + size_t(h) * T * T;
+    // QK^T: sgemm('N','T', M=T, N=T, K=hd); A=Q_g [T,hd], B=K_g [T,hd]
+    gsv::kern::accel::sgemm('N', 'T', int(T), int(T), int(hd), 1.0f,
+                            sdpa_qg_.data(), int(hd), sdpa_kg_.data(), int(hd),
+                            0.0f, sc_head, int(T));
+    for (size_t i = 0; i < T * T; ++i) sc_head[i] *= scale;
+    for (size_t q = 0; q < T; ++q)
+      gsv::kern::softmax(sc_head + q * T, sc_head + q * T, T);
+    // gather V 列转置 → [hd,T]
+    for (size_t t = 0; t < T; ++t)
+      for (size_t e = 0; e < hd; ++e)
+        sdpa_vtg_[e * T + t] = vp[t * D + off + e];
+    // P·V: C[T,hd] = P[T,T] · VT[hd,T]ᵀ
+    gsv::kern::accel::sgemm('N', 'T', int(T), int(hd), int(T), 1.0f, sc_head,
+                            int(T), sdpa_vtg_.data(), int(T), 0.0f,
+                            sdpasc_.data(), int(hd));
+    for (size_t q = 0; q < T; ++q)
+      std::memcpy(att_out + q * D + off, sdpasc_.data() + q * hd,
+                  hd * sizeof(float));
+  }
+}
+
 #endif  // GSV_AMX_GEMM
 
 void HubertEngine::gelu(float* x, size_t n) {
   for (size_t i = 0; i < n; ++i)
     x[i] = 0.5f * x[i] * (1.0f + std::erf(x[i] * static_cast<float>(M_SQRT1_2)));
 }
+
+namespace {
+
+// ---- T11 保序 NEON SDPA 内核(构造性位级等价, V2 反汇编实锤配方) ----
+//
+// 数值论证(见 .tmp/evidence-V.md / .tmp/t11_gate.bin 验收):
+//  · 生产目标码实测(dot 主循环): 向量精确积(fmul.4s) → lane 提取 →
+//    升序注入单累加器(分离加, 无收缩)。
+//    ⇒ 本内核逐字复刻该形态; vmulq 积精确落入寄存器后再按同序插入,
+//      算术图与舍入点序列完全不变(元素级对拍 0/159201 失配)。
+//  · 双分数(t, t+1)交错只是并行产两条独立链, 各自仍严格 e 升序左折叠,
+//    不引入任何新的结合点。
+//  contract(off): 防止此处 dot 被收缩成 fmadd(生产 dot 未收缩)。
+#pragma clang fp contract(off)
+inline void hubert_sdpa_qkt(const float* qp, const float* kp, size_t T,
+                            size_t D, size_t off, size_t hd, float scale,
+                            float* sc) {
+  const float* qs = qp + off;
+  const float* ks = kp + off;
+  size_t t = 0;
+  for (; t + 2 <= T; t += 2) {
+    const float* kv0 = ks + t * D;
+    const float* kv1 = kv0 + D;
+    for (size_t q = 0; q < T; ++q) {
+      const float* qv = qs + q * D;
+      float d0 = 0.f, d1 = 0.f;
+      size_t e = 0;
+      for (; e + 8 <= hd; e += 8) {
+        const float32x4_t p00 = vmulq_f32(vld1q_f32(qv + e), vld1q_f32(kv0 + e));
+        const float32x4_t p01 =
+            vmulq_f32(vld1q_f32(qv + e + 4), vld1q_f32(kv0 + e + 4));
+        const float32x4_t p10 = vmulq_f32(vld1q_f32(qv + e), vld1q_f32(kv1 + e));
+        const float32x4_t p11 =
+            vmulq_f32(vld1q_f32(qv + e + 4), vld1q_f32(kv1 + e + 4));
+        d0 = d0 + vgetq_lane_f32(p00, 0);
+        d0 = d0 + vgetq_lane_f32(p00, 1);
+        d0 = d0 + vgetq_lane_f32(p00, 2);
+        d0 = d0 + vgetq_lane_f32(p00, 3);
+        d0 = d0 + vgetq_lane_f32(p01, 0);
+        d0 = d0 + vgetq_lane_f32(p01, 1);
+        d0 = d0 + vgetq_lane_f32(p01, 2);
+        d0 = d0 + vgetq_lane_f32(p01, 3);
+        d1 = d1 + vgetq_lane_f32(p10, 0);
+        d1 = d1 + vgetq_lane_f32(p10, 1);
+        d1 = d1 + vgetq_lane_f32(p10, 2);
+        d1 = d1 + vgetq_lane_f32(p10, 3);
+        d1 = d1 + vgetq_lane_f32(p11, 0);
+        d1 = d1 + vgetq_lane_f32(p11, 1);
+        d1 = d1 + vgetq_lane_f32(p11, 2);
+        d1 = d1 + vgetq_lane_f32(p11, 3);
+      }
+      for (; e < hd; ++e) {
+        d0 = d0 + qv[e] * kv0[e];
+        d1 = d1 + qv[e] * kv1[e];
+      }
+      sc[q * T + t] = d0 * scale;
+      sc[q * T + t + 1] = d1 * scale;
+    }
+  }
+  for (; t < T; ++t) {
+    const float* kv0 = ks + t * D;
+    for (size_t q = 0; q < T; ++q) {
+      const float* qv = qs + q * D;
+      float d0 = 0.f;
+      size_t e = 0;
+      for (; e + 4 <= hd; e += 4) {
+        const float32x4_t pp = vmulq_f32(vld1q_f32(qv + e), vld1q_f32(kv0 + e));
+        d0 = d0 + vgetq_lane_f32(pp, 0);
+        d0 = d0 + vgetq_lane_f32(pp, 1);
+        d0 = d0 + vgetq_lane_f32(pp, 2);
+        d0 = d0 + vgetq_lane_f32(pp, 3);
+      }
+      for (; e < hd; ++e) d0 = d0 + qv[e] * kv0[e];
+      sc[q * T + t] = d0 * scale;
+    }
+  }
+}
+#pragma clang fp contract(on)  // 恢复默认(此函数外无其他声明)
+
+// PV(out = Σ_t p[t]·V[t,e]): 每输出元素一条独立链(t 升序), e 维 128-bit
+// lane 化。用 vfmaq 融合链 —— 生产目标码的 PV 循环正是 fmla.4s 融合形态
+// (与 dot 相反!), 尾部 std::fmaf 同语义。定义级对拍 0/25536 失配。
+#pragma clang fp contract(on)
+inline void hubert_sdpa_pv(const float* probs, const float* vp, size_t T,
+                           size_t D, size_t off, size_t hd, float* ov_head) {
+  std::fill(ov_head, ov_head + T * hd, 0.f);
+  for (size_t q = 0; q < T; ++q) {
+    const float* pr = probs + q * T;
+    float* ov = ov_head + q * hd;
+    size_t e = 0;
+    for (; e + 16 <= hd; e += 16) {
+      float32x4_t a0 = vdupq_n_f32(0.f), a1 = vdupq_n_f32(0.f);
+      float32x4_t a2 = vdupq_n_f32(0.f), a3 = vdupq_n_f32(0.f);
+      for (size_t t = 0; t < T; ++t) {
+        const float32x4_t p4 = vdupq_n_f32(pr[t]);
+        const float* vv = vp + t * D + off + e;
+        a0 = vfmaq_f32(a0, p4, vld1q_f32(vv));
+        a1 = vfmaq_f32(a1, p4, vld1q_f32(vv + 4));
+        a2 = vfmaq_f32(a2, p4, vld1q_f32(vv + 8));
+        a3 = vfmaq_f32(a3, p4, vld1q_f32(vv + 12));
+      }
+      vst1q_f32(ov + e, a0);
+      vst1q_f32(ov + e + 4, a1);
+      vst1q_f32(ov + e + 8, a2);
+      vst1q_f32(ov + e + 12, a3);
+    }
+    for (; e < hd; ++e) {
+      float s = 0.f;
+      for (size_t t = 0; t < T; ++t)
+        s = std::fmaf(pr[t], vp[t * D + off + e], s);
+      ov[e] = s;
+    }
+  }
+}
+#pragma clang fp contract(on)
+
+}  // namespace
 
 #if defined(GSV_AMX_GEMM)
 // E12: AMX dense — y[T,out] = x[T,in]·W[out,in]ᵀ + bias(与 FMLAL 同口径逐元素加)
@@ -275,6 +456,22 @@ void HubertEngine::conv_layer(int li, const std::vector<float>& in, int in_c, si
                     sizeof h);
       }
   out.resize(static_cast<size_t>(out_c) * T);
+#if defined(GSV_AMX_GEMM)
+  // T13: 旗后走 AMX pp —— im2col(cols16_) 输入位型不变, 仅 GEMM 归约后端
+  // FMLAL→AMX Z 长条链(E5-P2 同构); B 面板由 cols16_ 行主 [T,KK] 直包。
+  if (convs_[li].conv_panel_ready) {
+    kern::amx_pack_into(cols16_.data(), T, KK, hub_conv_act_);
+    kern::AmxPanel pb;
+    pb.rows = T;
+    pb.K = KK;
+    pb.buf.swap(hub_conv_act_);
+    kern::gemm_f16_amx_pp(convs_[li].conv_panel, pb, out.data(),
+                          static_cast<size_t>(out_c), T);
+    pb.buf.swap(hub_conv_act_);
+    out_len = T;
+    return;
+  }
+#endif
   kern::gemm_f16x_fmlal(convs_[li].w16, cols16_.data(), out.data(),
                         static_cast<size_t>(out_c), T, KK);
   out_len = T;
@@ -460,27 +657,57 @@ size_t HubertEngine::run(const float* waveform, size_t n) {
         }
       }
     }
-    // SDPA(无掩码): 每 head 独立
+    // SDPA(无掩码): 每 head 独立 —— T11 保序 NEON 后端(位级等价, 详见上方内核注释)
+    // T14 裁决放行(差分归因基准=相对部署基线零新增翻转, 实证 0/56):
+    //   随 --amx-enc 默认启用; GSV_T12_SDPA_AMX=0 可显式关闭(复现/仲裁档)
     const auto tp_sdpa0 = sdpaTim ? clk::now() : clk::time_point{};
     att_.assign(T * hidden_, 0.f);
+#if defined(GSV_AMX_GEMM) && defined(__aarch64__)
+    static const bool t12_sdpa_on =
+        [] { const char* e = std::getenv("GSV_T12_SDPA_AMX"); return !(e && e[0] == '0'); }();
+    if (t12_sdpa_on && amx_hubert_enabled() && amx_hubert_mode() == AmxEncMode::kAll) {
+      sdpa_amx_sgemm(qp, kp, vp, T, hd, scale, att_.data());
+    } else
+#endif
+#if defined(__aarch64__)
+    {
+      // 全头 score[heads,T,T] 复用 sc_ 缓冲; 每头: QK^T → 逐行 softmax → PV
+      if (sc_.size() < heads_ * T * T) sc_.resize(heads_ * T * T);
+      ovh_.resize(T * hd);
+      for (int h = 0; h < heads_; ++h) {
+        const size_t off = size_t(h) * hd;
+        float* sc_head = sc_.data() + size_t(h) * T * T;
+        hubert_sdpa_qkt(qp, kp, T, size_t(hidden_), off, hd, scale, sc_head);
+        for (size_t q = 0; q < T; ++q)
+          gsv::kern::softmax(sc_head + q * T, sc_head + q * T, T);
+        hubert_sdpa_pv(sc_head, vp, T, size_t(hidden_), off, hd, ovh_.data());
+        for (size_t q = 0; q < T; ++q)
+          std::memcpy(att_.data() + q * hidden_ + off, ovh_.data() + q * hd,
+                      hd * sizeof(float));
+      }
+    }
+#else
+    // 非 aarch64 兜底: 原 NEON-free 标量三重循环(同源拷贝)
     for (int h = 0; h < heads_; ++h) {
+      const size_t off = size_t(h) * hd;
       for (size_t q = 0; q < T; ++q) {
-        const float* qv = qp + q * hidden_ + h * hd;
+        const float* qv = qp + q * hidden_ + off;
         for (size_t kk = 0; kk < T; ++kk) {
-          const float* kv = kp + kk * hidden_ + h * hd;
+          const float* kv = kp + kk * hidden_ + off;
           float dot = 0.f;
           for (size_t e = 0; e < hd; ++e) dot += qv[e] * kv[e];
           smax_[kk] = dot * scale;
         }
         gsv::kern::softmax(smax_.data(), smax_.data(), T);
-        float* ov = att_.data() + q * hidden_ + h * hd;
+        float* ov = att_.data() + q * hidden_ + off;
         for (size_t kk = 0; kk < T; ++kk) {
           const float p = smax_[kk];
-          const float* vv = vp + kk * hidden_ + h * hd;
+          const float* vv = vp + kk * hidden_ + off;
           for (size_t e = 0; e < hd; ++e) ov[e] += p * vv[e];
         }
       }
     }
+#endif
     if (sdpaTim)
       sdpa_ms_ += std::chrono::duration<double, std::milli>(clk::now() - tp_sdpa0).count();
     // out proj + 残差 + post-LN
