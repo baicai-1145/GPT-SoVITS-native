@@ -129,6 +129,11 @@ class SvEngine {
   std::vector<uint16_t> cvt16_;       // T4d: 3x3 im2col 整张量批量转换暂存
 #if defined(GSV_AMX_GEMM)
   std::vector<uint8_t> sv_act_scratch_;   // E12: AMX 激活 panel 缓冲(容量复用)
+  // E14-SV/C3: 出核融合面板 —
+  //   sv_pan_b_: convs[i] 出核直写的拼接槽位(conv3 输入, K=co1); conv3 直用
+  //   零打包。conv1 出核经 epi_core 同遍直写其槽位 0。
+  std::vector<uint8_t> sv_pan_b_;
+  std::vector<float> ctile_;              // C3: 融合路径逐级 GEMM 数学结果
 #endif
 
   // 静态 conv2d(fp32 权重, im2col → sgemm('N','T')); 仅 stem conv1(fp32-only 段)使用
@@ -141,9 +146,14 @@ class SvEngine {
                   std::vector<float>& cols_unused, std::vector<float>& out);
 #if defined(GSV_AMX_GEMM)
   // E12: AMX 卷积(激活 panel 直写; 与 conv2d_f16 输出布局位级可对照)
+  // E14-SV/C0: site 标签仅用于探针站点归因(默认 nullptr)。
   void conv2d_amx(const kern::AmxPanel& w_panel, const float* in,
                   int c_in, int h, int w, int kh, int kw, int stride,
-                  int pad, int c_out, std::vector<float>& out);
+                  int pad, int c_out, std::vector<float>& out,
+                  const char* site = nullptr);
+  // E14-SV/C3: 已就绪双面板直接派发(无打包/trace/dump; 供出核融合链用)
+  void conv2d_amx_core(const kern::AmxPanel& w_panel, kern::AmxPanel& pb,
+                       int c_out, std::vector<float>& out);
 #endif
 };
 
