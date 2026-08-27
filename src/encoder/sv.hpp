@@ -141,9 +141,11 @@ class SvEngine {
                   std::vector<float>& cols_unused, std::vector<float>& out);
 #if defined(GSV_AMX_GEMM)
   // E12: AMX 卷积(激活 panel 直写; 与 conv2d_f16 输出布局位级可对照)
+  // E14-SV/C0: site 标签仅用于探针站点归因(默认 nullptr)。
   void conv2d_amx(const kern::AmxPanel& w_panel, const float* in,
                   int c_in, int h, int w, int kh, int kw, int stride,
-                  int pad, int c_out, std::vector<float>& out);
+                  int pad, int c_out, std::vector<float>& out,
+                  const char* site = nullptr);
 #endif
 };
 
