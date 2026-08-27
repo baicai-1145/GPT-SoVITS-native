@@ -101,6 +101,12 @@ class HubertEngine {
   void dense_amx(const Dense& d, const float* x, size_t T, float* y,
                  std::vector<uint8_t>& act_scratch, size_t in_dim,
                  const std::vector<float>& bias) const;
+  // E14-H1: 旗后 CNN 栈直产快路(全栈帧主化)。逐层把 im2col 直接写成
+  // f16 Y-panel 并融合上游变换(上一层的 GELU/L0 的 GN-affine 在取数时顺带),
+  // 消除独立 im2col/repack/GELU 扫描与尾转置。前置: conv_panel 全就绪 且
+  // AMX 可用。返回最终帧数 T6; 同时填充 cnn_/[cnn_t_] 兼容既有视图。
+  // 返回 0 = 形状防御失败, 调用方回退原路。
+  size_t cnn_stack_fused(const float* waveform, size_t n);
 #endif
 
   struct ConvL {
@@ -136,6 +142,7 @@ class HubertEngine {
 #if defined(GSV_AMX_GEMM)
   std::vector<uint8_t> hub_act_scratch_;  // E12: AMX 激活 panel 缓冲(容量复用)
   std::vector<uint8_t> hub_conv_act_;     // T13: CNN 激活 B 面板(容量复用)
+  std::vector<uint8_t> hub_cols_panel_;   // E14-H1: CNN 直产激活 Y-panel(容量复用)
 #endif
   // 对拍捕获
   std::vector<float> cap_pos_, cap_encln_, cap_l0attn_, cap_l0ln1_, cap_l0ffn_,
