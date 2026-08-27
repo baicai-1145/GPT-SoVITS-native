@@ -64,6 +64,11 @@ class HubertEngine {
 
  private:
   static void gelu(float* x, size_t n);
+#if defined(GSV_AMX_GEMM)
+  // T12: AMX 旗后 SDPA 批量化(batched sgemm; 数值 = E12/cos+codes 谱系)
+  void sdpa_amx_sgemm(float* qp, float* kp, float* vp, size_t T, size_t hd,
+                      float scale, float* att_out);
+#endif
   void conv_layer(int li, const std::vector<float>& in, int in_c, size_t in_len,
                   std::vector<float>& out, int& out_c, size_t& out_len);
 
@@ -117,6 +122,8 @@ class HubertEngine {
       ff_, resid_, smax_;
   std::vector<float> sc_;   // T11: SDPA 全头分数缓冲 [heads·T·T]
   std::vector<float> ovh_;  // T11: 单头 PV 输出暂存 [T·hd]
+  // T12: AMX 旗后 SDPA(batched sgemm) 滚动缓冲
+  std::vector<float> sdpasc_, sdpa_qg_, sdpa_kg_, sdpa_vtg_;
   std::vector<float> proj_o_, l0_, last_;
   size_t cnn_t_ = 0;
   std::vector<uint16_t> xh_;      // fp16 激活暂存(DenseF16 view FMLAL 前向复用)

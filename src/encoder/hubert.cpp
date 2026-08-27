@@ -213,6 +213,53 @@ void cast_pack_B_f32(const float* x_fp32, size_t T, size_t K,
 }
 
 }  // namespace
+
+// ---- T12: SDPA AMX 批量化(旗后; E11-5 配方 + 微基准裁决的 batched sgemm 路径) ----
+// 数值口径: 不位级(与 V1/E12 先例同谱系, codes 逐位为门禁)。
+//   每层每头两次 fp32 sgemm:
+//     QKT: C[T,T] = Q_h[T,HD] · K_h[T,HD]ᵀ  (gather 列切片后连续)
+//     PV : C[T,HD] = P[T,T] · VT_h[HD,T]ᵀ   (P 直接吃 softmax f32 输出,
+//                                              VT 为列转置 gather 布局)
+//   scale/softmax 与标量路径同一序: 先逐元素乘 scale 再 kern::softmax。
+void HubertEngine::sdpa_amx_sgemm(float* qp, float* kp, float* vp, size_t T,
+                                  size_t hd, float scale, float* att_out) {
+  const size_t D = hidden_;
+  if (sdpasc_.size() < T * hd) sdpasc_.resize(T * hd);
+  if (sdpa_qg_.size() < T * hd) sdpa_qg_.resize(T * hd);
+  if (sdpa_kg_.size() < T * hd) sdpa_kg_.resize(T * hd);
+  if (sdpa_vtg_.size() < hd * T) sdpa_vtg_.resize(hd * T);
+  if (sc_.size() < heads_ * T * T) sc_.resize(heads_ * T * T);
+  if (ovh_.size() < T * hd) ovh_.resize(T * hd);
+
+  for (int h = 0; h < heads_; ++h) {
+    const size_t off = size_t(h) * hd;
+    // gather Q/K 列切片 → 连续 [T,hd]
+    for (size_t t = 0; t < T; ++t) {
+      std::memcpy(sdpa_qg_.data() + t * hd, qp + t * D + off, hd * sizeof(float));
+      std::memcpy(sdpa_kg_.data() + t * hd, kp + t * D + off, hd * sizeof(float));
+    }
+    float* sc_head = sc_.data() + size_t(h) * T * T;
+    // QK^T: sgemm('N','T', M=T, N=T, K=hd); A=Q_g [T,hd], B=K_g [T,hd]
+    gsv::kern::accel::sgemm('N', 'T', int(T), int(T), int(hd), 1.0f,
+                            sdpa_qg_.data(), int(hd), sdpa_kg_.data(), int(hd),
+                            0.0f, sc_head, int(T));
+    for (size_t i = 0; i < T * T; ++i) sc_head[i] *= scale;
+    for (size_t q = 0; q < T; ++q)
+      gsv::kern::softmax(sc_head + q * T, sc_head + q * T, T);
+    // gather V 列转置 → [hd,T]
+    for (size_t t = 0; t < T; ++t)
+      for (size_t e = 0; e < hd; ++e)
+        sdpa_vtg_[e * T + t] = vp[t * D + off + e];
+    // P·V: C[T,hd] = P[T,T] · VT[hd,T]ᵀ
+    gsv::kern::accel::sgemm('N', 'T', int(T), int(hd), int(T), 1.0f, sc_head,
+                            int(T), sdpa_vtg_.data(), int(T), 0.0f,
+                            sdpasc_.data(), int(hd));
+    for (size_t q = 0; q < T; ++q)
+      std::memcpy(att_out + q * D + off, sdpasc_.data() + q * hd,
+                  hd * sizeof(float));
+  }
+}
+
 #endif  // GSV_AMX_GEMM
 
 void HubertEngine::gelu(float* x, size_t n) {
@@ -581,8 +628,19 @@ size_t HubertEngine::run(const float* waveform, size_t n) {
       }
     }
     // SDPA(无掩码): 每 head 独立 —— T11 保序 NEON 后端(位级等价, 详见上方内核注释)
+    // T12 处置: AMX batched sgemm 在 56 段全量 codes 门禁中翻转 4 段
+    // (7.1%), 未过门禁 —— 不上线。保留函数与显式复现开关
+    // GSV_T12_SDPA_AMX=1(默认关; 仅仲裁/后续研究者使用), 证据见
+    // .tmp/evidence-T12.md。默认路径(--amx-enc 无论开否)均为位级 NEON。
     const auto tp_sdpa0 = sdpaTim ? clk::now() : clk::time_point{};
     att_.assign(T * hidden_, 0.f);
+#if defined(GSV_AMX_GEMM) && defined(__aarch64__)
+    static const bool t12_sdpa_amx =
+        [] { const char* e = std::getenv("GSV_T12_SDPA_AMX"); return e && e[0] == '1'; }();
+    if (t12_sdpa_amx && amx_hubert_enabled() && amx_hubert_mode() == AmxEncMode::kAll) {
+      sdpa_amx_sgemm(qp, kp, vp, T, hd, scale, att_.data());
+    } else
+#endif
 #if defined(__aarch64__)
     {
       // 全头 score[heads,T,T] 复用 sc_ 缓冲; 每头: QK^T → 逐行 softmax → PV
