@@ -55,10 +55,13 @@ constexpr size_t kAmxSvMinK = 256;
 
 // E13-SV/T3 装载期权重预打包门槛(.tmp/t3_probe 同形实测):
 //   净赚者需要面板就绪; 面板内存/一次性成本极小(<百KB 级), 从宽。
-//   唯一确认的输家是 24ch 块 convs(K=216,M=24) —— 由 convs 派发点
-//   的原门槛(width*9≥256)排除, 此处无需特判。
+//   E14-SV/C1: 补充 w24 块 3x3 族(rows=24,K=216,L1.convs)——原门槛拒之门外,
+//   微基准(.tmp/c1_probe, 配对 min-of-11 @load≈3) 实测 AMX 全链(pack+gemm)
+//   2.97ms vs FMLAL 全链(im2col+gemm) 9.67ms = 3.26x 净赚, 三形状稳定。
 inline bool amx_sv_worth_packing(size_t rows, size_t K) {
-  return rows >= kAmxSvMinRows && K >= 64;
+  if (rows >= kAmxSvMinRows && K >= 64)
+    return true;
+  return rows >= 24 && K >= 192;
 }
 
 // E13-SV/T3 派发侧判据: 是否走 AMX(pp)。保证不 regress E12 原有任何
@@ -855,10 +858,15 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
     }
     // convs[i](3x3 p1 s1) + bns + ReLU20 → 拼接槽位 i
 #if defined(GSV_AMX_GEMM)
+    // E14-SV/C1 门槛(微基准 .tmp/c1_probe 配对 min-of-11 @load≈3):
+    //   - S≥512: 全部 convs 命中点实际最小 S=L4.b2 696(L4 族 6.81x 净赚);
+    //     原 S≥2048 会把 L4 踢回 FMLAL(12 次 43.5ms 回归) —— 已撤销。
+    //   - K=width*9≥192: 新纳入 w24 块(K=216, L1 族 2.9-3.4x 净赚);
+    //     保留原排除段(更小 width 无实例且探针外无证据)。
     if (i < int(convs_panels_ready.size()) && convs_panels_ready[size_t(i)] &&
         !(amx_sv_skip_mask() & 2u) &&
-        static_cast<size_t>(h) * static_cast<size_t>(w) >= kAmxSvMinRows &&
-        static_cast<size_t>(width) * 9 >= kAmxSvMinK) {
+        static_cast<size_t>(h) * static_cast<size_t>(w) >= 512 &&
+        static_cast<size_t>(width) * 9 >= 192) {
       eng.nxt_.resize(static_cast<size_t>(width) * s);
       eng.conv2d_amx(convs_panels[size_t(i)], i == 0 ? chunk(0) : sp.data(),
                      width, h, w, 3, 3, 1, 1, width, eng.nxt_, "blk_convs");
