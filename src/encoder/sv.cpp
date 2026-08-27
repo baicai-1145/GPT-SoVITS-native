@@ -48,9 +48,39 @@ static unsigned amx_sv_skip_mask() {
   return m;
 }
 
-// E12 分流门槛(与 E8/E12-hubert 一致): S≥48 且 K≥256
+// E12 分流门槛(E12 原始): S≥48 且 K≥256
 constexpr size_t kAmxSvMinRows = 48;
 constexpr size_t kAmxSvMinK = 256;
+
+// E13-SV/T3 装载期权重预打包门槛(.tmp/t3_probe 同形实测):
+//   净赚者需要面板就绪; 面板内存/一次性成本极小(<百KB 级), 从宽。
+//   唯一确认的输家是 24ch 块 convs(K=216,M=24) —— 由 convs 派发点
+//   的原门槛(width*9≥256)排除, 此处无需特判。
+inline bool amx_sv_worth_packing(size_t rows, size_t K) {
+  return rows >= kAmxSvMinRows && K >= 64;
+}
+
+// E13-SV/T3 派发侧判据: 是否走 AMX(pp)。保证不 regress E12 原有任何
+// 已命中位点(原线优先返回 true), 在此基础上按微基准实测净赚域扩展:
+//   M=m_rows≥64 且 S≥2048 且 K≥64 —— 排除了两类实测输家:
+//   a) 薄 M(=inter 24, 如 L3.aff1 0.6x 打包成本>计算);
+//   b) 特小 S/K 组合(池往返+激活面板成本占比过高)。
+inline bool amx_sv_go(size_t m_rows, size_t s, size_t K) {
+  if (m_rows >= kAmxSvMinRows && s >= kAmxSvMinRows && K >= kAmxSvMinK)
+    return true;
+  return m_rows >= 64 && s >= 2048 && K >= 64;
+}
+
+namespace {
+// E13-SV 探针: GSV_SV_AMX_TRACE=1 时对 FMLAL 回退分支打印调用身份(零行为变更)
+inline bool amx_trace() {
+  static bool t = [] {
+    const char* e = std::getenv("GSV_SV_AMX_TRACE");
+    return e && *e;
+  }();
+  return t;
+}
+}  // namespace
 
 namespace {
 
@@ -350,6 +380,8 @@ void SvEngine::Aff::apply(const float* x, const float* ds, float* out, int h, in
 #endif
   {
     // FMAL 回退: 转置量化 cat→[S,2ch]fp16 后 gemm(A=W1, B=catᵀ)
+    if (amx_trace())
+      std::fprintf(stderr, "[sv-fb] aff1 ch=%d inter=%d S=%zu\n", ch, inter, s);
     if (xh.size() < 2 * static_cast<size_t>(ch) * s) xh.resize(2 * static_cast<size_t>(ch) * s);
     kern::f32_trans_to_f16(cat_.data(), xh.data(), 2 * ch, s);
     const auto tp_aff1 = sv_inner_tim() ? std::chrono::steady_clock::now()
@@ -395,6 +427,8 @@ void SvEngine::Aff::apply(const float* x, const float* ds, float* out, int h, in
   } else
 #endif
   {
+    if (amx_trace())
+      std::fprintf(stderr, "[sv-fb] aff2 ch=%d inter=%d S=%zu\n", ch, inter, s);
     if (xh2.size() < static_cast<size_t>(inter) * s) xh2.resize(static_cast<size_t>(inter) * s);
     kern::f32_trans_to_f16(att_.data(), xh2.data(), inter, s);  // [inter,S]→[S,inter]fp16
     const auto tp_aff2 = sv_inner_tim() ? std::chrono::steady_clock::now()
@@ -435,13 +469,18 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
   // 注意: in 可能就是 eng.tmp_(调用方把主缓冲喂进来) —— 必须写入另一缓冲防别名。
   int h = h_in, w = w_in;
 #if defined(GSV_AMX_GEMM)
-  if (conv1_panel_ready && stride == 1 && !(amx_sv_skip_mask() & 1u) &&
-      static_cast<size_t>(h) * static_cast<size_t>(w) >= kAmxSvMinRows &&
-      static_cast<size_t>(c_in) >= kAmxSvMinK) {
-    // E12: 1x1 conv = dense GEMM; 激活 im2col=identity (转置直写面板)
-    const size_t s = static_cast<size_t>(h) * static_cast<size_t>(w);
-    eng.nxt_.resize(static_cast<size_t>(co1) * s);
-    eng.conv2d_amx(conv1_panel, in, c_in, h, w, 1, 1, 1, 0, co1, eng.nxt_);
+  if (conv1_panel_ready && !(amx_sv_skip_mask() & 1u) &&
+      amx_sv_go(size_t(co1), size_t(h_in) * w_in, size_t(c_in))) {
+    // E13-SV/T3: k1 卷积恒等 dense GEMM, k==1 时 im2col 无重叠复用,
+    // k1s2 与 k1s1 数学一致(每输出位置独立取单列, 边界零填等等价);
+    // 解除 E12 的 stride==1 分流限制, 入口块 conv1(s2) 走 AMX 直派。
+    // 派发门槛从 S/K≥48/256 收紧为 amx_sv_go(基于 t3_probe 实测净赚域)。
+    eng.conv2d_amx(conv1_panel, in, c_in, h_in, w_in, 1, 1, stride, 0, co1,
+                   eng.nxt_);
+    if (stride != 1) {  // 下游 BN/分块逻辑按新分辨率(与 else 分支同式)
+      h = (h_in - 1) / stride + 1;
+      w = (w_in - 1) / stride + 1;
+    }
   } else
 #endif
   if (stride == 1) {
@@ -449,6 +488,8 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
     // gemm(A=W[co1,c_in], B=xh) 直接得通道主 nxt_[co1,S] —— 不经 tmp_
     // (in 可能别名 eng.tmp_, 不得写回)。
     const size_t s = static_cast<size_t>(h) * w;
+    if (amx_trace())
+      std::fprintf(stderr, "[sv-fb] blk_conv1 cin=%d->%d S=%zu\n", c_in, co1, s);
     if (eng.xh_.size() < static_cast<size_t>(c_in) * s)
       eng.xh_.resize(static_cast<size_t>(c_in) * s);
     kern::f32_trans_to_f16(in, eng.xh_.data(), c_in, s);
@@ -513,9 +554,14 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
                      width, h, w, 3, 3, 1, 1, width, eng.nxt_);
     } else
 #endif
-    eng.conv2d_f16(i == 0 ? chunk(0) : sp.data(), width, h, w,
-                   convs_w[static_cast<size_t>(i)],
-                   width, 3, 3, 1, 1, eng.cols_, eng.nxt_);
+    {
+      if (amx_trace())
+        std::fprintf(stderr, "[sv-fb] convs i=%d w=%d S=%zu\n", i, width,
+                     static_cast<size_t>(h) * w);
+      eng.conv2d_f16(i == 0 ? chunk(0) : sp.data(), width, h, w,
+                     convs_w[static_cast<size_t>(i)],
+                     width, 3, 3, 1, 1, eng.cols_, eng.nxt_);
+    }
     bns[static_cast<size_t>(i)].apply(eng.nxt_.data(), width, s);
     for (float& v : eng.nxt_) v = relu20(v);
     std::memcpy(eng.tmp2_.data() + static_cast<size_t>(i) * width * s, eng.nxt_.data(),
@@ -526,15 +572,19 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
   // conv3(k1) + bn3
 #if defined(GSV_AMX_GEMM)
   if (conv3_panel_ready && !(amx_sv_skip_mask() & 4u) &&
-      static_cast<size_t>(h) * static_cast<size_t>(w) >= kAmxSvMinRows &&
-      static_cast<size_t>(co1) >= kAmxSvMinK) {
+      amx_sv_go(size_t(exp_planes), s, size_t(co1))) {
     eng.nxt_.resize(static_cast<size_t>(exp_planes) * s);
     eng.conv2d_amx(conv3_panel, eng.tmp2_.data(), co1, h, w, 1, 1, 1, 0,
                    exp_planes, eng.nxt_);
   } else
 #endif
-  eng.conv2d_f16(eng.tmp2_.data(), co1, h, w, conv3_w, exp_planes, 1, 1, 1, 0,
-                 eng.cols_, eng.nxt_);
+  {
+    if (amx_trace())
+      std::fprintf(stderr, "[sv-fb] conv3 cin=%d->%d S=%zu\n", co1, exp_planes,
+                   static_cast<size_t>(h) * w);
+    eng.conv2d_f16(eng.tmp2_.data(), co1, h, w, conv3_w, exp_planes, 1, 1, 1, 0,
+                   eng.cols_, eng.nxt_);
+  }
   bn3.apply(eng.nxt_.data(), exp_planes, s);
 
 #ifdef C1_TRACE
@@ -546,15 +596,19 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
   } else {
 #if defined(GSV_AMX_GEMM)
     if (sc_panel_ready && !(amx_sv_skip_mask() & 8u) &&
-        static_cast<size_t>(h_in) * static_cast<size_t>(w_in) >= kAmxSvMinRows &&
-        static_cast<size_t>(c_in) >= kAmxSvMinK) {
+        amx_sv_go(size_t(exp_planes), size_t(h_in) * w_in, size_t(c_in))) {
       eng.tmp_.resize(static_cast<size_t>(exp_planes) * s);
       eng.conv2d_amx(sc_panel, in, c_in, h_in, w_in, 1, 1, stride, 0,
                      exp_planes, eng.tmp_);
     } else
 #endif
-    eng.conv2d_f16(in, c_in, h_in, w_in, sc_w, exp_planes, 1, 1, stride, 0, eng.cols_,
-                   eng.tmp_);
+    {
+      if (amx_trace())
+        std::fprintf(stderr, "[sv-fb] sc cin=%d->%d stride=%d S=%zu\n", c_in,
+                     exp_planes, stride, static_cast<size_t>(h_in) * w_in);
+      eng.conv2d_f16(in, c_in, h_in, w_in, sc_w, exp_planes, 1, 1, stride, 0, eng.cols_,
+                     eng.tmp_);
+    }
     sc_bn.apply(eng.tmp_.data(), exp_planes, s);
     for (size_t j = 0; j < eng.nxt_.size(); ++j) eng.nxt_[j] += eng.tmp_[j];
   }
@@ -583,14 +637,25 @@ void SvEngine::load_block(int l, int i, bool expect_aff) {
   if (n_convs != blk.scale)
     throw std::runtime_error("sv block scale 与 convs 数量不符: " + p);
 
-  blk.conv1_w = load_conv_w(*f_, p + "conv1.weight");
+  const int co1_local = blk.width * blk.scale;
+  const int cin_conv1 = static_cast<int>(
+      f_->tensor((p + "conv1.weight").c_str())->dims[1]);
+  blk.conv1_w = load_conv_w(*f_, p + "conv1.weight", nullptr
+#if defined(GSV_AMX_GEMM)
+      , &blk.conv1_panel, size_t(co1_local), size_t(cin_conv1)
+#endif
+  );
   blk.bn1 = load_bn(*f_, p + "bn1");
   for (int j = 0; j < blk.scale; ++j) {
     blk.convs_w.push_back(
         load_conv_w(*f_, p + "convs." + std::to_string(j) + ".weight"));
     blk.bns.push_back(load_bn(*f_, p + "bns." + std::to_string(j)));
   }
-  blk.conv3_w = load_conv_w(*f_, p + "conv3.weight");
+  blk.conv3_w = load_conv_w(*f_, p + "conv3.weight", nullptr
+#if defined(GSV_AMX_GEMM)
+      , &blk.conv3_panel, size_t(blk.exp_planes), size_t(co1_local)
+#endif
+  );
   blk.bn3 = load_bn(*f_, p + "bn3");
   if (blk.aff) {
     for (int j = 0; j < blk.scale - 1; ++j) {
@@ -610,32 +675,33 @@ void SvEngine::load_block(int l, int i, bool expect_aff) {
   }
   blk.has_shortcut = f_->tensor((p + "shortcut.0.weight").c_str()) != nullptr;
   if (blk.has_shortcut) {
-    blk.sc_w = load_conv_w(*f_, p + "shortcut.0.weight");
+    const int cin_sc = static_cast<int>(
+        f_->tensor((p + "shortcut.0.weight").c_str())->dims[1]);
+    blk.sc_w = load_conv_w(*f_, p + "shortcut.0.weight", nullptr
+#if defined(GSV_AMX_GEMM)
+        , &blk.sc_panel, size_t(blk.exp_planes), size_t(cin_sc)
+#endif
+    );
     blk.sc_bn = load_bn(*f_, p + "shortcut.1");
   }
 
 #if defined(GSV_AMX_GEMM)
-  // E12: 装载期预打包 AMX 权重 panel。形状分流门槛与 E8 一致(K>=256)。
-  // 注意 c_in 需从上一 stage 推得: conv1 的 in = 上一层输出通道。
+  // E12: 装载期预打包 AMX 权重 panel。形状分流见 amx_sv_worth_packing(T3 收紧)。
   if (amx_sv_enabled() && kern::amx_gemm_available()) {
-    const int co1 = blk.width * blk.scale;
-    // conv1 输入通道: i==0 ? 上层 exp_planes : 同层上一块
-    const int cin_conv1 = f_->tensor((p + "conv1.weight").c_str())->dims[1];
-    const int co1_ck = static_cast<int>(f_->tensor((p + "conv1.weight").c_str())->dims[0]);
     auto try_pack = [&](kern::AmxPanel& panel, const uint16_t* w, size_t rows,
                         size_t K, bool& ready) {
-      if (rows >= kAmxSvMinRows && K >= kAmxSvMinK && w) {
+      if (amx_sv_worth_packing(rows, K) && w) {
         panel.rows = rows;
         panel.K = K;
         kern::amx_pack_into(w, rows, K, panel.buf);
         ready = true;
       }
     };
-    (void)co1; (void)co1_ck;
-    try_pack(blk.conv1_panel, blk.conv1_w, size_t(co1), size_t(cin_conv1),
+    (void)co1_local;
+    try_pack(blk.conv1_panel, blk.conv1_w, size_t(co1_local), size_t(cin_conv1),
              blk.conv1_panel_ready);
     try_pack(blk.conv3_panel, blk.conv3_w, size_t(blk.exp_planes),
-             size_t(co1), blk.conv3_panel_ready);
+             size_t(co1_local), blk.conv3_panel_ready);
     for (int j = 0; j < blk.scale; ++j) {
       kern::AmxPanel p3;
       bool ready = false;
@@ -697,7 +763,7 @@ SvEngine::SvEngine(const GsvFile& f) : f_(&f) {
   if (amx_sv_enabled() && kern::amx_gemm_available()) {
     auto try_pack = [&](kern::AmxPanel& panel, const uint16_t* w, size_t rows,
                         size_t K, bool& ready) {
-      if (rows >= kAmxSvMinRows && K >= kAmxSvMinK && w) {
+      if (amx_sv_worth_packing(rows, K) && w) {
         panel.rows = rows;
         panel.K = K;
         kern::amx_pack_into(w, rows, K, panel.buf);
