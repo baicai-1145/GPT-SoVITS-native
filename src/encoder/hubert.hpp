@@ -108,7 +108,12 @@ class HubertEngine {
     std::vector<float> w;           // 无 f16 段回退(不适用; 保留类型以防)
     bool has_gn = false;
     std::vector<float> gn_g, gn_b;
+#if defined(GSV_AMX_GEMM)
+    kern::AmxPanel conv_panel;      // T13: 装载期预打包(旗后)
+    bool conv_panel_ready = false;
+#endif
   };
+
   ConvL convs_[7];
   Dense proj_;
   std::vector<float> proj_ln_g_, proj_ln_b_;
@@ -130,6 +135,7 @@ class HubertEngine {
   std::vector<uint16_t> cols16_;  // fp16 im2col 暂存(CNN/pos_conv FMLAL 用)
 #if defined(GSV_AMX_GEMM)
   std::vector<uint8_t> hub_act_scratch_;  // E12: AMX 激活 panel 缓冲(容量复用)
+  std::vector<uint8_t> hub_conv_act_;     // T13: CNN 激活 B 面板(容量复用)
 #endif
   // 对拍捕获
   std::vector<float> cap_pos_, cap_encln_, cap_l0attn_, cap_l0ln1_, cap_l0ffn_,

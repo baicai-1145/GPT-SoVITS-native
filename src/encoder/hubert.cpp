@@ -117,6 +117,20 @@ HubertEngine::HubertEngine(const GsvFile& f) {
     if (!wv.has_f16())
       throw std::runtime_error("hubert conv 权重缺 f16 段: " + p);
     L.w16 = wv.data_f16_raw();  // fp16 直读(FMLAL)
+#if defined(GSV_AMX_GEMM)
+    // T13: CNN 权重装载期预打包(仅 kAll)。打包是装载期一次性成本,
+    // 运行时每次卷积都省 FMLAL 全量重算, 无需形状门槛抛股(除退化防护);
+    // 数值谱系 = E12/E5-P2(f16 im2col 输入位型不变, 归约序换 Z 长条链),
+    // 由 codes 56 段全量门禁裁决。
+    if (amx_hubert_enabled() && amx_hubert_mode() == AmxEncMode::kAll &&
+        kern::amx_gemm_available() && wv.numel() >= 4096) {
+      L.conv_panel.rows = static_cast<size_t>(out_c);
+      L.conv_panel.K = wv.numel() / static_cast<size_t>(out_c);
+      kern::amx_pack_into(L.w16, L.conv_panel.rows, L.conv_panel.K,
+                          L.conv_panel.buf);
+      L.conv_panel_ready = true;
+    }
+#endif
     if (li == 0) {
       L.has_gn = true;
       L.gn_g = vec_any((p + "layer_norm.weight").c_str());
@@ -442,6 +456,22 @@ void HubertEngine::conv_layer(int li, const std::vector<float>& in, int in_c, si
                     sizeof h);
       }
   out.resize(static_cast<size_t>(out_c) * T);
+#if defined(GSV_AMX_GEMM)
+  // T13: 旗后走 AMX pp —— im2col(cols16_) 输入位型不变, 仅 GEMM 归约后端
+  // FMLAL→AMX Z 长条链(E5-P2 同构); B 面板由 cols16_ 行主 [T,KK] 直包。
+  if (convs_[li].conv_panel_ready) {
+    kern::amx_pack_into(cols16_.data(), T, KK, hub_conv_act_);
+    kern::AmxPanel pb;
+    pb.rows = T;
+    pb.K = KK;
+    pb.buf.swap(hub_conv_act_);
+    kern::gemm_f16_amx_pp(convs_[li].conv_panel, pb, out.data(),
+                          static_cast<size_t>(out_c), T);
+    pb.buf.swap(hub_conv_act_);
+    out_len = T;
+    return;
+  }
+#endif
   kern::gemm_f16x_fmlal(convs_[li].w16, cols16_.data(), out.data(),
                         static_cast<size_t>(out_c), T, KK);
   out_len = T;
