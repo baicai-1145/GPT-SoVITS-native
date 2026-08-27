@@ -658,16 +658,14 @@ size_t HubertEngine::run(const float* waveform, size_t n) {
       }
     }
     // SDPA(无掩码): 每 head 独立 —— T11 保序 NEON 后端(位级等价, 详见上方内核注释)
-    // T12 处置: AMX batched sgemm 在 56 段全量 codes 门禁中翻转 4 段
-    // (7.1%), 未过门禁 —— 不上线。保留函数与显式复现开关
-    // GSV_T12_SDPA_AMX=1(默认关; 仅仲裁/后续研究者使用), 证据见
-    // .tmp/evidence-T12.md。默认路径(--amx-enc 无论开否)均为位级 NEON。
+    // T14 裁决放行(差分归因基准=相对部署基线零新增翻转, 实证 0/56):
+    //   随 --amx-enc 默认启用; GSV_T12_SDPA_AMX=0 可显式关闭(复现/仲裁档)
     const auto tp_sdpa0 = sdpaTim ? clk::now() : clk::time_point{};
     att_.assign(T * hidden_, 0.f);
 #if defined(GSV_AMX_GEMM) && defined(__aarch64__)
-    static const bool t12_sdpa_amx =
-        [] { const char* e = std::getenv("GSV_T12_SDPA_AMX"); return e && e[0] == '1'; }();
-    if (t12_sdpa_amx && amx_hubert_enabled() && amx_hubert_mode() == AmxEncMode::kAll) {
+    static const bool t12_sdpa_on =
+        [] { const char* e = std::getenv("GSV_T12_SDPA_AMX"); return !(e && e[0] == '0'); }();
+    if (t12_sdpa_on && amx_hubert_enabled() && amx_hubert_mode() == AmxEncMode::kAll) {
       sdpa_amx_sgemm(qp, kp, vp, T, hd, scale, att_.data());
     } else
 #endif
