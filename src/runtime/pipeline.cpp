@@ -377,22 +377,81 @@ bool Pipeline::buildReference(const std::string& refWavPath, SynthResult* out,
     sovits::load_tensor_f32(sovF, "quantizer.vq.layers.0._codebook.embed",
                             embed, {1024, 768});
     out->prompt_semantic.resize(Tq);
-    for (size_t t = 0; t < Tq; ++t) {
-      int64_t best = 0;
-      double bd = 1e30;
+    // T5: 最近码字块化 — dist[t,cb] = ‖proj_t − e_cb‖²
+    //   = ‖proj_t‖²(行常量,argmin 无关) − 2·proj·e + ‖e_cb‖²(逐码不 可略)
+    //   ⇒ 先 sgemm 算 −2·proj·embedᵀ, 再逐列加 norm_e[1024]。
+    //   标量三重循环(80-87ms) → 单次 sgemm + 归一化逐行 argmin。
+    //   数值护栏: fp32 块化累加序变化引入的绝对误差实测 ≤0.045(见
+    //   .tmp/evidence-T5.md), 而 fp32 行 top-2 差实测 ≥3.0 ⇒ 默认 τ=1.0:
+    //   差距 < GSV_RVQ_TIE_EPS 的帧回退原始双精度逐码精确复算(与基线判定
+    //   位级同构); GSV_RVQ_AUDIT=1 打印回退/捕获数。
+    {
+      const char* epsEnv = std::getenv("GSV_RVQ_TIE_EPS");
+      const double tieEps = epsEnv ? std::atof(epsEnv) : 1.0;
+      const bool rvqAudit = std::getenv("GSV_RVQ_AUDIT") != nullptr;
+      double normE[1024];
       for (int64_t cb = 0; cb < 1024; ++cb) {
         const float* e = embed.data() + size_t(cb) * 768;
-        double d = 0.0;
-        for (size_t c = 0; c < 768; ++c) {
-          const double diff = double(proj[t * 768 + c]) - double(e[c]);
-          d += diff * diff;
-        }
-        if (d < bd) {
-          bd = d;
-          best = cb;
-        }
+        double s = 0.0;
+        for (size_t c = 0; c < 768; ++c)
+          s += double(e[c]) * double(e[c]);
+        normE[cb] = s;
       }
-      out->prompt_semantic[t] = best;
+      std::vector<float> dist(size_t(Tq) * 1024);
+      kern::accel::sgemm('N', 'T', int(Tq), 1024, 768, -2.0f, proj.data(), 768,
+                         embed.data(), 768, 0.0f, dist.data(), 1024);
+      for (size_t t = 0; t < Tq; ++t) {
+        float* row = dist.data() + t * 1024;
+        for (int64_t cb = 0; cb < 1024; ++cb)
+          row[cb] += float(normE[cb]);
+      }
+      size_t nFallback = 0, nFlip = 0;
+      for (size_t t = 0; t < Tq; ++t) {
+        const float* row = dist.data() + t * 1024;
+        size_t b0 = 0;
+        float v0, v1;
+        if (row[0] <= row[1]) {
+          v0 = row[0]; b0 = 0; v1 = row[1];
+        } else {
+          v0 = row[1]; b0 = 1; v1 = row[0];
+        }
+        for (size_t cb = 2; cb < 1024; ++cb) {
+          const float d = row[cb];
+          if (d < v0) {
+            v1 = v0; v0 = d; b0 = cb;
+          } else if (d < v1) {
+            v1 = d;
+          }
+        }
+        int64_t best = int64_t(b0);
+        if (double(v1) - double(v0) < tieEps) {
+          // 位级护栏分支: 双精度精确复算整帧(argmin 判定与基线同构:
+          // cb 升序扫 + 严格小于刷新)
+          ++nFallback;
+          double bd = 1e30;
+          int64_t bExact = 0;
+          for (int64_t cb = 0; cb < 1024; ++cb) {
+            const float* e = embed.data() + size_t(cb) * 768;
+            double d = 0.0;
+            for (size_t c = 0; c < 768; ++c) {
+              const double diff = double(proj[t * 768 + c]) - double(e[c]);
+              d += diff * diff;
+            }
+            if (d < bd) {
+              bd = d;
+              bExact = cb;
+            }
+          }
+          if (bExact != best) ++nFlip;
+          best = bExact;
+        }
+        out->prompt_semantic[t] = best;
+      }
+      if (rvqAudit)
+        std::fprintf(stderr,
+                     "[rvq-batch] Tq=%zu fallback=%zu flip_caught=%zu "
+                     "tie_eps=%g\n",
+                     Tq, nFallback, nFlip, tieEps);
     }
     if (refTim)  // E13 探针: extract_latent 三段(open/proj/rvq)
       std::fprintf(stderr,
@@ -400,6 +459,23 @@ bool Pipeline::buildReference(const std::string& refWavPath, SynthResult* out,
                    "proj%.0f + rvq%.0f\n",
                    nowMs() - tLat0, Tq, tLatOpen - tLat0, tLatProj - tLatOpen,
                    nowMs() - tLatProj);
+    // E13-MIX/T5 探针: prompt_semantic codes + ssl_proj 输出落盘
+    // (GSV_RVQ_DUMP=<path>; 两路径位级比对用, 零行为变更)
+    if (const char* dumpPath = std::getenv("GSV_RVQ_DUMP")) {
+      FILE* df = fopen(dumpPath, "wb");
+      if (df) {
+        const bool okD = fwrite(out->prompt_semantic.data(), sizeof(int64_t),
+                                out->prompt_semantic.size(), df) ==
+                            out->prompt_semantic.size() &&
+                        fwrite(proj.data(), sizeof(float), proj.size(), df) ==
+                            proj.size();
+        fclose(df);
+        if (!okD)
+          std::fprintf(stderr, "警告: GSV_RVQ_DUMP 写入不完整: %s\n", dumpPath);
+      } else {
+        std::fprintf(stderr, "警告: GSV_RVQ_DUMP 无法写入: %s\n", dumpPath);
+      }
+    }
 
     if (opt_.use_ref_cache) {
       encoder::RefEntry e;
