@@ -264,24 +264,67 @@ void SvEngine::conv2d_f16(const float* in, int c_in, int h, int w, const uint16_
   const size_t K = static_cast<size_t>(c_in) * kh * kw;
   cols16_.resize(S * K);
   const auto tp_im2 = sv_tp();
-  for (int oy = 0; oy < oh; ++oy)
-    for (int ox = 0; ox < ow; ++ox) {
-      uint16_t* row = cols16_.data() + (static_cast<size_t>(oy) * ow + ox) * K;
-      for (int c = 0; c < c_in; ++c)
-        for (int ky = 0; ky < kh; ++ky)
-          for (int kx = 0; kx < kw; ++kx) {
-            const int iy = oy * stride - pad + ky;
-            const int ix = ox * stride - pad + kx;
-            const __fp16 hv =
-                (iy >= 0 && iy < h && ix >= 0 && ix < w)
-                    ? static_cast<__fp16>(
-                          in[(static_cast<size_t>(c) * h + iy) * w + ix])
-                    : __fp16(0);
-            std::memcpy(row + (static_cast<size_t>(c) * kh + ky) * kw + kx, &hv,
-                        sizeof hv);
-          }
+  // E13-SV/T4d: k3s3p1 情形整张量一次向量 FCVT(位级同标量), im2col 时
+  // 只做 f16 散布写 —— 转换次数从 S*K=9*S*W² 降到 C*H*W(约 /9·C/W 倍),
+  // w24 convs(FMLAL 保留族)的回退成本大头即在此。
+  if (kh == 3 && kw == 3 && stride == 1 && pad == 1 && h > 2 && w > 2) {
+    const size_t total = size_t(c_in) * h * w;
+    if (cvt16_.size() < total) cvt16_.resize(total);
+    {
+      size_t i = 0;
+      const float* sp = in;
+      uint16_t* dp = cvt16_.data();
+      for (; i + 8 <= total; i += 8, sp += 8, dp += 8) {
+        const float32x4_t v0 = vld1q_f32(sp);
+        const float32x4_t v1 = vld1q_f32(sp + 4);
+        vst1q_f16(reinterpret_cast<__fp16*>(dp),
+                  vcombine_f16(vcvt_f16_f32(v0), vcvt_f16_f32(v1)));
+      }
+      for (; i < total; ++i, ++sp, ++dp)
+        *dp = kern::f32_to_f16_scalar(*sp);
     }
-  sv_acc(tp_im2, g_sv_inner.meta_im2col_ms);
+    size_t s_idx2 = 0;
+    for (int oy = 0; oy < oh; ++oy)
+      for (int ox = 0; ox < ow; ++ox, ++s_idx2) {
+        uint16_t* row = cols16_.data() + s_idx2 * K;
+        for (int c = 0; c < c_in; ++c) {
+          const uint16_t* plane = cvt16_.data() + (size_t)c * h * w;
+          for (int ky = 0; ky < 3; ++ky) {
+            const int iy = oy + ky - 1;
+            uint16_t* dk = row + (size_t)c * 9 + size_t(ky) * 3;
+            if (iy < 0 || iy >= h) {
+              dk[0] = dk[1] = dk[2] = 0;  // 复用缓冲: 越界行必须显式补零
+              continue;
+            }
+            const uint16_t* rowp = plane + (size_t)iy * w;
+            for (int kx = 0; kx < 3; ++kx) {
+              const int ix = ox + kx - 1;
+              dk[kx] = (ix >= 0 && ix < w) ? rowp[ix] : 0;
+            }
+          }
+        }
+      }
+    sv_acc(tp_im2, g_sv_inner.meta_im2col_ms);
+  } else {
+    for (int oy = 0; oy < oh; ++oy)
+      for (int ox = 0; ox < ow; ++ox) {
+        uint16_t* row = cols16_.data() + (static_cast<size_t>(oy) * ow + ox) * K;
+        for (int c = 0; c < c_in; ++c)
+          for (int ky = 0; ky < kh; ++ky)
+            for (int kx = 0; kx < kw; ++kx) {
+              const int iy = oy * stride - pad + ky;
+              const int ix = ox * stride - pad + kx;
+              const __fp16 hv =
+                  (iy >= 0 && iy < h && ix >= 0 && ix < w)
+                      ? static_cast<__fp16>(
+                            in[(static_cast<size_t>(c) * h + iy) * w + ix])
+                      : __fp16(0);
+              std::memcpy(row + (static_cast<size_t>(c) * kh + ky) * kw + kx, &hv,
+                          sizeof hv);
+            }
+      }
+    sv_acc(tp_im2, g_sv_inner.meta_im2col_ms);
+  }
   out.assign(static_cast<size_t>(c_out) * S, 0.f);
   const auto tp_fl0 = sv_inner_tim() ? std::chrono::steady_clock::now()
                                      : std::chrono::steady_clock::time_point{};
