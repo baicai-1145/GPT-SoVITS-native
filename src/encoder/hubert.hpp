@@ -115,6 +115,8 @@ class HubertEngine {
   // scratch(跨 run 复用)
   std::vector<float> cur_, nxt_, cnn_, cols_, tmp_, x_, pos_out_, qkv_, att_,
       ff_, resid_, smax_;
+  std::vector<float> sc_;   // T11: SDPA 全头分数缓冲 [heads·T·T]
+  std::vector<float> ovh_;  // T11: 单头 PV 输出暂存 [T·hd]
   std::vector<float> proj_o_, l0_, last_;
   size_t cnn_t_ = 0;
   std::vector<uint16_t> xh_;      // fp16 激活暂存(DenseF16 view FMLAL 前向复用)
