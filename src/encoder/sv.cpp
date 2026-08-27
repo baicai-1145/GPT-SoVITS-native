@@ -87,6 +87,18 @@ namespace {
 
 inline float relu20(float v) { return v < 0.f ? 0.f : (v > 20.f ? 20.f : v); }
 
+// E13-SV/T4: relu20 的 NEON 版(vmax/vmin 精确, 与标量语义一致)
+inline void relu20_neon(float* p, size_t n) {
+  const float32x4_t v0 = vdupq_n_f32(0.f);
+  const float32x4_t v20 = vdupq_n_f32(20.f);
+  const size_t rc = n & ~size_t(3);
+  size_t i = 0;
+  for (; i + 4 <= rc; i += 4) {
+    vst1q_f32(p + i, vmaxq_f32(vminq_f32(vld1q_f32(p + i), v20), v0));
+  }
+  for (; i < n; ++i) p[i] = relu20(p[i]);
+}
+
 // dtype 无关读取: 大矩阵为 f16 存储, 小张量(BN/LN/bias/stem conv 等)为 fp32 存储
 std::vector<float> vec_any(const GsvFile& f, const std::string& name) {
   const TensorView* t = f.tensor(name);
@@ -179,15 +191,28 @@ inline void sv_acc(std::chrono::steady_clock::time_point t0, double& dst) {
 
 void SvEngine::Bn::apply(float* x, int c, size_t s) const {
   const auto tp = sv_tp();
-  constexpr double eps = 1e-5;  // torch BatchNorm2d 默认(eval: running stats)
+  // E13-SV/T4c: 每 channel 预算一次 scale/beta(fp32), 行内 NEON FMA。
+  // 原实现是逐元素 double 链 (x-mu)*a+beta —— 属实现精度选择(非 torch
+  // 语义要求, torch CPU BN 本身就是 fp32 vectorized); 小步 A/B 门禁:
+  // svEmb corr 签名差 + wav mel 包络 ≤0.005。
+  constexpr float eps = 1e-5f;
+  const int rc = int(s & ~size_t(3));
   for (int ci = 0; ci < c; ++ci) {
-    const double a =
-        static_cast<double>(g[ci]) / std::sqrt(static_cast<double>(var[ci]) + eps);
-    const double beta = static_cast<double>(b[ci]);
-    const double mu = static_cast<double>(mean[ci]);
+    const float a = g[ci] / std::sqrt(var[ci] + eps);
+    const float beta = b[ci];
+    const float mu = mean[ci];
     float* row = x + static_cast<size_t>(ci) * s;
-    for (size_t i = 0; i < s; ++i)
-      row[i] = static_cast<float>((static_cast<double>(row[i]) - mu) * a + beta);
+    const float32x4_t va = vdupq_n_f32(a);
+    const float32x4_t vmu = vdupq_n_f32(mu);
+    const float32x4_t vbeta = vdupq_n_f32(beta);
+    int i = 0;
+    for (; i + 4 <= rc; i += 4) {
+      const float32x4_t vc = vsubq_f32(vld1q_f32(row + i), vmu);
+      vst1q_f32(row + i, vfmaq_f32(vbeta, vc, va));  // beta + (x-mu)*a
+    }
+    // 尾部逐点(与主链同公式)
+    for (; i < int(s); ++i)
+      row[i] = (row[i] - mu) * a + beta;
   }
   sv_acc(tp, g_sv_inner.meta_bn_ms);
 }
@@ -299,6 +324,50 @@ void pack_k1s1_rows_neon(const float* in, int c_in, size_t S,
       crow[r] = kern::f32_to_f16_scalar(chp[r]);
   }
 }
+
+// E13-SV/T4: 3x3 s1 p1 快速路径。张量已整批向量 FCVT 到 f16(位级与标量
+// 一致)。注意 j0 起的 32 个展平样本可能跨源行边界(w=737 时 tile 跨 1~2
+// 行)，按「同行连续段」分段处理，段内做三条水平窗拷贝。
+void pack_3x3s1_scatter_neon(const std::vector<uint16_t>& tmp16, int c_in,
+                             int h, int w, size_t j0, size_t rend,
+                             uint16_t* tb) {
+  // 注意: 激活面板缓冲跨调用复用容量, 无效 k 位必须显式写零
+  // (与标量路径的全覆盖语义一致), 不得残留上一次的字节。
+  size_t r = 0;
+  while (r < rend) {
+    const size_t flat = j0 + r;
+    const int yy = int(flat / w);
+    const int x0 = int(flat % w);
+    const size_t seg =
+        std::min(rend - r, size_t(w) - size_t(x0));  // 本段同行长度
+    for (int c = 0; c < c_in; ++c) {
+      const uint16_t* plane = tmp16.data() + (size_t)c * h * w;
+      uint16_t* crow = tb + (size_t)(c * 9) * 32;
+      for (int ky = 0; ky < 3; ++ky) {
+        const int iy = yy + ky - 1;
+        const uint16_t* row =
+            (iy >= 0 && iy < h) ? plane + (size_t)iy * w : nullptr;
+        for (int kx = 0; kx < 3; ++kx) {
+          const int d = kx - 1;
+          uint16_t* dk = crow + (size_t(ky * 3 + kx) * 32);
+          // 与标量参考同义: 每个 panel 位必写一次, 源越界写 0。
+          // 有效 q 区间: 0 ≤ x0+q+d < w 且行在界内
+          const int qlo = std::max(0, -(x0 + d));       // sx≥0
+          const int qhi = std::min(int(seg), w - x0 - d);  // sx<w exclusive
+          for (int q = 0; q < qlo; ++q) dk[r + q] = 0;
+          const int qe2 = std::max(qhi, qlo);
+          if (row) {
+            for (int q = qlo; q < qe2; ++q) dk[r + q] = row[x0 + d + q];
+            for (int q = qe2; q < int(seg); ++q) dk[r + q] = 0;
+          } else {
+            for (int q = qlo; q < int(seg); ++q) dk[r + q] = 0;
+          }
+        }
+      }
+    }
+    r += seg;
+  }
+}
 }  // namespace
 
 void pack_conv_cols_to_panel(const float* in, int c_in, int h, int w,
@@ -317,14 +386,42 @@ void pack_conv_cols_to_panel(const float* in, int c_in, int h, int w,
       std::memset(d_tail + k * 64 + zoff, 0, 64 - zoff);
   }
 #if defined(GSV_AMX_GEMM)
+  // E13-SV 临时调试开关: 置位时禁用两条快速打包路径(对拍用)
+  const bool force_scalar = [] { const char* e = std::getenv("GSV_SV_PACK_SCALAR"); return e && *e; }();
   // T4: 1x1 s1 卷积的 im2col=恒等映射(h/w 平铺与展平空间同序) —
   // 全部 AMX 激活体积的大头(L1-L4 全部 conv3/sc/AFF/中后期 conv1)走此路。
-  if (kh == 1 && kw == 1 && stride == 1 && pad == 0) {
+  if (!force_scalar && kh == 1 && kw == 1 && stride == 1 && pad == 0) {
     for (size_t t = 0; t < nt; ++t) {
       const size_t j0 = t * 32;
       const size_t rend = std::min(size_t(32), S - j0);
       pack_k1s1_rows_neon(in + j0, c_in, S, rend,
                           reinterpret_cast<uint16_t*>(dst + t * K * 64));
+    }
+    return;
+  }
+  // T4b: 3x3 s1 p1(convs 组形状)。h/w 平铺展平序下窗口仅含垂直两个
+  // 整行越界情形, 其余访问是三条水平连续段 —— 行级 cvt 一次复用三窗。
+  if (!force_scalar && kh == 3 && kw == 3 && stride == 1 && pad == 1 && h > 2 && w > 2) {
+    // 整张量一次向量 FCVT(约 im2col 转换量的 1/9)，逐 tile 只做散布拷贝
+    const size_t total = size_t(c_in) * h * w;
+    thread_local std::vector<uint16_t> t_cvt3;
+    if (t_cvt3.size() < total) t_cvt3.resize(total);
+    {
+      size_t i = 0;
+      const float* sp = in;
+      uint16_t* dp = t_cvt3.data();
+      for (; i + 4 <= total; i += 4, sp += 4, dp += 4) {
+        const float32x4_t v = vld1q_f32(sp);
+        vst1_u16(dp, vreinterpret_u16_f16(vcvt_f16_f32(v)));
+      }
+      for (; i < total; ++i, ++sp, ++dp)
+        *dp = kern::f32_to_f16_scalar(*sp);
+    }
+    for (size_t t = 0; t < nt; ++t) {
+      const size_t j0 = t * 32;
+      const size_t rend = std::min(size_t(32), S - j0);
+      pack_3x3s1_scatter_neon(t_cvt3, c_in, h, w, j0, rend,
+                              reinterpret_cast<uint16_t*>(dst + t * K * 64));
     }
     return;
   }
@@ -457,10 +554,17 @@ void SvEngine::Aff::apply(const float* x, const float* ds, float* out, int h, in
 #ifdef C1_TRACE
   std::fprintf(stderr, "    [aff gemm1 done]\n");
 #endif
-  for (int e = 0; e < inter; ++e) {
-    float* row = att_.data() + static_cast<size_t>(e) * s;
-    const float b = b1[static_cast<size_t>(e)];
-    for (size_t i = 0; i < s; ++i) row[i] += b;
+  {
+    // E13-SV/T4: 偏置逐行 NEON 加法(精确同序, 逐元素加法无重排)
+    const int rc = int(s & ~size_t(3));
+    for (int e = 0; e < inter; ++e) {
+      float* row = att_.data() + static_cast<size_t>(e) * s;
+      const float32x4_t vb = vdupq_n_f32(b1[static_cast<size_t>(e)]);
+      int i = 0;
+      for (; i + 4 <= rc; i += 4)
+        vst1q_f32(row + i, vaddq_f32(vld1q_f32(row + i), vb));
+      for (; i < int(s); ++i) row[i] += b1[static_cast<size_t>(e)];
+    }
   }
   bn1.apply(att_.data(), inter, s);
   gsv::kern::silu(att_.data(), att_.data(), att_.size());
@@ -503,10 +607,16 @@ void SvEngine::Aff::apply(const float* x, const float* ds, float* out, int h, in
 #ifdef C1_TRACE
   std::fprintf(stderr, "    [aff gemm2 done]\n");
 #endif
-  for (int e = 0; e < ch; ++e) {
-    float* row = att_t_.data() + static_cast<size_t>(e) * s;
-    const float b = b2[static_cast<size_t>(e)];
-    for (size_t i = 0; i < s; ++i) row[i] += b;
+  {
+    const int rc = int(s & ~size_t(3));
+    for (int e = 0; e < ch; ++e) {
+      float* row = att_t_.data() + static_cast<size_t>(e) * s;
+      const float32x4_t vb = vdupq_n_f32(b2[static_cast<size_t>(e)]);
+      int i = 0;
+      for (; i + 4 <= rc; i += 4)
+        vst1q_f32(row + i, vaddq_f32(vld1q_f32(row + i), vb));
+      for (; i < int(s); ++i) row[i] += b2[static_cast<size_t>(e)];
+    }
   }
   bn2.apply(att_t_.data(), ch, s);
   {
@@ -576,7 +686,7 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
   {
     const auto tp_bn1 = sv_tp();
     bn1.apply(eng.nxt_.data(), co1, s);
-    for (float& v : eng.nxt_) v = relu20(v);
+    relu20_neon(eng.nxt_.data(), eng.nxt_.size());
     sv_acc(tp_bn1, g_sv_inner.meta_relu_ms);  // bn1+relu20 合并窗口(见证据说明)
   }
 #ifdef C1_TRACE
@@ -634,7 +744,7 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
     bns[static_cast<size_t>(i)].apply(eng.nxt_.data(), width, s);
     {
       const auto tp_rl = sv_tp();
-      for (float& v : eng.nxt_) v = relu20(v);
+      relu20_neon(eng.nxt_.data(), eng.nxt_.size());
       std::memcpy(eng.tmp2_.data() + static_cast<size_t>(i) * width * s,
                   eng.nxt_.data(), eng.nxt_.size() * sizeof(float));
       std::memcpy(sp.data(), eng.nxt_.data(), eng.nxt_.size() * sizeof(float));
@@ -691,7 +801,7 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
       sv_acc(tp_ad3, g_sv_inner.meta_add_ms);
     }
   }
-  for (float& v : eng.nxt_) v = relu20(v);
+  relu20_neon(eng.nxt_.data(), eng.nxt_.size());
 #ifdef C1_TRACE
   std::fprintf(stderr, "  [blk done]\n");
 #endif
