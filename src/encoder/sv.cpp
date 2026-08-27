@@ -641,6 +641,8 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
   // conv1(k1, stride, p0) + bn1 + ReLU20
   // 注意: in 可能就是 eng.tmp_(调用方把主缓冲喂进来) —— 必须写入另一缓冲防别名。
   int h = h_in, w = w_in;
+  // E13-SV/T4: conv1 输出直写 eng.cur_, 消除原先 nxt_→cur_ 的整块拷贝
+  std::vector<float>& c1out = eng.cur_;
 #if defined(GSV_AMX_GEMM)
   if (conv1_panel_ready && !(amx_sv_skip_mask() & 1u) &&
       amx_sv_go(size_t(co1), size_t(h_in) * w_in, size_t(c_in))) {
@@ -649,7 +651,7 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
     // 解除 E12 的 stride==1 分流限制, 入口块 conv1(s2) 走 AMX 直派。
     // 派发门槛从 S/K≥48/256 收紧为 amx_sv_go(基于 t3_probe 实测净赚域)。
     eng.conv2d_amx(conv1_panel, in, c_in, h_in, w_in, 1, 1, stride, 0, co1,
-                   eng.nxt_);
+                   c1out);
     if (stride != 1) {  // 下游 BN/分块逻辑按新分辨率(与 else 分支同式)
       h = (h_in - 1) / stride + 1;
       w = (w_in - 1) / stride + 1;
@@ -658,7 +660,7 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
 #endif
   if (stride == 1) {
     // 1x1 s1: 零 im2col。in 通道主 [c_in,S] → 转置量化 xh_[S,c_in];
-    // gemm(A=W[co1,c_in], B=xh) 直接得通道主 nxt_[co1,S] —— 不经 tmp_
+    // gemm(A=W[co1,c_in], B=xh) 直接得通道主输出 —— 不经 tmp_
     // (in 可能别名 eng.tmp_, 不得写回)。
     const size_t s = static_cast<size_t>(h) * w;
     if (amx_trace())
@@ -666,10 +668,10 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
     if (eng.xh_.size() < static_cast<size_t>(c_in) * s)
       eng.xh_.resize(static_cast<size_t>(c_in) * s);
     kern::f32_trans_to_f16(in, eng.xh_.data(), c_in, s);
-    eng.nxt_.resize(static_cast<size_t>(co1) * s);
+    c1out.resize(static_cast<size_t>(co1) * s);
     const auto tp_c1 = sv_inner_tim() ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
-    kern::gemm_f16x_fmlal(conv1_w, eng.xh_.data(), eng.nxt_.data(),
+    kern::gemm_f16x_fmlal(conv1_w, eng.xh_.data(), c1out.data(),
                           static_cast<size_t>(co1), s,
                           static_cast<size_t>(c_in));
     if (sv_inner_tim()) {
@@ -678,15 +680,15 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
       g_sv_inner.blkconv1_s += long(s);
     }
   } else {
-    eng.conv2d_f16(in, c_in, h, w, conv1_w, co1, 1, 1, stride, 0, eng.cols_, eng.nxt_);
+    eng.conv2d_f16(in, c_in, h, w, conv1_w, co1, 1, 1, stride, 0, eng.cols_, c1out);
     h = (h - 1) / stride + 1;
     w = (w - 1) / stride + 1;
   }
   const size_t s = static_cast<size_t>(h) * w;
   {
     const auto tp_bn1 = sv_tp();
-    bn1.apply(eng.nxt_.data(), co1, s);
-    relu20_neon(eng.nxt_.data(), eng.nxt_.size());
+    bn1.apply(c1out.data(), co1, s);
+    relu20_neon(c1out.data(), c1out.size());
     sv_acc(tp_bn1, g_sv_inner.meta_relu_ms);  // bn1+relu20 合并窗口(见证据说明)
   }
 #ifdef C1_TRACE
@@ -694,10 +696,10 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
 #endif
 
   // 分块处理链(torch 语义): sp 从原始块 0 出发, 每轮处理后作为下一轮 fuse/相加的左操作数
-  eng.cur_.assign(eng.nxt_.begin(), eng.nxt_.end());  // spx([co1,s])
-  eng.nxt_.clear();
+  // E13-SV/T4: conv1 已直写 eng.cur_(c1out), 此处无需再整块拷贝。
+  // 注意: c1out 语义 = [co1, s] 即 concat 的槽位 0..3 连续排布(chunk(i) 基址)。
+  eng.cur_.resize(static_cast<size_t>(co1) * s);      // conv1 输出恰好是 co1×s
   eng.tmp2_.resize(static_cast<size_t>(co1) * s);     // 拼接缓冲(槽位 i × width)
-  eng.nxt_.reserve(static_cast<size_t>(width) * s);
   auto chunk = [&](int i) -> const float* {
     return eng.cur_.data() + static_cast<size_t>(i) * width * s;
   };
@@ -718,7 +720,14 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
         std::memcpy(sp.data(), fus.data(), sp.size() * sizeof(float));
       } else {
         const auto tp_ad = sv_tp();
-        for (size_t j = 0; j < sp.size(); ++j) sp[j] += chunk(i)[j];
+        // E13-SV/T4: 向量四宽加法(load 完成后才 store, 别名安全; 精确同序)
+        const float* rp = chunk(i);
+        size_t j = 0;
+        const size_t rc = sp.size() & ~size_t(3);
+        for (; j + 4 <= rc; j += 4)
+          vst1q_f32(sp.data() + j,
+                    vaddq_f32(vld1q_f32(sp.data() + j), vld1q_f32(rp + j)));
+        for (; j < sp.size(); ++j) sp[j] += rp[j];
         sv_acc(tp_ad, g_sv_inner.meta_add_ms);
       }
     }
@@ -776,7 +785,16 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
   // shortcut(输入仍是 [c_in,h_in,w_in], 经 stride 下采样到输出分辨率 —— 必须用原始 h_in/w_in!)
   if (!has_shortcut) {
     const auto tp_ad2 = sv_tp();
-    for (size_t j = 0; j < eng.nxt_.size(); ++j) eng.nxt_[j] += in[j];
+{
+      const float* bp = in;
+      const size_t n2 = eng.nxt_.size();
+      size_t j = 0;
+      const size_t rc = n2 & ~size_t(3);
+      for (; j + 4 <= rc; j += 4)
+        vst1q_f32(eng.nxt_.data() + j,
+                  vaddq_f32(vld1q_f32(eng.nxt_.data() + j), vld1q_f32(bp + j)));
+      for (; j < n2; ++j) eng.nxt_[j] += bp[j];
+    }
     sv_acc(tp_ad2, g_sv_inner.meta_add_ms);
   } else {
 #if defined(GSV_AMX_GEMM)
@@ -797,7 +815,16 @@ void SvEngine::Block::apply(const float* in, int c_in, int h_in, int w_in,
     sc_bn.apply(eng.tmp_.data(), exp_planes, s);
     {
       const auto tp_ad3 = sv_tp();
-      for (size_t j = 0; j < eng.nxt_.size(); ++j) eng.nxt_[j] += eng.tmp_[j];
+{
+      const float* bp = eng.tmp_.data();
+      const size_t n2 = eng.nxt_.size();
+      size_t j = 0;
+      const size_t rc = n2 & ~size_t(3);
+      for (; j + 4 <= rc; j += 4)
+        vst1q_f32(eng.nxt_.data() + j,
+                  vaddq_f32(vld1q_f32(eng.nxt_.data() + j), vld1q_f32(bp + j)));
+      for (; j < n2; ++j) eng.nxt_[j] += bp[j];
+    }
       sv_acc(tp_ad3, g_sv_inner.meta_add_ms);
     }
   }
