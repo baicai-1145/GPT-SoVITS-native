@@ -67,7 +67,7 @@ void printHelp(const char* argv0) {
       "  --overlap         流水重叠模式: AR(N+1) ‖ SoVITS(N) (数值同串行)\n"
       "  --timing-csv F    per-segment 三阶段耗时 CSV 输出路径\n"
       "  --amx             SoVITS conv 启用 AMX fp16 GEMM 后端(实验; 默认关)\n"
-      "  --kv-reuse        AR prompt KV 跨段复用(实验; 默认关, 数值逐位一致)\n"
+      "  --kv-reuse        实验诊断; 仅在完全相同 prompt+text 重复合成时命中(位级一致), 长文本多段不同文本场景无收益(掩码语义)\n"
       "  --fp16-kv         AR KV cache 以 fp16 存储(等价 --fp16; 默认关)\n"
       "  --fp16-all        AR KV cache + GEMV 均启用 fp16 (实验开关; 默认关)\n"
       "  --sample          AR 采样对齐 python(top_k=15/pen=1.35, 根治长文本复读; 默认贪心=位级口径)\n"
