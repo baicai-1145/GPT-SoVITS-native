@@ -171,6 +171,12 @@ int main(int argc, char** argv) {
       opt.sovits_in_dump = next("--dump-sovits-in");
     } else if (a == "--sovits-in") {
       sovitsInPath = next("--sovits-in");
+    } else if (a == "--queue-cap") {
+      opt.queue_cap = std::strtoul(next("--queue-cap").c_str(), nullptr, 10);
+      if (opt.queue_cap < 1) {
+        std::fprintf(stderr, "错误: --queue-cap 必须 >= 1\n");
+        return 2;
+      }
     } else if (a == "--no-cache") {
       opt.use_ref_cache = false;
     } else {
