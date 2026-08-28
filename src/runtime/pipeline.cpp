@@ -9,9 +9,11 @@
 #include <cmath>
 #include <cstring>
 #include <cstdio>
+#include <exception>
 #include <filesystem>
 #include <initializer_list>
 #include <random>
+#include <thread>
 
 #include "runtime/threadpool.hpp"
 #include "runtime/wav.hpp"
@@ -300,195 +302,404 @@ bool Pipeline::buildReference(const std::string& refWavPath, SynthResult* out,
     rt::wav::WavFile w = rt::wav::load_wav(refWavPath);
     if (w.samples.empty()) throw std::runtime_error("空音频: " + refWavPath);
 
-    Resampler to32k;
-    to32k.init(int(w.sample_rate), kSr);
-    std::vector<float> a32;
-    if (int(w.sample_rate) == int(kSr))
-      a32 = w.samples;
-    else
-      to32k.process(w.samples.data(), w.samples.size(), a32);
-    normalizeRef(&a32);
+    const bool enc_serial = std::getenv("GSV_ENC_SERIAL") != nullptr;
+    if (opt_.enc_amx && !enc_serial) {
+      // ---- E15: 并行分支 (--amx-enc 开启时): 链 A (SV + cond, 主线程) ‖ 链 B (HuBERT + ssl_proj + RVQ, 派生线程) ----
+      std::exception_ptr b_exc = nullptr;
+      std::vector<float> proj;
+      size_t T = 0, Tq = 0;
+      double tHub0 = 0.0, tHub1 = 0.0, tLat0 = 0.0, tLatOpen = 0.0, tLatProj = 0.0, tLatEnd = 0.0;
 
-    // sv_emb 输入 = 归一后 32k → 16k
-    Resampler to16;
-    to16.init(kSr, 16000);
-    std::vector<float> a16cond;
-    to16.process(a32.data(), a32.size(), a16cond);
-    std::vector<float> fbank =
-        encoder::kaldi_fbank_80(a16cond.data(), a16cond.size(), nullptr);
-    size_t frames80 = fbank.size() / 80;
-    const double tSv0 = nowMs();
-    sv_->forward3(fbank.data(), frames80);
-    const double tSv1 = nowMs();
-    std::vector<float> svEmb(sv_->emb_out());  // [20480]
-    // E13-SV 探针: GSV_SV_EMB_DUMP=<path> 时落盘 svEmb(验证侧工具, 零行为变更)
-    if (const char* dp = std::getenv("GSV_SV_EMB_DUMP"); dp && *dp) {
-      if (FILE* fp = std::fopen(dp, "wb")) {
-        std::fwrite(svEmb.data(), sizeof(float), svEmb.size(), fp);
-        std::fclose(fp);
-        std::fprintf(stderr, "[sv-dump] %s (%zu floats)\n", dp, svEmb.size());
-      } else {
-        std::fprintf(stderr, "[sv-dump] 写失败: %s\n", dp);
-    }
-    }
+      std::thread threadB([&]() {
+        try {
+          // 链 B: 原始音频 → 16k (+9600 零) → HuBERT → ssl_proj → RVQ
+          Resampler to16raw;
+          to16raw.init(int(w.sample_rate), 16000);
+          std::vector<float> wav16k;
+          if (int(w.sample_rate) == 16000)
+            wav16k = w.samples;
+          else
+            to16raw.process(w.samples.data(), w.samples.size(), wav16k);
+          if (wav16k.size() < 48000 || wav16k.size() > 160000)
+            throw std::runtime_error(
+                "参考音频长度须为 3~10 秒 (当前约 " +
+                std::to_string(double(wav16k.size()) / 16000.0) + " 秒): " +
+                refWavPath);
 
-    // prompt_semantic: 原始音频直接 → 16k (+9600 零) → HuBERT → ssl_proj → RVQ
-    Resampler to16raw;
-    to16raw.init(int(w.sample_rate), 16000);
-    std::vector<float> wav16k;
-    if (int(w.sample_rate) == 16000)
-      wav16k = w.samples;
-    else
-      to16raw.process(w.samples.data(), w.samples.size(), wav16k);
-    if (wav16k.size() < 48000 || wav16k.size() > 160000)
-      throw std::runtime_error(
-          "参考音频长度须为 3~10 秒 (当前约 " +
-          std::to_string(double(wav16k.size()) / 16000.0) + " 秒): " +
-          refWavPath);
+          // HuBERT: 零尾填充与 CPUFast 一致 (cat[wav16k, zeros(9600)])
+          std::vector<float> hubIn(wav16k);
+          hubIn.insert(hubIn.end(), kSilence, 0.f);  // 0.3s@32k 的零段, CPUFast 同款
+          tHub0 = refTim ? nowMs() : 0.0;
+          T = hubert_->run(hubIn.data(), hubIn.size());
+          tHub1 = refTim ? nowMs() : 0.0;
+          const std::vector<float>& hidden = hubert_->out();  // [T,768]
 
-    // 条件链 (spec → ref_enc → ge/ge_text)
-    cond_.compute(a32.data(), a32.size(), svEmb.data(), &out->cond);
-    const double tCond = nowMs();
-
-    // HuBERT: 零尾填充与 CPUFast 一致 (cat[wav16k, zeros(9600)])
-    std::vector<float> hubIn(wav16k);
-    hubIn.insert(hubIn.end(), kSilence, 0.f);  // 0.3s@32k 的零段, CPUFast 同款
-    const size_t T = hubert_->run(hubIn.data(), hubIn.size());
-    const double tHub = nowMs();
-    if (refTim) {
-      std::fprintf(stderr,
-                   "[ref-timing] sv.forward3=%.0fms(%zu帧) cond=%.0fms "
-                   "hubert.run=%.0fms(T=%zu) 前处理(resample+fbank+load)=%.0fms "
-                   "合计=%.0fms\n",
-                   tSv1 - tSv0, frames80, tCond - tSv1, tHub - tCond, T,
-                   tSv0 - tRef0, tHub - tRef0);
-    }
-    const std::vector<float>& hidden = hubert_->out();  // [T,768]
-
-    // extract_latent: v2ProPlus semantic_frame_rate="25hz" ⇒
-    //   ssl_proj = Conv1d(768,768,k=2,stride=2) 帧率减半, 再最近码字。
-    const double tLat0 = refTim ? nowMs() : 0.0;  // E13 探针: extract_latent 段计时
-    rt::GsvFile sovF(joinPath(weightsDir_, "sovits_v2ProPlus.gsv"));
-    std::vector<float> sslW, sslB;  // W[768,768,2](out,in,tap), b[768]
-    sovits::load_tensor_f32(sovF, "ssl_proj.weight", sslW);
-    sovits::load_tensor_f32(sovF, "ssl_proj.bias", sslB);
-    const size_t Tq = (T >= 2) ? ((T - 2) / 2 + 1) : 0;  // floor((L-k)/s)+1
-    const double tLatOpen = refTim ? nowMs() : 0.0;  // E13: gsv 重开+读权重
-    std::vector<float> proj(Tq * 768);
-    {  // im2col: 相邻两输入帧拼 [Tq,1536]; 权重按 tap 展平 [768,1536]
-      std::vector<float> w2(size_t(768) * 1536);
-      for (size_t c = 0; c < 768; ++c)
-        for (size_t d = 0; d < 768; ++d) {
-          w2[c * 1536 + d] = sslW[(c * 768 + d) * 2 + 0];
-          w2[c * 1536 + d + 768] = sslW[(c * 768 + d) * 2 + 1];
+          // extract_latent: v2ProPlus semantic_frame_rate="25hz" ⇒
+          //   ssl_proj = Conv1d(768,768,k=2,stride=2) 帧率减半, 再最近码字。
+          tLat0 = refTim ? nowMs() : 0.0;
+          rt::GsvFile sovF(joinPath(weightsDir_, "sovits_v2ProPlus.gsv"));
+          std::vector<float> sslW, sslB;  // W[768,768,2](out,in,tap), b[768]
+          sovits::load_tensor_f32(sovF, "ssl_proj.weight", sslW);
+          sovits::load_tensor_f32(sovF, "ssl_proj.bias", sslB);
+          Tq = (T >= 2) ? ((T - 2) / 2 + 1) : 0;  // floor((L-k)/s)+1
+          tLatOpen = refTim ? nowMs() : 0.0;
+          proj.resize(Tq * 768);
+          {  // im2col: 相邻两输入帧拼 [Tq,1536]; 权重按 tap 展平 [768,1536]
+            std::vector<float> w2(size_t(768) * 1536);
+            for (size_t c = 0; c < 768; ++c)
+              for (size_t d = 0; d < 768; ++d) {
+                w2[c * 1536 + d] = sslW[(c * 768 + d) * 2 + 0];
+                w2[c * 1536 + d + 768] = sslW[(c * 768 + d) * 2 + 1];
+              }
+            kern::accel::sgemm('N', 'T', int(Tq), 768, 1536, 1.0f, hidden.data(),
+                               1536, w2.data(), 1536, 0.0f, proj.data(), 768);
+            for (size_t t = 0; t < Tq; ++t)
+              for (size_t c = 0; c < 768; ++c) proj[t * 768 + c] += sslB[c];
+          }
+          tLatProj = refTim ? nowMs() : 0.0;
+          std::vector<float> embed;  // [1024,768]
+          sovits::load_tensor_f32(sovF, "quantizer.vq.layers.0._codebook.embed",
+                                  embed, {1024, 768});
+          out->prompt_semantic.resize(Tq);
+          {
+            const char* epsEnv = std::getenv("GSV_RVQ_TIE_EPS");
+            const double tieEps = epsEnv ? std::atof(epsEnv) : 1.0;
+            const bool rvqAudit = std::getenv("GSV_RVQ_AUDIT") != nullptr;
+            double normE[1024];
+            for (int64_t cb = 0; cb < 1024; ++cb) {
+              const float* e = embed.data() + size_t(cb) * 768;
+              double s = 0.0;
+              for (size_t c = 0; c < 768; ++c)
+                s += double(e[c]) * double(e[c]);
+              normE[cb] = s;
+            }
+            std::vector<float> dist(size_t(Tq) * 1024);
+            kern::accel::sgemm('N', 'T', int(Tq), 1024, 768, -2.0f, proj.data(), 768,
+                               embed.data(), 768, 0.0f, dist.data(), 1024);
+            for (size_t t = 0; t < Tq; ++t) {
+              float* row = dist.data() + t * 1024;
+              for (int64_t cb = 0; cb < 1024; ++cb)
+                row[cb] += float(normE[cb]);
+            }
+            size_t nFallback = 0, nFlip = 0;
+            for (size_t t = 0; t < Tq; ++t) {
+              const float* row = dist.data() + t * 1024;
+              size_t b0 = 0;
+              float v0, v1;
+              if (row[0] <= row[1]) {
+                v0 = row[0]; b0 = 0; v1 = row[1];
+              } else {
+                v0 = row[1]; b0 = 1; v1 = row[0];
+              }
+              for (size_t cb = 2; cb < 1024; ++cb) {
+                const float d = row[cb];
+                if (d < v0) {
+                  v1 = v0; v0 = d; b0 = cb;
+                } else if (d < v1) {
+                  v1 = d;
+                }
+              }
+              int64_t best = int64_t(b0);
+              if (double(v1) - double(v0) < tieEps) {
+                ++nFallback;
+                double bd = 1e30;
+                int64_t bExact = 0;
+                for (int64_t cb = 0; cb < 1024; ++cb) {
+                  const float* e = embed.data() + size_t(cb) * 768;
+                  double d = 0.0;
+                  for (size_t c = 0; c < 768; ++c) {
+                    const double diff = double(proj[t * 768 + c]) - double(e[c]);
+                    d += diff * diff;
+                  }
+                  if (d < bd) {
+                    bd = d;
+                    bExact = cb;
+                  }
+                }
+                if (bExact != best) ++nFlip;
+                best = bExact;
+              }
+              out->prompt_semantic[t] = best;
+            }
+            if (rvqAudit)
+              std::fprintf(stderr,
+                           "[rvq-batch] Tq=%zu fallback=%zu flip_caught=%zu "
+                           "tie_eps=%g\n",
+                           Tq, nFallback, nFlip, tieEps);
+          }
+          tLatEnd = refTim ? nowMs() : 0.0;
+        } catch (...) {
+          b_exc = std::current_exception();
         }
-      kern::accel::sgemm('N', 'T', int(Tq), 768, 1536, 1.0f, hidden.data(),
-                         1536, w2.data(), 1536, 0.0f, proj.data(), 768);
-      for (size_t t = 0; t < Tq; ++t)
-        for (size_t c = 0; c < 768; ++c) proj[t * 768 + c] += sslB[c];
-    }
-    const double tLatProj = refTim ? nowMs() : 0.0;  // E13: im2col+sgemm+bias
-    std::vector<float> embed;  // [1024,768]
-    sovits::load_tensor_f32(sovF, "quantizer.vq.layers.0._codebook.embed",
-                            embed, {1024, 768});
-    out->prompt_semantic.resize(Tq);
-    // T5: 最近码字块化 — dist[t,cb] = ‖proj_t − e_cb‖²
-    //   = ‖proj_t‖²(行常量,argmin 无关) − 2·proj·e + ‖e_cb‖²(逐码不 可略)
-    //   ⇒ 先 sgemm 算 −2·proj·embedᵀ, 再逐列加 norm_e[1024]。
-    //   标量三重循环(80-87ms) → 单次 sgemm + 归一化逐行 argmin。
-    //   数值护栏: fp32 块化累加序变化引入的绝对误差实测 ≤0.045(见
-    //   .tmp/evidence-T5.md), 而 fp32 行 top-2 差实测 ≥3.0 ⇒ 默认 τ=1.0:
-    //   差距 < GSV_RVQ_TIE_EPS 的帧回退原始双精度逐码精确复算(与基线判定
-    //   位级同构); GSV_RVQ_AUDIT=1 打印回退/捕获数。
-    {
-      const char* epsEnv = std::getenv("GSV_RVQ_TIE_EPS");
-      const double tieEps = epsEnv ? std::atof(epsEnv) : 1.0;
-      const bool rvqAudit = std::getenv("GSV_RVQ_AUDIT") != nullptr;
-      double normE[1024];
-      for (int64_t cb = 0; cb < 1024; ++cb) {
-        const float* e = embed.data() + size_t(cb) * 768;
-        double s = 0.0;
-        for (size_t c = 0; c < 768; ++c)
-          s += double(e[c]) * double(e[c]);
-        normE[cb] = s;
-      }
-      std::vector<float> dist(size_t(Tq) * 1024);
-      kern::accel::sgemm('N', 'T', int(Tq), 1024, 768, -2.0f, proj.data(), 768,
-                         embed.data(), 768, 0.0f, dist.data(), 1024);
-      for (size_t t = 0; t < Tq; ++t) {
-        float* row = dist.data() + t * 1024;
-        for (int64_t cb = 0; cb < 1024; ++cb)
-          row[cb] += float(normE[cb]);
-      }
-      size_t nFallback = 0, nFlip = 0;
-      for (size_t t = 0; t < Tq; ++t) {
-        const float* row = dist.data() + t * 1024;
-        size_t b0 = 0;
-        float v0, v1;
-        if (row[0] <= row[1]) {
-          v0 = row[0]; b0 = 0; v1 = row[1];
+      });
+
+      // RAII 保证无论链 A 是否抛出异常, 链 B 线程均能被确定性 join
+      struct Joiner {
+        std::thread& t;
+        ~Joiner() { if (t.joinable()) t.join(); }
+      } joiner{threadB};
+
+      // 链 A (主线程): a32 → a16 → fbank → sv.forward3 → svEmb → cond.compute
+      Resampler to32k;
+      to32k.init(int(w.sample_rate), kSr);
+      std::vector<float> a32;
+      if (int(w.sample_rate) == int(kSr))
+        a32 = w.samples;
+      else
+        to32k.process(w.samples.data(), w.samples.size(), a32);
+      normalizeRef(&a32);
+
+      Resampler to16;
+      to16.init(kSr, 16000);
+      std::vector<float> a16cond;
+      to16.process(a32.data(), a32.size(), a16cond);
+      std::vector<float> fbank =
+          encoder::kaldi_fbank_80(a16cond.data(), a16cond.size(), nullptr);
+      size_t frames80 = fbank.size() / 80;
+      const double tSv0 = nowMs();
+      sv_->forward3(fbank.data(), frames80);
+      const double tSv1 = nowMs();
+      std::vector<float> svEmb(sv_->emb_out());  // [20480]
+      if (const char* dp = std::getenv("GSV_SV_EMB_DUMP"); dp && *dp) {
+        if (FILE* fp = std::fopen(dp, "wb")) {
+          std::fwrite(svEmb.data(), sizeof(float), svEmb.size(), fp);
+          std::fclose(fp);
+          std::fprintf(stderr, "[sv-dump] %s (%zu floats)\n", dp, svEmb.size());
         } else {
-          v0 = row[1]; b0 = 1; v1 = row[0];
+          std::fprintf(stderr, "[sv-dump] 写失败: %s\n", dp);
         }
-        for (size_t cb = 2; cb < 1024; ++cb) {
-          const float d = row[cb];
-          if (d < v0) {
-            v1 = v0; v0 = d; b0 = cb;
-          } else if (d < v1) {
-            v1 = d;
-          }
-        }
-        int64_t best = int64_t(b0);
-        if (double(v1) - double(v0) < tieEps) {
-          // 位级护栏分支: 双精度精确复算整帧(argmin 判定与基线同构:
-          // cb 升序扫 + 严格小于刷新)
-          ++nFallback;
-          double bd = 1e30;
-          int64_t bExact = 0;
-          for (int64_t cb = 0; cb < 1024; ++cb) {
-            const float* e = embed.data() + size_t(cb) * 768;
-            double d = 0.0;
-            for (size_t c = 0; c < 768; ++c) {
-              const double diff = double(proj[t * 768 + c]) - double(e[c]);
-              d += diff * diff;
-            }
-            if (d < bd) {
-              bd = d;
-              bExact = cb;
-            }
-          }
-          if (bExact != best) ++nFlip;
-          best = bExact;
-        }
-        out->prompt_semantic[t] = best;
       }
-      if (rvqAudit)
+
+      cond_.compute(a32.data(), a32.size(), svEmb.data(), &out->cond);
+      const double tCond = nowMs();
+
+      // 汇合: join 链 B 并检查异常
+      if (threadB.joinable()) threadB.join();
+      if (b_exc) std::rethrow_exception(b_exc);
+
+      const double tRefEnd = nowMs();
+      if (refTim) {
         std::fprintf(stderr,
-                     "[rvq-batch] Tq=%zu fallback=%zu flip_caught=%zu "
-                     "tie_eps=%g\n",
-                     Tq, nFallback, nFlip, tieEps);
-    }
-    if (refTim)  // E13 探针: extract_latent 三段(open/proj/rvq)
-      std::fprintf(stderr,
-                   "[ref-timing] extract_latent=%.0fms(Tq=%zu) = open%.0f + "
-                   "proj%.0f + rvq%.0f\n",
-                   nowMs() - tLat0, Tq, tLatOpen - tLat0, tLatProj - tLatOpen,
-                   nowMs() - tLatProj);
-    // E13-MIX/T5 探针: prompt_semantic codes + ssl_proj 输出落盘
-    // (GSV_RVQ_DUMP=<path>; 两路径位级比对用, 零行为变更)
-    if (const char* dumpPath = std::getenv("GSV_RVQ_DUMP")) {
-      FILE* df = fopen(dumpPath, "wb");
-      if (df) {
-        const bool okD = fwrite(out->prompt_semantic.data(), sizeof(int64_t),
-                                out->prompt_semantic.size(), df) ==
-                            out->prompt_semantic.size() &&
-                        fwrite(proj.data(), sizeof(float), proj.size(), df) ==
-                            proj.size();
-        fclose(df);
-        if (!okD)
-          std::fprintf(stderr, "警告: GSV_RVQ_DUMP 写入不完整: %s\n", dumpPath);
-      } else {
-        std::fprintf(stderr, "警告: GSV_RVQ_DUMP 无法写入: %s\n", dumpPath);
+                     "[ref-timing] sv.forward3=%.0fms(%zu帧) cond=%.0fms "
+                     "hubert.run=%.0fms(T=%zu) 前处理(resample+fbank+load)=%.0fms "
+                     "并行总耗时=%.0fms (串行估算=%.0fms)\n",
+                     tSv1 - tSv0, frames80, tCond - tSv1, tHub1 - tHub0, T,
+                     tSv0 - tRef0, tRefEnd - tRef0,
+                     (tCond - tSv0) + (tLatEnd - tHub0) + (tSv0 - tRef0));
+        std::fprintf(stderr,
+                     "[ref-timing] extract_latent=%.0fms(Tq=%zu) = open%.0f + "
+                     "proj%.0f + rvq%.0f\n",
+                     tLatEnd - tLat0, Tq, tLatOpen - tLat0, tLatProj - tLatOpen,
+                     tLatEnd - tLatProj);
+      }
+
+      if (const char* dumpPath = std::getenv("GSV_RVQ_DUMP")) {
+        FILE* df = fopen(dumpPath, "wb");
+        if (df) {
+          const bool okD = fwrite(out->prompt_semantic.data(), sizeof(int64_t),
+                                  out->prompt_semantic.size(), df) ==
+                              out->prompt_semantic.size() &&
+                          fwrite(proj.data(), sizeof(float), proj.size(), df) ==
+                              proj.size();
+          fclose(df);
+          if (!okD)
+            std::fprintf(stderr, "警告: GSV_RVQ_DUMP 写入不完整: %s\n", dumpPath);
+        } else {
+          std::fprintf(stderr, "警告: GSV_RVQ_DUMP 无法写入: %s\n", dumpPath);
+        }
+      }
+    } else {
+      // 串行原路径 (opt_.enc_amx == false): 保持位级完全不动
+      Resampler to32k;
+      to32k.init(int(w.sample_rate), kSr);
+      std::vector<float> a32;
+      if (int(w.sample_rate) == int(kSr))
+        a32 = w.samples;
+      else
+        to32k.process(w.samples.data(), w.samples.size(), a32);
+      normalizeRef(&a32);
+
+      // sv_emb 输入 = 归一后 32k → 16k
+      Resampler to16;
+      to16.init(kSr, 16000);
+      std::vector<float> a16cond;
+      to16.process(a32.data(), a32.size(), a16cond);
+      std::vector<float> fbank =
+          encoder::kaldi_fbank_80(a16cond.data(), a16cond.size(), nullptr);
+      size_t frames80 = fbank.size() / 80;
+      const double tSv0 = nowMs();
+      sv_->forward3(fbank.data(), frames80);
+      const double tSv1 = nowMs();
+      std::vector<float> svEmb(sv_->emb_out());  // [20480]
+      // E13-SV 探针: GSV_SV_EMB_DUMP=<path> 时落盘 svEmb(验证侧工具, 零行为变更)
+      if (const char* dp = std::getenv("GSV_SV_EMB_DUMP"); dp && *dp) {
+        if (FILE* fp = std::fopen(dp, "wb")) {
+          std::fwrite(svEmb.data(), sizeof(float), svEmb.size(), fp);
+          std::fclose(fp);
+          std::fprintf(stderr, "[sv-dump] %s (%zu floats)\n", dp, svEmb.size());
+        } else {
+          std::fprintf(stderr, "[sv-dump] 写失败: %s\n", dp);
+        }
+      }
+
+      // prompt_semantic: 原始音频直接 → 16k (+9600 零) → HuBERT → ssl_proj → RVQ
+      Resampler to16raw;
+      to16raw.init(int(w.sample_rate), 16000);
+      std::vector<float> wav16k;
+      if (int(w.sample_rate) == 16000)
+        wav16k = w.samples;
+      else
+        to16raw.process(w.samples.data(), w.samples.size(), wav16k);
+      if (wav16k.size() < 48000 || wav16k.size() > 160000)
+        throw std::runtime_error(
+            "参考音频长度须为 3~10 秒 (当前约 " +
+            std::to_string(double(wav16k.size()) / 16000.0) + " 秒): " +
+            refWavPath);
+
+      // 条件链 (spec → ref_enc → ge/ge_text)
+      cond_.compute(a32.data(), a32.size(), svEmb.data(), &out->cond);
+      const double tCond = nowMs();
+
+      // HuBERT: 零尾填充与 CPUFast 一致 (cat[wav16k, zeros(9600)])
+      std::vector<float> hubIn(wav16k);
+      hubIn.insert(hubIn.end(), kSilence, 0.f);  // 0.3s@32k 的零段, CPUFast 同款
+      const size_t T = hubert_->run(hubIn.data(), hubIn.size());
+      const double tHub = nowMs();
+      if (refTim) {
+        std::fprintf(stderr,
+                     "[ref-timing] sv.forward3=%.0fms(%zu帧) cond=%.0fms "
+                     "hubert.run=%.0fms(T=%zu) 前处理(resample+fbank+load)=%.0fms "
+                     "合计=%.0fms\n",
+                     tSv1 - tSv0, frames80, tCond - tSv1, tHub - tCond, T,
+                     tSv0 - tRef0, tHub - tRef0);
+      }
+      const std::vector<float>& hidden = hubert_->out();  // [T,768]
+
+      // extract_latent: v2ProPlus semantic_frame_rate="25hz" ⇒
+      //   ssl_proj = Conv1d(768,768,k=2,stride=2) 帧率减半, 再最近码字。
+      const double tLat0 = refTim ? nowMs() : 0.0;  // E13 探针: extract_latent 段计时
+      rt::GsvFile sovF(joinPath(weightsDir_, "sovits_v2ProPlus.gsv"));
+      std::vector<float> sslW, sslB;  // W[768,768,2](out,in,tap), b[768]
+      sovits::load_tensor_f32(sovF, "ssl_proj.weight", sslW);
+      sovits::load_tensor_f32(sovF, "ssl_proj.bias", sslB);
+      const size_t Tq = (T >= 2) ? ((T - 2) / 2 + 1) : 0;  // floor((L-k)/s)+1
+      const double tLatOpen = refTim ? nowMs() : 0.0;  // E13: gsv 重开+读权重
+      std::vector<float> proj(Tq * 768);
+      {  // im2col: 相邻两输入帧拼 [Tq,1536]; 权重按 tap 展平 [768,1536]
+        std::vector<float> w2(size_t(768) * 1536);
+        for (size_t c = 0; c < 768; ++c)
+          for (size_t d = 0; d < 768; ++d) {
+            w2[c * 1536 + d] = sslW[(c * 768 + d) * 2 + 0];
+            w2[c * 1536 + d + 768] = sslW[(c * 768 + d) * 2 + 1];
+          }
+        kern::accel::sgemm('N', 'T', int(Tq), 768, 1536, 1.0f, hidden.data(),
+                           1536, w2.data(), 1536, 0.0f, proj.data(), 768);
+        for (size_t t = 0; t < Tq; ++t)
+          for (size_t c = 0; c < 768; ++c) proj[t * 768 + c] += sslB[c];
+      }
+      const double tLatProj = refTim ? nowMs() : 0.0;  // E13: im2col+sgemm+bias
+      std::vector<float> embed;  // [1024,768]
+      sovits::load_tensor_f32(sovF, "quantizer.vq.layers.0._codebook.embed",
+                              embed, {1024, 768});
+      out->prompt_semantic.resize(Tq);
+      // T5: 最近码字块化 — dist[t,cb] = ‖proj_t − e_cb‖²
+      //   = ‖proj_t‖²(行常量,argmin 无关) − 2·proj·e + ‖e_cb‖²(逐码不 可略)
+      //   ⇒ 先 sgemm 算 −2·proj·embedᵀ, 再逐列加 norm_e[1024]。
+      //   标量三重循环(80-87ms) → 单次 sgemm + 归一化逐行 argmin。
+      //   数值护栏: fp32 块化累加序变化引入的绝对误差实测 ≤0.045(见
+      //   .tmp/evidence-T5.md), 而 fp32 行 top-2 差实测 ≥3.0 ⇒ 默认 τ=1.0:
+      //   差距 < GSV_RVQ_TIE_EPS 的帧回退原始双精度逐码精确复算(与基线判定
+      //   位级同构); GSV_RVQ_AUDIT=1 打印回退/捕获数。
+      {
+        const char* epsEnv = std::getenv("GSV_RVQ_TIE_EPS");
+        const double tieEps = epsEnv ? std::atof(epsEnv) : 1.0;
+        const bool rvqAudit = std::getenv("GSV_RVQ_AUDIT") != nullptr;
+        double normE[1024];
+        for (int64_t cb = 0; cb < 1024; ++cb) {
+          const float* e = embed.data() + size_t(cb) * 768;
+          double s = 0.0;
+          for (size_t c = 0; c < 768; ++c)
+            s += double(e[c]) * double(e[c]);
+          normE[cb] = s;
+        }
+        std::vector<float> dist(size_t(Tq) * 1024);
+        kern::accel::sgemm('N', 'T', int(Tq), 1024, 768, -2.0f, proj.data(), 768,
+                           embed.data(), 768, 0.0f, dist.data(), 1024);
+        for (size_t t = 0; t < Tq; ++t) {
+          float* row = dist.data() + t * 1024;
+          for (int64_t cb = 0; cb < 1024; ++cb)
+            row[cb] += float(normE[cb]);
+        }
+        size_t nFallback = 0, nFlip = 0;
+        for (size_t t = 0; t < Tq; ++t) {
+          const float* row = dist.data() + t * 1024;
+          size_t b0 = 0;
+          float v0, v1;
+          if (row[0] <= row[1]) {
+            v0 = row[0]; b0 = 0; v1 = row[1];
+          } else {
+            v0 = row[1]; b0 = 1; v1 = row[0];
+          }
+          for (size_t cb = 2; cb < 1024; ++cb) {
+            const float d = row[cb];
+            if (d < v0) {
+              v1 = v0; v0 = d; b0 = cb;
+            } else if (d < v1) {
+              v1 = d;
+            }
+          }
+          int64_t best = int64_t(b0);
+          if (double(v1) - double(v0) < tieEps) {
+            // 位级护栏分支: 双精度精确复算整帧(argmin 判定与基线同构:
+            // cb 升序扫 + 严格小于刷新)
+            ++nFallback;
+            double bd = 1e30;
+            int64_t bExact = 0;
+            for (int64_t cb = 0; cb < 1024; ++cb) {
+              const float* e = embed.data() + size_t(cb) * 768;
+              double d = 0.0;
+              for (size_t c = 0; c < 768; ++c) {
+                const double diff = double(proj[t * 768 + c]) - double(e[c]);
+                d += diff * diff;
+              }
+              if (d < bd) {
+                bd = d;
+                bExact = cb;
+              }
+            }
+            if (bExact != best) ++nFlip;
+            best = bExact;
+          }
+          out->prompt_semantic[t] = best;
+        }
+        if (rvqAudit)
+          std::fprintf(stderr,
+                       "[rvq-batch] Tq=%zu fallback=%zu flip_caught=%zu "
+                       "tie_eps=%g\n",
+                       Tq, nFallback, nFlip, tieEps);
+      }
+      if (refTim)  // E13 探针: extract_latent 三段(open/proj/rvq)
+        std::fprintf(stderr,
+                     "[ref-timing] extract_latent=%.0fms(Tq=%zu) = open%.0f + "
+                     "proj%.0f + rvq%.0f\n",
+                     nowMs() - tLat0, Tq, tLatOpen - tLat0, tLatProj - tLatOpen,
+                     nowMs() - tLatProj);
+      // E13-MIX/T5 探针: prompt_semantic codes + ssl_proj 输出落盘
+      // (GSV_RVQ_DUMP=<path>; 两路径位级比对用, 零行为变更)
+      if (const char* dumpPath = std::getenv("GSV_RVQ_DUMP")) {
+        FILE* df = fopen(dumpPath, "wb");
+        if (df) {
+          const bool okD = fwrite(out->prompt_semantic.data(), sizeof(int64_t),
+                                  out->prompt_semantic.size(), df) ==
+                              out->prompt_semantic.size() &&
+                          fwrite(proj.data(), sizeof(float), proj.size(), df) ==
+                              proj.size();
+          fclose(df);
+          if (!okD)
+            std::fprintf(stderr, "警告: GSV_RVQ_DUMP 写入不完整: %s\n", dumpPath);
+        } else {
+          std::fprintf(stderr, "警告: GSV_RVQ_DUMP 无法写入: %s\n", dumpPath);
+        }
       }
     }
 

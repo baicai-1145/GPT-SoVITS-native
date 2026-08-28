@@ -87,6 +87,7 @@ bool probe_and_set_amx() {
 // ---------------- AMX 专用线程池 ----------------
 struct AmxPool {
   std::mutex mu;
+  std::mutex dispatch_mu;  // E15: 派发互斥 — 保护 run_phased/submit_graph/submit_dag 并发派发安全
   std::condition_variable cv, done_cv;
   struct Task {
     int phase;
@@ -196,6 +197,7 @@ struct AmxPool {
     size_t n = 0;
     for (auto& p : phases) n += p.size();
     if (n == 0) return;
+    std::lock_guard<std::mutex> dlk(dispatch_mu);
     {
       std::lock_guard<std::mutex> lk(mu);
       future_phases.clear();
@@ -231,6 +233,7 @@ struct AmxPool {
     size_t total = 0;
     for (size_t p = 0; p < n_phases; ++p) total += phase_totals[p];
     if (total == 0) return;
+    std::lock_guard<std::mutex> dlk(dispatch_mu);
     {
       std::lock_guard<std::mutex> lk(mu);
       future_phases = std::move(byphase);
@@ -259,6 +262,7 @@ struct AmxPool {
     size_t total = 0;
     for (size_t i = 0; i < n; ++i) total += remaining[i];
     if (total == 0) return;
+    std::lock_guard<std::mutex> dlk(dispatch_mu);
     {
       std::lock_guard<std::mutex> lk(mu);
       dag_mode = true;
