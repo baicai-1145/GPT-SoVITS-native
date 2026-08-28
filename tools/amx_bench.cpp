@@ -68,6 +68,16 @@ int main(int argc, char** argv) {
       {"enc_p.ssl_proj Co768 K512  T300", 768, 300, 512},
       {"enc_p.ffn      Co2048 K768 T300", 2048, 300, 768},
       {"bert.ffn(24L)  Co4096 K1024 T64", 4096, 64, 1024},
+      // E17: AR prefill & decode shapes at S=280 / T=1
+      {"ar.prefill_qkv Co1536 K512  S280", 1536, 280, 512},
+      {"ar.prefill_w1  Co2048 K512  S280", 2048, 280, 512},
+      {"ar.prefill_w2  Co512  K2048 S280", 512, 280, 2048},
+      {"ar.sdpa_qk     M280   N280  K32",  280, 280, 32},
+      {"ar.decode_qkv  Co1536 K512  T1",   1536, 1, 512},
+      {"ar.decode_w1   Co2048 K512  T1",   2048, 1, 512},
+      {"ar.decode_w2   Co512  K2048 T1",   512, 1, 2048},
+      {"ar.decode_wout Co512  K512  T1",   512, 1, 512},
+      {"ar.decode_wp   Co1025 K512  T1",   1025, 1, 512},
   };
 
   std::mt19937 rng(20260824);
