@@ -57,6 +57,7 @@ struct PipelineOptions {
   bool ar_sample_on = false;        // true 时把 ar_sampling 传给 generate
   bool bert_amx = false;   // E8: BERT dense 接入 AMX 后端 (--amx-bert; 默认关)
   bool enc_amx = false;    // E12: HuBERT dense 接入 AMX 后端 (--amx-enc; 默认关)
+  size_t queue_cap = 2;    // D2/O3: 流水线队列容量 (默认 2=双缓冲)
 };
 
 struct SegmentResult {

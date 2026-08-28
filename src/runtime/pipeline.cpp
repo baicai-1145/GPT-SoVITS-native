@@ -970,6 +970,9 @@ static void writeTimingCsv(const std::string& path,
 bool Pipeline::synthesize(const std::string& utf8Text,
                           const std::string& refWavPath, SynthResult* out,
                           std::string* err) {
+  firstPacketMsX100.store(0);
+  rngSeeded_ = false;
+  sovInSink_.clear();
   const double tSynth = nowMs();
   try {
     // 1. 参考条件 (缓存/编码器)
@@ -977,7 +980,10 @@ bool Pipeline::synthesize(const std::string& utf8Text,
 
     // 2. 文本前端切段 (CPUFast 口径); 提示文本条件一次构建
     textfront::TextFrontend::Result full;
-    if (!tf_.process(utf8Text, &full, opt_.cut_method)) {
+    textfront::TextLangMode lm = opt_.lang_mode == "all_zh"
+                                     ? textfront::TextLangMode::AllZh
+                                     : textfront::TextLangMode::Auto;
+    if (!tf_.process(utf8Text, &full, opt_.cut_method, lm)) {
       if (err) *err = full.error;
       return false;
     }
@@ -1035,20 +1041,30 @@ bool Pipeline::synthesize(const std::string& utf8Text,
             return seg;
           },
           /*qos1=*/"utility", /*qos2=*/"user_initiated",
-          /*qos3=*/"user_initiated", /*queueCap=*/2);
+          /*qos3=*/"user_initiated", /*queueCap=*/opt_.queue_cap);
       pipe.start();
 
-      // 异常传输: stage 抛错经 envelope 送达 drain, 此处重抛给调用方
-      size_t submitted = 0, drained = 0;
-      try {
-        for (; submitted < full.sentences.size(); ++submitted)
-          pipe.submit({full.sentences[submitted]});
+      // D2: 异步生产者提交: 避免全量 pre-submit 在队列满时阻塞主线程,
+      // 导致 drain 无法执行而死锁 (queueCap 无论 1/2/N 均能安全流水推进)
+      std::thread producer([&pipe, &full] {
+        for (const auto& s : full.sentences) {
+          if (!pipe.submit({s})) break;
+        }
         pipe.shutdownInput();
+      });
+
+      // 异常传输: stage 抛错经 envelope 送达 drain, 此处重抛给调用方
+      size_t drained = 0;
+      try {
         while (drained < full.sentences.size()) {
           Pipe::WavItem it;
           if (!pipe.drain(it)) break;
           SegmentResult seg = std::move(it.data);
-          if (it.exc) std::rethrow_exception(it.exc);
+          if (it.exc) {
+            pipe.cancel();
+            if (producer.joinable()) producer.join();
+            std::rethrow_exception(it.exc);
+          }
           if (it.timing) {
             seg.tf_ms = it.timing->t_textfrontMs;
             seg.wait_ms = it.timing->t_waitMs;
@@ -1057,8 +1073,10 @@ bool Pipeline::synthesize(const std::string& utf8Text,
           appendSeg(std::move(seg));
           ++drained;
         }
+        if (producer.joinable()) producer.join();
       } catch (...) {
         pipe.cancel();
+        if (producer.joinable()) producer.join();
         throw;
       }
     }
