@@ -114,6 +114,12 @@ class T2SEngine {
                      GenDebug* dbg = nullptr,
                      const SamplingParams* sampling = nullptr);
 
+  // K1: KV cache 复用快照管理
+  void set_kv_reuse(bool enable) { kv_reuse_ = enable; }
+  bool kv_reuse() const { return kv_reuse_; }
+  bool last_prefill_hit() const { return last_prefill_hit_; }
+  void reset_kv_cache() { prompt_snapshot_.valid = false; }
+
   double last_prefill_ms() const { return last_prefill_ms_; }
   double last_decode_ms() const { return last_decode_ms_; }
 
@@ -247,6 +253,24 @@ class T2SEngine {
   // 在 generate() 入口按 V 一次性 resize, 之后复用
   std::vector<int> topk_idx_;
   std::vector<float> topk_val_;
+
+  // K1: prompt KV cache 复用快照
+  struct PromptSnapshot {
+    std::vector<int64_t> phones;
+    std::vector<int64_t> prompt;
+    std::vector<float> bert1024;
+    size_t S = 0;
+    size_t T = 0;
+    size_t P = 0;
+    std::vector<float> last_xy_row;  // [D]
+    std::vector<std::vector<float>> kc, vc;
+    std::vector<std::vector<uint16_t>> kc16, vc16;
+    bool is_fp16 = false;
+    bool valid = false;
+  };
+  PromptSnapshot prompt_snapshot_;
+  bool kv_reuse_ = false;
+  bool last_prefill_hit_ = false;
 
   // scratch(generate 内复用)
   std::vector<std::vector<float>> kc_, vc_; // 每层 KV cache [cap*D] (fp32 模式)
