@@ -888,22 +888,70 @@ GenResult T2SEngine::generate(const int64_t* phones, size_t T,
   // ---- B1: prefill(24 层, 大矩阵乘固定 Accelerate sgemm) ----
   if (dbg) dbg->on_input(xy_.data(), S);
   const auto t0 = std::chrono::steady_clock::now();
-  for (size_t l = 0; l < dims_.n_layers; ++l) {
-    if (fp16_.kv)
-      block_prefill_impl<true>(l, xy_.data(), S, /*pos=*/0, /*text_len=*/T,
-                               nullptr, kc16_[l].data(), nullptr,
-                               vc16_[l].data());
-    else
-      block_prefill_impl<false>(l, xy_.data(), S, /*pos=*/0, /*text_len=*/T,
-                                kc_[l].data(), nullptr, vc_[l].data(),
-                                nullptr);
-    if (dbg) dbg->on_layer(l, xy_.data(), S);
+  bool hit = false;
+  if (kv_reuse_ && prompt_snapshot_.valid &&
+      prompt_snapshot_.is_fp16 == fp16_.kv &&
+      prompt_snapshot_.T == T && prompt_snapshot_.P == P &&
+      std::memcmp(prompt_snapshot_.phones.data(), phones, T * sizeof(int64_t)) == 0 &&
+      std::memcmp(prompt_snapshot_.prompt.data(), prompt, P * sizeof(int64_t)) == 0 &&
+      std::memcmp(prompt_snapshot_.bert1024.data(), bert1024, T * dims_.bert_dim * sizeof(float)) == 0) {
+    hit = true;
+    for (size_t l = 0; l < dims_.n_layers; ++l) {
+      if (fp16_.kv) {
+        std::memcpy(kc16_[l].data(), prompt_snapshot_.kc16[l].data(), S * D * sizeof(uint16_t));
+        std::memcpy(vc16_[l].data(), prompt_snapshot_.vc16[l].data(), S * D * sizeof(uint16_t));
+      } else {
+        std::memcpy(kc_[l].data(), prompt_snapshot_.kc[l].data(), S * D * sizeof(float));
+        std::memcpy(vc_[l].data(), prompt_snapshot_.vc[l].data(), S * D * sizeof(float));
+      }
+    }
+  } else {
+    for (size_t l = 0; l < dims_.n_layers; ++l) {
+      if (fp16_.kv)
+        block_prefill_impl<true>(l, xy_.data(), S, /*pos=*/0, /*text_len=*/T,
+                                 nullptr, kc16_[l].data(), nullptr,
+                                 vc16_[l].data());
+      else
+        block_prefill_impl<false>(l, xy_.data(), S, /*pos=*/0, /*text_len=*/T,
+                                  kc_[l].data(), nullptr, vc_[l].data(),
+                                  nullptr);
+      if (dbg) dbg->on_layer(l, xy_.data(), S);
+    }
+    if (kv_reuse_) {
+      prompt_snapshot_.phones.assign(phones, phones + T);
+      prompt_snapshot_.prompt.assign(prompt, prompt + P);
+      prompt_snapshot_.bert1024.assign(bert1024, bert1024 + T * dims_.bert_dim);
+      prompt_snapshot_.S = S;
+      prompt_snapshot_.T = T;
+      prompt_snapshot_.P = P;
+      prompt_snapshot_.is_fp16 = fp16_.kv;
+      prompt_snapshot_.last_xy_row.assign(xy_.data() + (S - 1) * D, xy_.data() + S * D);
+      prompt_snapshot_.kc.assign(dims_.n_layers, {});
+      prompt_snapshot_.vc.assign(dims_.n_layers, {});
+      prompt_snapshot_.kc16.assign(dims_.n_layers, {});
+      prompt_snapshot_.vc16.assign(dims_.n_layers, {});
+      for (size_t l = 0; l < dims_.n_layers; ++l) {
+        if (fp16_.kv) {
+          prompt_snapshot_.kc16[l].assign(kc16_[l].begin(), kc16_[l].begin() + S * D);
+          prompt_snapshot_.vc16[l].assign(vc16_[l].begin(), vc16_[l].begin() + S * D);
+        } else {
+          prompt_snapshot_.kc[l].assign(kc_[l].begin(), kc_[l].begin() + S * D);
+          prompt_snapshot_.vc[l].assign(vc_[l].begin(), vc_[l].begin() + S * D);
+        }
+      }
+      prompt_snapshot_.valid = true;
+    }
   }
   const auto t1 = std::chrono::steady_clock::now();
+  last_prefill_hit_ = hit;
 
   // 首 logits 来自最后一个音频 prompt 位置(xy_dec[:, -1])
   logits_.resize(dims_.vocab);
-  predict_layer_fp(xy_.data() + (S - 1) * D, logits_.data());
+  if (hit) {
+    predict_layer_fp(prompt_snapshot_.last_xy_row.data(), logits_.data());
+  } else {
+    predict_layer_fp(xy_.data() + (S - 1) * D, logits_.data());
+  }
 
   // ---- B2: decode 循环(GEMV + KV cache fp32 + 贪心) ----
   // E4: 采样路径 —— sampling.mode=TopK 时走 topk_sample (复现 python 默认 15 采样, 根治复读)
@@ -991,9 +1039,10 @@ GenResult T2SEngine::generate(const int64_t* phones, size_t T,
     const double ms_per_tok =
         last_decode_ms_ / static_cast<double>(r.steps);
     std::fprintf(stderr,
-                 "[ar-timing] T=%zu P=%zu S=%zu steps=%zu prefill=%.2fms "
+                 "[ar-timing] T=%zu P=%zu S=%zu steps=%zu prefill=%.2fms (hit=%d) "
                  "decode=%.2fms (%.3f ms/tok)\n",
-                 T, P, S, r.steps, last_prefill_ms_, last_decode_ms_, ms_per_tok);
+                 T, P, S, r.steps, last_prefill_ms_, last_prefill_hit_ ? 1 : 0,
+                 last_decode_ms_, ms_per_tok);
   }
   return r;
 }
