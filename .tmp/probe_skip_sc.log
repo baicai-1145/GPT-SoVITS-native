@@ -1,5 +1,0 @@
-[ref-timing] sv.forward3=1018ms(737帧) cond=92ms hubert.run=908ms(T=399) 前处理(resample+fbank+load)=13ms 合计=2032ms
-输出: .tmp/e13_out.wav (2.46 秒 @32000 Hz, 1 段)
-参考: prompt_semantic=199, ge/ge_text 已构建
-  段00 phones=23 tokens=54 ar=532ms voc=269ms eos=1
-计时: load=276ms infer=3131ms RTF=1.273 首包≈3131ms

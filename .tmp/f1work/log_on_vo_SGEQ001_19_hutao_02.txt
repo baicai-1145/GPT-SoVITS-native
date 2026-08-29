@@ -1,4 +1,0 @@
-输出: .tmp/f1work/on_vo_SGEQ001_19_hutao_02.wav (0.78 秒 @32000 Hz, 1 段)
-参考: prompt_semantic=203, ge/ge_text 已构建
-  段00 phones=23 tokens=12 ar=285ms voc=62ms eos=1
-计时: load=268ms infer=1534ms RTF=1.967 首包≈1534ms

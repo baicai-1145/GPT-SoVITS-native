@@ -29,3 +29,6 @@ tools/bench_topk.cpp
 tools/prefill_bench.cpp
 tools/s2_tile_chain_bench.cpp
 tools/sdpa_bench.cpp
+
+# E22 补丁: 验收证据/临时文件不入库(本地保留)
+.tmp/

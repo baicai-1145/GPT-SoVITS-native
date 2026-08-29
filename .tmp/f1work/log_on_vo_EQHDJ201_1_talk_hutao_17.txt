@@ -1,4 +1,0 @@
-输出: .tmp/f1work/on_vo_EQHDJ201_1_talk_hutao_17.wav (4.74 秒 @32000 Hz, 1 段)
-参考: prompt_semantic=118, ge/ge_text 已构建
-  段00 phones=23 tokens=111 ar=792ms voc=564ms eos=1
-计时: load=235ms infer=2093ms RTF=0.442 首包≈2093ms

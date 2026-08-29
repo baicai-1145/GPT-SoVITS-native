@@ -1,4 +1,0 @@
-输出: .tmp/f1work/on_vo_card_hutao_endOfGame_win_01.wav (6.82 秒 @32000 Hz, 1 段)
-参考: prompt_semantic=193, ge/ge_text 已构建
-  段00 phones=23 tokens=163 ar=1729ms voc=1020ms eos=1
-计时: load=296ms infer=4003ms RTF=0.587 首包≈4003ms

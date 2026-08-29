@@ -1,4 +1,0 @@
-输出: .tmp/f1work/off_vo_mimiTomo_ly_hutao_villiage_02.wav (2.94 秒 @32000 Hz, 1 段)
-参考: prompt_semantic=229, ge/ge_text 已构建
-  段00 phones=23 tokens=66 ar=908ms voc=413ms eos=1
-计时: load=248ms infer=6059ms RTF=2.061 首包≈6059ms

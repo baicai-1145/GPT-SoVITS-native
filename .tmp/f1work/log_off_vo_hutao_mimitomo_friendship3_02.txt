@@ -1,4 +1,0 @@
-输出: .tmp/f1work/off_vo_hutao_mimitomo_friendship3_02.wav (4.94 秒 @32000 Hz, 1 段)
-参考: prompt_semantic=123, ge/ge_text 已构建
-  段00 phones=23 tokens=116 ar=1071ms voc=667ms eos=1
-计时: load=192ms infer=4004ms RTF=0.811 首包≈4004ms

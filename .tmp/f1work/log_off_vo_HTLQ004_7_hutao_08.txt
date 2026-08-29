@@ -1,4 +1,0 @@
-输出: .tmp/f1work/off_vo_HTLQ004_7_hutao_08.wav (2.18 秒 @32000 Hz, 1 段)
-参考: prompt_semantic=223, ge/ge_text 已构建
-  段00 phones=23 tokens=47 ar=647ms voc=284ms eos=1
-计时: load=230ms infer=5482ms RTF=2.515 首包≈5482ms

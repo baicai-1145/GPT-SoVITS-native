@@ -1,4 +1,0 @@
-输出: .tmp/f1work/on_vo_hutao_dialog_share_01.wav (0.74 秒 @32000 Hz, 1 段)
-参考: prompt_semantic=258, ge/ge_text 已构建
-  段00 phones=23 tokens=11 ar=350ms voc=61ms eos=1
-计时: load=265ms infer=1896ms RTF=2.562 首包≈1896ms

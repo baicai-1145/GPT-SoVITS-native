@@ -1,4 +1,0 @@
-输出: .tmp/f1work/off_vo_DPEQ002_6_hutao_29.wav (5.62 秒 @32000 Hz, 1 段)
-参考: prompt_semantic=114, ge/ge_text 已构建
-  段00 phones=23 tokens=133 ar=926ms voc=694ms eos=1
-计时: load=200ms infer=3443ms RTF=0.613 首包≈3443ms
