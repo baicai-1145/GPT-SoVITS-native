@@ -39,6 +39,8 @@ namespace gsv::kern {
 
 namespace {
 
+static thread_local bool t_is_amx_worker = false;
+
 // ---------------- SIGILL 探测 (并发安全) ----------------
 // 处理器全程长驻安装 (首次探测时装, 不再恢复): handler 只服务探测,
 // 且 buf/in_probe 均为 thread_local —— 任意线程 SIGILL 只会跳回自己的
@@ -138,6 +140,7 @@ struct AmxPool {
 
   // mu 已持: 任务完成记账; 相位清空则解锁下一相位
   void finish_task(int phase) {
+    if (phase < 0) return;  // 简单独立批任务: on_done 已就地更新调用方局部计数
     if (dag_mode) {
       // E10-K: 按-chain DAG 调度 —— 仅当本节点所有 chunks 完成时,
       // 才解锁其后继节点 (而非等待整个 phase). idx = node_idx。
@@ -172,6 +175,7 @@ struct AmxPool {
 
  public:
   void worker() {
+    t_is_amx_worker = true;
     if (!probe_and_set_amx()) {  // 本线程无 AMX → 不接活
       probed.fetch_add(1, std::memory_order_release);
       return;
@@ -220,10 +224,28 @@ struct AmxPool {
     std::unique_lock<std::mutex> lk(mu);
     done_cv.wait(lk, [this] { return pending == 0; });
   }
+  // E21: 无锁非阻塞独立批任务 (不占 dispatch_mu, 与 DAG/Phased 并发共存)
   void run_batch(std::vector<std::function<void()>> batch) {
-    std::vector<std::vector<std::function<void()>>> ph;
-    ph.emplace_back(std::move(batch));
-    run_phased(std::move(ph));
+    if (batch.empty()) return;
+    const size_t total = batch.size();
+    size_t left = total;
+    std::condition_variable local_cv;
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      for (auto& f : batch) {
+        ready.push_back(Task{
+            -1,
+            std::move(f),
+            [&left, &local_cv] {
+              if (--left == 0) {
+                local_cv.notify_one();
+              }
+            }});
+      }
+      cv.notify_all();
+    }
+    std::unique_lock<std::mutex> lk(mu);
+    local_cv.wait(lk, [&] { return left == 0; });
   }
   // E9: 相位化图提交。byphase[p] 为相位 p 的任务队列 (head 等); 含延迟
   // 入队者 (由某任务 on_done 推入) 也必须计入 phase_totals[p]。调用方
@@ -426,11 +448,23 @@ static thread_local std::vector<uint8_t> t_araw, t_braw;
 // 前置条件: AMX 已可用 (调用方保证), 输入形状已校验。
 void gemm_pp_dispatch(const uint8_t* X, const uint8_t* Y, float* c,
                       size_t M, size_t N, size_t K) {
-  AmxPool& pool = amx_pool();
-  const int healthy = pool.healthy.load(std::memory_order_acquire);
   const size_t nmb = (M + 31) / 32, nnb = (N + 31) / 32;
   const size_t ntiles = nmb * nnb;
-  const size_t grain = (ntiles + (size_t)healthy - 1) / (size_t)healthy;
+  if (ntiles == 0) return;
+
+  // 若当前已在 AMX worker 线程内执行, 直接内联运行 tiles (零重入死锁, 零调度开销)
+  if (t_is_amx_worker) {
+    for (size_t mb = 0; mb < nmb; ++mb) {
+      for (size_t nb = 0; nb < nnb; ++nb) {
+        amx_tile(X, Y, c, M, N, K, mb, nb);
+      }
+    }
+    return;
+  }
+
+  AmxPool& pool = amx_pool();
+  const int healthy = pool.healthy.load(std::memory_order_acquire);
+  const size_t grain = healthy > 0 ? (ntiles + (size_t)healthy - 1) / (size_t)healthy : ntiles;
   std::vector<std::function<void()>> batch;
   for (size_t t = 0; t < ntiles; t += grain) {
     const size_t e = std::min(ntiles, t + grain);
@@ -483,6 +517,22 @@ bool amx_gemm_available() {
   // 惰性触发池创建; 池 worker 探测在各自线程完成
   AmxPool& pool = amx_pool();
   return pool.healthy.load(std::memory_order_acquire) > 0;
+}
+
+size_t amx_pool_healthy_threads() {
+  AmxPool& pool = amx_pool();
+  int h = pool.healthy.load(std::memory_order_acquire);
+  return h > 0 ? (size_t)h : 0;
+}
+
+void amx_run_batch(std::vector<std::function<void()>> tasks) {
+  if (tasks.empty()) return;
+  AmxPool& pool = amx_pool();
+  if (pool.healthy.load(std::memory_order_acquire) <= 1) {
+    for (auto& t : tasks) t();
+    return;
+  }
+  pool.run_batch(std::move(tasks));
 }
 
 AmxPanel amx_pack(const uint16_t* w, size_t rows, size_t K) {

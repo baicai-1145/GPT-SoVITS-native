@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <exception>
 #include <filesystem>
+#include <future>
 #include <initializer_list>
 #include <random>
 #include <thread>
@@ -875,12 +876,13 @@ Pipeline::SegArIn Pipeline::stageFeaturize(const SegText& t) const {
 }
 
 Pipeline::SegSovIn Pipeline::stageAr(const SegArIn& in,
-                                     const std::vector<int64_t>& promptSem) {
+                                     const std::vector<int64_t>& promptSem,
+                                     gsv::runtime::SegTiming* tm, size_t segIdx) {
   SegSovIn o;
   o.empty = in.phonesSeg.empty();
   if (o.empty) return o;  // 纯标点段直通, 不触碰 RNG (与 C2 串行语义一致)
 
-  const double t0 = nowMs();
+  const auto t_ar_start = std::chrono::steady_clock::now();
   ar::GenResult gen =
       opt_.ar_sample_on
           ? ar_->generate(in.phonesAll.data(), in.phonesAll.size(),
@@ -891,7 +893,7 @@ Pipeline::SegSovIn Pipeline::stageAr(const SegArIn& in,
           : ar_->generate(in.phonesAll.data(), in.phonesAll.size(),
                           promptSem.data(), promptSem.size(),
                           in.bertAll.data());
-  o.arMs = nowMs() - t0;
+  const auto t_gen_done = std::chrono::steady_clock::now();
   o.hitEos = gen.hit_eos;
   o.codes.assign(gen.sampled.begin(), gen.sampled.end());
   o.rawArgmax = gen.raw_argmax;
@@ -914,11 +916,54 @@ Pipeline::SegSovIn Pipeline::stageAr(const SegArIn& in,
   }
   std::normal_distribution<float> nd(0.f, 1.f);
   for (float& v : o.noise) v = nd(rng_);
+  const auto t_noise_done = std::chrono::steady_clock::now();
+
+  o.arMs = std::chrono::duration<double, std::milli>(t_noise_done - t_ar_start).count();
+  const double noiseMs = std::chrono::duration<double, std::milli>(t_noise_done - t_gen_done).count();
+
+  // 计算与 SoVITS (stage3) 的并发重叠时间
+  const int64_t ar0_us = std::chrono::duration_cast<std::chrono::microseconds>(t_ar_start.time_since_epoch()).count();
+  const int64_t ar1_us = std::chrono::duration_cast<std::chrono::microseconds>(t_noise_done.time_since_epoch()).count();
+  int64_t overlap_us = 0;
+  {
+    std::lock_guard<std::mutex> lk(voc_span_mtx_);
+    for (const auto& sp : voc_spans_) {
+      int64_t s = std::max(ar0_us, sp.start_us);
+      int64_t e = std::min(ar1_us, sp.end_us);
+      if (e > s) overlap_us += (e - s);
+    }
+  }
+  if (cur_voc_active_.load(std::memory_order_acquire)) {
+    int64_t vs = cur_voc_start_us_.load(std::memory_order_relaxed);
+    int64_t s = std::max(ar0_us, vs);
+    int64_t e = ar1_us;
+    if (e > s) overlap_us += (e - s);
+  }
+  const double sovOverlapMs = overlap_us * 1e-3;
+
+  if (tm) {
+    tm->t_arPrepMs = gen.prep_ms;
+    tm->t_arPrefillMs = gen.prefill_ms;
+    tm->t_arDecodeMs = gen.decode_ms;
+    tm->t_arNoiseMs = noiseMs;
+    tm->t_sovOverlapMs = sovOverlapMs;
+  }
+
+  if (std::getenv("GSV_AR_TIMING")) {
+    const double ms_per_tok = gen.steps > 0 ? (gen.decode_ms / static_cast<double>(gen.steps)) : 0.0;
+    const double idleWait = tm ? tm->t_arIdleWaitMs : 0.0;
+    std::fprintf(stderr,
+                 "[ar-breakdown] seg=%02zu | wait_tf=%.2fms prep=%.2fms prefill=%.2fms decode=%.2fms (tok=%zu, %.3fms/tok) noise=%.2fms | ar_wall=%.2fms | voc_overlap=%.2fms\n",
+                 segIdx, idleWait, gen.prep_ms, gen.prefill_ms, gen.decode_ms,
+                 gen.steps, ms_per_tok, noiseMs, o.arMs, sovOverlapMs);
+  }
   return o;
 }
 
 void Pipeline::stageVoc(const SegSovIn& in, SegmentResult* seg,
-                        const DecodeCondition& cond) const {
+                        const DecodeCondition& cond,
+                        gsv::runtime::SegTiming* /*tm*/,
+                        size_t segIdx) const {
   seg->norm_text = in.normText;
   seg->phones = in.phonesSeg;
   seg->tokens.assign(in.codes.begin(), in.codes.end());
@@ -936,12 +981,31 @@ void Pipeline::stageVoc(const SegSovIn& in, SegmentResult* seg,
   si.ge_text = cond.ge_text.data();
   si.noise = in.noise.data();
   si.Tq_expected = in.codes.size() * 2;
-  const double t1 = nowMs();
+
+  const auto t_voc_start = std::chrono::steady_clock::now();
+  const int64_t v0_us = std::chrono::duration_cast<std::chrono::microseconds>(t_voc_start.time_since_epoch()).count();
+  cur_voc_start_us_.store(v0_us, std::memory_order_release);
+  cur_voc_active_.store(true, std::memory_order_release);
+
   sovits::Tensor2D wavOut;
   static sovits::Dumper noopDumper;  // 未 enable → 不落盘
   sovits_->run(si, wavOut, noopDumper);
-  seg->voc_ms = nowMs() - t1;
+
+  const auto t_voc_end = std::chrono::steady_clock::now();
+  const int64_t v1_us = std::chrono::duration_cast<std::chrono::microseconds>(t_voc_end.time_since_epoch()).count();
+  cur_voc_active_.store(false, std::memory_order_release);
+  {
+    std::lock_guard<std::mutex> lk(voc_span_mtx_);
+    voc_spans_.push_back({v0_us, v1_us, segIdx});
+  }
+
+  seg->voc_ms = std::chrono::duration<double, std::milli>(t_voc_end - t_voc_start).count();
   seg->audio_frames = wavOut.T;
+
+  if (std::getenv("GSV_AR_TIMING")) {
+    std::fprintf(stderr, "[voc-breakdown] seg=%02zu | voc_wall=%.2fms frames=%zu\n",
+                 segIdx, seg->voc_ms, seg->audio_frames);
+  }
 
   // 峰值归一 (>1 才除), 存归一后波形供拼接
   double mx = 0.0;
@@ -978,12 +1042,14 @@ bool Pipeline::synthesize(const std::string& utf8Text,
   firstPacketMsX100.store(0);
   rngSeeded_ = false;
   sovInSink_.clear();
+  {
+    std::lock_guard<std::mutex> lk(voc_span_mtx_);
+    voc_spans_.clear();
+  }
+  cur_voc_active_.store(false);
+  cur_voc_start_us_.store(0);
   const double tSynth = nowMs();
   try {
-    // 1. 参考条件 (缓存/编码器)
-    if (!buildReference(refWavPath, out, err)) return false;
-
-    // 2. 文本前端切段 (CPUFast 口径); 提示文本条件一次构建
     textfront::TextFrontend::Result full;
     textfront::TextLangMode lm = opt_.lang_mode == "all_zh"
                                      ? textfront::TextLangMode::AllZh
@@ -996,7 +1062,20 @@ bool Pipeline::synthesize(const std::string& utf8Text,
       if (err) *err = "文本前端未产出任何合成段";
       return false;
     }
-    if (!prompt_.ready && !buildPrompt(&prompt_, err)) return false;
+
+    std::string prompt_err;
+    std::future<bool> prompt_future;
+    if (!prompt_.ready) {
+      prompt_future = std::async(std::launch::async, [&]() {
+        return buildPrompt(&prompt_, &prompt_err);
+      });
+    }
+
+    // 1. 参考条件 (缓存/编码器)
+    if (!buildReference(refWavPath, out, err)) {
+      if (prompt_future.valid()) prompt_future.wait();
+      return false;
+    }
 
     std::vector<float> allAudio;
     auto appendSeg = [&](SegmentResult&& seg) {
@@ -1009,8 +1088,17 @@ bool Pipeline::synthesize(const std::string& utf8Text,
     };
 
     if (!opt_.overlap) {
+      if (prompt_future.valid()) {
+        if (!prompt_future.get()) {
+          if (err) *err = prompt_err;
+          return false;
+        }
+      } else if (!prompt_.ready && !buildPrompt(&prompt_, err)) {
+        return false;
+      }
       // ---- 串行模式: 同一阶段函数顺序内联 (数值路径与重叠态一致) ----
       rngSeeded_ = false;
+      size_t segIdx = 0;
       for (const auto& segStr : full.sentences) {
         SegmentResult seg;
         seg.sentence = segStr;
@@ -1019,11 +1107,12 @@ bool Pipeline::synthesize(const std::string& utf8Text,
         seg.tf_ms = nowMs() - t0;
         seg.norm_text = ain.normText;
         seg.phones = ain.phonesSeg;
-            SegSovIn sin = stageAr(ain, out->prompt_semantic);
+        SegSovIn sin = stageAr(ain, out->prompt_semantic, nullptr, segIdx);
         if (!opt_.sovits_in_dump.empty()) sovInSink_.push_back(sin);
-        stageVoc(sin, &seg, out->cond);
-            if (!seg.audio.empty()) noteFirstPacket(nowMs() - tSynth);
+        stageVoc(sin, &seg, out->cond, nullptr, segIdx);
+        if (!seg.audio.empty()) noteFirstPacket(nowMs() - tSynth);
         appendSeg(std::move(seg));
+        ++segIdx;
       }
     } else {
       // ---- 重叠模式: SegQueue 双缓冲, AR(N+1) ‖ SoVITS(N) ----
@@ -1031,17 +1120,19 @@ bool Pipeline::synthesize(const std::string& utf8Text,
       using gsv::runtime::SegTiming;
       using Pipe = gsv::runtime::SegmentPipeline<SegText, SegArIn, SegSovIn,
                                                  SegmentResult>;
+      std::atomic<size_t> arSegIdx{0};
+      std::atomic<size_t> vocSegIdx{0};
       Pipe pipe(
-          [this](const SegText& t, SegTiming&) {
+          [this](const SegText& t, SegTiming&) -> SegArIn {
             return stageFeaturize(t);
           },
-          [this, &out](const SegArIn& a, SegTiming&) {
-            return stageAr(a, out->prompt_semantic);
+          [this, &out, &arSegIdx](const SegArIn& a, SegTiming& tm) -> SegSovIn {
+            return stageAr(a, out->prompt_semantic, &tm, arSegIdx.fetch_add(1));
           },
-          [this, &tSynth, &out](const SegSovIn& v, SegTiming&) {
+          [this, &tSynth, &out, &vocSegIdx](const SegSovIn& v, SegTiming& tm) -> SegmentResult {
             SegmentResult seg;
             if (!opt_.sovits_in_dump.empty()) sovInSink_.push_back(v);  // stage3 FIFO 单线程
-            stageVoc(v, &seg, out->cond);
+            stageVoc(v, &seg, out->cond, &tm, vocSegIdx.fetch_add(1));
             if (!seg.audio.empty()) noteFirstPacket(nowMs() - tSynth);
             return seg;
           },
