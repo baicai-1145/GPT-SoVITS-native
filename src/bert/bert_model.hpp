@@ -59,23 +59,11 @@ struct BertModel {
 
     Matrix y, scr, ctxh;
     std::vector<uint16_t> xh;  // fp16 激活暂存(跨层复用)
-    // E8: per-layer timing 重置
-    if (bert_layer_timing_on()) {
-      auto& lt = last_layer_timing();
-      lt.qkv = lt.head = lt.wout_ln = lt.ffn = 0;
-    }
     for (size_t i = 0; i < cfg.layers; ++i) {
       stack[i].forward(x, ext, y, scr, ctxh, xh);
       x.d.swap(y.d);
       if (i == 0) dm.dump("bert_layer0_out", x);
       if (i == cfg.layers - 3) dm.dump("bert_layer_m3_out", x);  // hidden_states[-3]
-    }
-    if (bert_layer_timing_on()) {
-      const auto& lt = last_layer_timing();
-      std::fprintf(stderr,
-                   "[bert-layer-timing] layers=%zu qkv=%.1f head=%.1f "
-                   "wout+ffn=%.1f (ms)\n",
-                   cfg.layers, lt.qkv, lt.head, lt.ffn);
     }
     dm.dump("bert_last_out", x);  // 末层 LN 输出 = last_hidden_state
     out.d.swap(x.d);
