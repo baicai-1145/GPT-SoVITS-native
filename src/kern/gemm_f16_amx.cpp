@@ -495,12 +495,10 @@ void gemm_f16_amx_impl(const uint16_t* a, const uint16_t* b, float* c,
   AmxPool& pool = amx_pool();
   const int healthy = pool.healthy.load(std::memory_order_acquire);
   if (healthy <= 0 || g_amx_disabled.load()) {
-    if (getenv("GSV_AMX_DEBUG")) fprintf(stderr, "[amx] FALLBACK fmlal M=%zu N=%zu K=%zu healthy=%d\n", M, N, K, healthy);
     gemm_f16x_fmlal(a, b, c, M, N, K);  // 平台无 AMX → 全量回退
     g_amx_disabled.store(true);
     return;
   }
-  if (getenv("GSV_AMX_DEBUG")) fprintf(stderr, "[amx] AMX path M=%zu N=%zu K=%zu healthy=%d\n", M, N, K, healthy);
 
   pack_panel(a, M, K, t_araw);
   pack_panel(b, N, K, t_braw);

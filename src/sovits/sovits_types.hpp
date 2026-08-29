@@ -494,58 +494,6 @@ inline void load_tensor_f32(const rt::GsvFile& f, std::string_view name,
 // ---- debug dump: 与 tools/export_sovits_fixtures.py 同格式的 f32 raw + .shape ----
 
 
-// E6: conv 内部 prep(panel 构建)/GEMM 拆分累计 (画像专用)
-struct ConvSplit {
-  double prep = 0, gemm = 0;
-  size_t n = 0;
-  void reset() { *this = ConvSplit{}; }
-};
-inline ConvSplit& g_conv_split() {
-  static thread_local ConvSplit t;
-  return t;
-}
-// E6: 单调毫秒时钟 (画像用)
-inline double now_ms_e6() {
-  return std::chrono::duration<double, std::milli>(
-             std::chrono::steady_clock::now().time_since_epoch())
-      .count();
-}
-
-// ---- E6: SoVITS 内部画像计时 (GSV_SOVITS_TIMING=1 时每次 run 后 stderr 汇总) ----
-// 计时始终累计 (开销 ~ns 级, 远小于阶段耗时); 报告与清零走 report_and_reset。
-struct StageTimers {
-  double quant = 0, upsample = 0, enc_p = 0, noise = 0, flow = 0, dec = 0;
-  // dec 内部分组
-  double dec_pre = 0, dec_cond = 0, dec_ups = 0, dec_res = 0, dec_post = 0;
-  // res 内部细分
-  double res_conv1 = 0, res_conv2 = 0, res_ew = 0;
-  // mha 内部细分 (E10-dec-pool-analysis → step #5: MHA 接入 AMX)
-  double mha_proj = 0, mha_scores = 0, mha_soft = 0, mha_out = 0,
-         mha_rel_pre = 0, mha_rel = 0, mha_conv_o = 0;
-  size_t calls = 0;
-
-  void report_and_reset() {
-    std::fprintf(stderr,
-        "[sovits-timing] n=%zu quant=%.1f up=%.1f enc_p=%.1f noise=%.1f "
-        "flow=%.1f dec=%.1f | dec: pre=%.1f cond=%.1f ups=%.1f res=%.1f "
-        "post=%.1f | res: c1=%.1f c2=%.1f ew=%.1f ms\n",
-        calls, quant, upsample, enc_p, noise, flow, dec,
-        dec_pre, dec_cond, dec_ups, dec_res, dec_post,
-        res_conv1, res_conv2, res_ew);
-    std::fprintf(stderr,
-        "[mha-timing] proj=%.1f scores=%.1f softmax=%.1f attn_out=%.1f rel_pre=%.1f rel=%.1f conv_o=%.1f ms\n",
-        mha_proj, mha_scores, mha_soft, mha_out, mha_rel_pre, mha_rel, mha_conv_o);
-    *this = StageTimers{};
-  }
-};
-inline StageTimers& sov_timers() {
-  static thread_local StageTimers t;
-  return t;
-}
-inline bool sov_timing_enabled() {
-  static const bool b = std::getenv("GSV_SOVITS_TIMING") != nullptr;
-  return b;
-}
 class Dumper {
  public:
   void enable(std::string dir) {

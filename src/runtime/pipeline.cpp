@@ -175,34 +175,13 @@ bool Pipeline::load(const std::string& weightsDir, const std::string& dataDir,
     }
   }
 
-  // ---- E7: load 段分阶段画像 (GSV_LOAD_PROFILE=1 时 stderr 输出各阶段耗时) ----
-  const bool profileLoad = ::getenv("GSV_LOAD_PROFILE") != nullptr;
-  auto profMark = [profileLoad](const char* stage, double* t) {
-    const double now = nowMs();
-    if (profileLoad)
-      std::fprintf(stderr, "[load-profile] %-22s %8.1f ms\n", stage, now - *t);
-    *t = now;
-  };
-  double tStage = nowMs();
-
   try {
-    // ---- E7 画像结论: 权重在 USB 外接盘 (~73MB/s) ----
-    // 跨文件同时预取实测有害 (USB 寻道抖动, 冷态反而 16s→77s), 已撤销。
-    // 保留逐文件 F_RDADVISE 能力 (GsvFile::prefetch / prefetch_file) 供
-    // 单文件流内聚簇使用; 真正的冷态治理见 gsv_tool --slim (去 f32 冗余段,
-    // 文件体积 -67%, 页缓存压力同比降)。
-    if (profileLoad) profMark("prefetch_issue(异步,不阻塞)", &tStage);
-
-    // FE-AUTO-1: 语种切分数据(lid.176.bin + budoux json)可选; 按环境变量
-    // GSV_LID_BIN > dataDir > CPUFast 权威路径 的顺序探测。缺失时 auto
-    // 模式在 process 报错, all_zh 不受影响。
+    // FE-AUTO-1: 语种切分数据(lid.176.bin + budoux json)可选; 按 dataDir > CPUFast 权威路径 的顺序探测。
     std::string lidP;
-    if (const char* envLid = ::getenv("GSV_LID_BIN"); envLid && *envLid) {
-      lidP = envLid;
-    } else if (!firstExisting(
-                   {joinPath(dataDir, "lid.176.bin"),
-                    joinPath(dataDir + "/../..", "pretrained_models/lid.176.bin")},
-                   &lidP)) {
+    if (!firstExisting(
+            {joinPath(dataDir, "lid.176.bin"),
+             joinPath(dataDir + "/../..", "pretrained_models/lid.176.bin")},
+            &lidP)) {
       const char* cpuFast = "/Volumes/2T/GPT-SoVITS-CPUFast/GPT_SoVITS/"
                             "pretrained_models/fast_langdetect/lid.176.bin";
       if (std::filesystem::exists(cpuFast)) lidP = cpuFast;
@@ -216,44 +195,36 @@ bool Pipeline::load(const std::string& weightsDir, const std::string& dataDir,
     if (!tf_.load(trieP, pinyinP, err, cmuP, haveG2pw ? &g2pwOpt : nullptr,
                   lidP, budouxD))
       return false;
-    profMark("textfront(含G2PW)", &tStage);
     if (!tok_.load(joinPath(dataDir, "roberta_vocab.txt"), err)) return false;
-    profMark("tokenizer_vocab", &tStage);
 
     bert_.cfg = bert::BertConfig{};  // roberta-wwm-ext-large 默认即此
     fBert_ = std::make_unique<rt::GsvFile>(
         joinPath(weightsDir, "roberta_wwm_ext_large.gsv"));
     fBert_->prefetch();  // GsvFile 内映射续期 WILLNEED (幂等)
     bert_.load(*fBert_, "bert");
-    profMark("bert_load(1.9GB)", &tStage);
 
     fAr_ = std::make_unique<rt::GsvFile>(joinPath(weightsDir, "ar_s1v3.gsv"));
     ar_ = std::make_unique<ar::T2SEngine>(*fAr_);
-    if (opt_.ar_kv_reuse) ar_->set_kv_reuse(true);
     if (opt_.ar_splitk) {
       ar_->set_splitk(true);
       std::fprintf(stderr, "AR split-K: enabled (实验开关)\n");
     }
-    if (opt_.ar_fp16_kv || opt_.ar_fp16_gemv) {
+    if (opt_.ar_fp16_all) {
       ar::T2SEngine::Fp16Options fo;
-      fo.kv = opt_.ar_fp16_kv;
-      fo.gemv = opt_.ar_fp16_gemv;
+      fo.kv = true;
+      fo.gemv = true;
       ar_->set_fp16(fo);
-      std::fprintf(stderr, "AR fp16: kv=%d gemv=%d (实验开关)\n", fo.kv,
-                   fo.gemv);
+      std::fprintf(stderr, "AR fp16: kv=1 gemv=1 (实验开关)\n");
     }
-    profMark("ar_load(444MB)", &tStage);
     sovits_ = std::make_unique<sovits::SovitsEngine>();
     fSov_ = std::make_unique<rt::GsvFile>(joinPath(weightsDir, "sovits_v2ProPlus.gsv"));
     sovits_->load(fSov_->path(), opt.sovits_amx);
-    profMark("sovits_load(460MB+pack)", &tStage);
     cond_.load(*fSov_);
 #if defined(GSV_AMX_GEMM)
     // T8: cond 批量化 ref_enc 收进 --amx-enc 门控(默认 false=基线标量位级口径);
     //     T6 优化只在旗开时生效(mel 门口径验收)。
     cond_.setAmxEnc(opt_.enc_amx);
 #endif
-    profMark("cond_load", &tStage);
 #if defined(GSV_AMX_GEMM)
     // E12: SV 装载前使能 — SvEngine 构造期据此预打包 conv panel。
     // GSV_AMX_ENC_SUB=nosv 可关掉 SV(隔离验收用)
@@ -270,11 +241,9 @@ bool Pipeline::load(const std::string& weightsDir, const std::string& dataDir,
     encoder::amx_hubert_enabled() = opt_.enc_amx && !no_hub;
 #endif
     hubert_ = std::make_unique<encoder::HubertEngine>(*fHub_);
-    profMark("hubert_load(531MB)", &tStage);
     fSv_ = std::make_unique<rt::GsvFile>(
         joinPath(weightsDir, "eres2netv2_sv.gsv"));
     sv_ = std::make_unique<encoder::SvEngine>(*fSv_);
-    profMark("sv_load(306MB)", &tStage);
   } catch (const std::exception& e) {
     if (err) *err = e.what();
     return false;
@@ -308,8 +277,7 @@ bool Pipeline::buildReference(const std::string& refWavPath, SynthResult* out,
     rt::wav::WavFile w = rt::wav::load_wav(refWavPath);
     if (w.samples.empty()) throw std::runtime_error("空音频: " + refWavPath);
 
-    const bool enc_serial = std::getenv("GSV_ENC_SERIAL") != nullptr;
-    if (opt_.enc_amx && !enc_serial) {
+    if (opt_.enc_amx) {
       // ---- E15: 并行分支 (--amx-enc 开启时): 链 A (SV + cond, 主线程) ‖ 链 B (HuBERT + ssl_proj + RVQ, 派生线程) ----
       std::exception_ptr b_exc = nullptr;
       std::vector<float> proj;
@@ -370,7 +338,6 @@ bool Pipeline::buildReference(const std::string& refWavPath, SynthResult* out,
           {
             const char* epsEnv = std::getenv("GSV_RVQ_TIE_EPS");
             const double tieEps = epsEnv ? std::atof(epsEnv) : 1.0;
-            const bool rvqAudit = std::getenv("GSV_RVQ_AUDIT") != nullptr;
             double normE[1024];
             for (int64_t cb = 0; cb < 1024; ++cb) {
               const float* e = embed.data() + size_t(cb) * 768;
@@ -387,7 +354,6 @@ bool Pipeline::buildReference(const std::string& refWavPath, SynthResult* out,
               for (int64_t cb = 0; cb < 1024; ++cb)
                 row[cb] += float(normE[cb]);
             }
-            size_t nFallback = 0, nFlip = 0;
             for (size_t t = 0; t < Tq; ++t) {
               const float* row = dist.data() + t * 1024;
               size_t b0 = 0;
@@ -407,7 +373,6 @@ bool Pipeline::buildReference(const std::string& refWavPath, SynthResult* out,
               }
               int64_t best = int64_t(b0);
               if (double(v1) - double(v0) < tieEps) {
-                ++nFallback;
                 double bd = 1e30;
                 int64_t bExact = 0;
                 for (int64_t cb = 0; cb < 1024; ++cb) {
@@ -422,16 +387,10 @@ bool Pipeline::buildReference(const std::string& refWavPath, SynthResult* out,
                     bExact = cb;
                   }
                 }
-                if (bExact != best) ++nFlip;
                 best = bExact;
               }
               out->prompt_semantic[t] = best;
             }
-            if (rvqAudit)
-              std::fprintf(stderr,
-                           "[rvq-batch] Tq=%zu fallback=%zu flip_caught=%zu "
-                           "tie_eps=%g\n",
-                           Tq, nFallback, nFlip, tieEps);
           }
           tLatEnd = refTim ? nowMs() : 0.0;
         } catch (...) {
@@ -466,16 +425,6 @@ bool Pipeline::buildReference(const std::string& refWavPath, SynthResult* out,
       sv_->forward3(fbank.data(), frames80);
       const double tSv1 = nowMs();
       std::vector<float> svEmb(sv_->emb_out());  // [20480]
-      if (const char* dp = std::getenv("GSV_SV_EMB_DUMP"); dp && *dp) {
-        if (FILE* fp = std::fopen(dp, "wb")) {
-          std::fwrite(svEmb.data(), sizeof(float), svEmb.size(), fp);
-          std::fclose(fp);
-          std::fprintf(stderr, "[sv-dump] %s (%zu floats)\n", dp, svEmb.size());
-        } else {
-          std::fprintf(stderr, "[sv-dump] 写失败: %s\n", dp);
-        }
-      }
-
       cond_.compute(a32.data(), a32.size(), svEmb.data(), &out->cond);
       const double tCond = nowMs();
 
@@ -497,22 +446,6 @@ bool Pipeline::buildReference(const std::string& refWavPath, SynthResult* out,
                      "proj%.0f + rvq%.0f\n",
                      tLatEnd - tLat0, Tq, tLatOpen - tLat0, tLatProj - tLatOpen,
                      tLatEnd - tLatProj);
-      }
-
-      if (const char* dumpPath = std::getenv("GSV_RVQ_DUMP")) {
-        FILE* df = fopen(dumpPath, "wb");
-        if (df) {
-          const bool okD = fwrite(out->prompt_semantic.data(), sizeof(int64_t),
-                                  out->prompt_semantic.size(), df) ==
-                              out->prompt_semantic.size() &&
-                          fwrite(proj.data(), sizeof(float), proj.size(), df) ==
-                              proj.size();
-          fclose(df);
-          if (!okD)
-            std::fprintf(stderr, "警告: GSV_RVQ_DUMP 写入不完整: %s\n", dumpPath);
-        } else {
-          std::fprintf(stderr, "警告: GSV_RVQ_DUMP 无法写入: %s\n", dumpPath);
-        }
       }
     } else {
       // 串行原路径 (opt_.enc_amx == false): 保持位级完全不动
@@ -537,16 +470,6 @@ bool Pipeline::buildReference(const std::string& refWavPath, SynthResult* out,
       sv_->forward3(fbank.data(), frames80);
       const double tSv1 = nowMs();
       std::vector<float> svEmb(sv_->emb_out());  // [20480]
-      // E13-SV 探针: GSV_SV_EMB_DUMP=<path> 时落盘 svEmb(验证侧工具, 零行为变更)
-      if (const char* dp = std::getenv("GSV_SV_EMB_DUMP"); dp && *dp) {
-        if (FILE* fp = std::fopen(dp, "wb")) {
-          std::fwrite(svEmb.data(), sizeof(float), svEmb.size(), fp);
-          std::fclose(fp);
-          std::fprintf(stderr, "[sv-dump] %s (%zu floats)\n", dp, svEmb.size());
-        } else {
-          std::fprintf(stderr, "[sv-dump] 写失败: %s\n", dp);
-        }
-      }
 
       // prompt_semantic: 原始音频直接 → 16k (+9600 零) → HuBERT → ssl_proj → RVQ
       Resampler to16raw;
@@ -615,11 +538,10 @@ bool Pipeline::buildReference(const std::string& refWavPath, SynthResult* out,
       //   数值护栏: fp32 块化累加序变化引入的绝对误差实测 ≤0.045(见
       //   .tmp/evidence-T5.md), 而 fp32 行 top-2 差实测 ≥3.0 ⇒ 默认 τ=1.0:
       //   差距 < GSV_RVQ_TIE_EPS 的帧回退原始双精度逐码精确复算(与基线判定
-      //   位级同构); GSV_RVQ_AUDIT=1 打印回退/捕获数。
+      //   位级同构)。
       {
         const char* epsEnv = std::getenv("GSV_RVQ_TIE_EPS");
         const double tieEps = epsEnv ? std::atof(epsEnv) : 1.0;
-        const bool rvqAudit = std::getenv("GSV_RVQ_AUDIT") != nullptr;
         double normE[1024];
         for (int64_t cb = 0; cb < 1024; ++cb) {
           const float* e = embed.data() + size_t(cb) * 768;
@@ -636,7 +558,6 @@ bool Pipeline::buildReference(const std::string& refWavPath, SynthResult* out,
           for (int64_t cb = 0; cb < 1024; ++cb)
             row[cb] += float(normE[cb]);
         }
-        size_t nFallback = 0, nFlip = 0;
         for (size_t t = 0; t < Tq; ++t) {
           const float* row = dist.data() + t * 1024;
           size_t b0 = 0;
@@ -658,7 +579,6 @@ bool Pipeline::buildReference(const std::string& refWavPath, SynthResult* out,
           if (double(v1) - double(v0) < tieEps) {
             // 位级护栏分支: 双精度精确复算整帧(argmin 判定与基线同构:
             // cb 升序扫 + 严格小于刷新)
-            ++nFallback;
             double bd = 1e30;
             int64_t bExact = 0;
             for (int64_t cb = 0; cb < 1024; ++cb) {
@@ -673,16 +593,10 @@ bool Pipeline::buildReference(const std::string& refWavPath, SynthResult* out,
                 bExact = cb;
               }
             }
-            if (bExact != best) ++nFlip;
             best = bExact;
           }
           out->prompt_semantic[t] = best;
         }
-        if (rvqAudit)
-          std::fprintf(stderr,
-                       "[rvq-batch] Tq=%zu fallback=%zu flip_caught=%zu "
-                       "tie_eps=%g\n",
-                       Tq, nFallback, nFlip, tieEps);
       }
       if (refTim)  // E13 探针: extract_latent 三段(open/proj/rvq)
         std::fprintf(stderr,
@@ -690,23 +604,6 @@ bool Pipeline::buildReference(const std::string& refWavPath, SynthResult* out,
                      "proj%.0f + rvq%.0f\n",
                      nowMs() - tLat0, Tq, tLatOpen - tLat0, tLatProj - tLatOpen,
                      nowMs() - tLatProj);
-      // E13-MIX/T5 探针: prompt_semantic codes + ssl_proj 输出落盘
-      // (GSV_RVQ_DUMP=<path>; 两路径位级比对用, 零行为变更)
-      if (const char* dumpPath = std::getenv("GSV_RVQ_DUMP")) {
-        FILE* df = fopen(dumpPath, "wb");
-        if (df) {
-          const bool okD = fwrite(out->prompt_semantic.data(), sizeof(int64_t),
-                                  out->prompt_semantic.size(), df) ==
-                              out->prompt_semantic.size() &&
-                          fwrite(proj.data(), sizeof(float), proj.size(), df) ==
-                              proj.size();
-          fclose(df);
-          if (!okD)
-            std::fprintf(stderr, "警告: GSV_RVQ_DUMP 写入不完整: %s\n", dumpPath);
-        } else {
-          std::fprintf(stderr, "警告: GSV_RVQ_DUMP 无法写入: %s\n", dumpPath);
-        }
-      }
     }
 
     if (opt_.use_ref_cache) {
@@ -743,12 +640,9 @@ Feat featurize(const textfront::TextFrontend* tf,
                const bert::BertModel& bm, const std::string& utf8,
                std::string* /*err*/,
                textfront::TextLangMode langMode = textfront::TextLangMode::Auto) {
-  const double tf0 = nowMs();
   textfront::TextFrontend::Result one;
   if (!tf->process(utf8, &one, /*cutMethod=*/0, langMode))
     throw std::runtime_error(one.error);
-  if (std::getenv("GSV_FRONT_TIMING"))
-    std::fprintf(stderr, "[front] tf.process(jieba+g2pw规则+g2pwBERT)=%.1fms\n", nowMs()-tf0);
   Feat f;
   f.phones.assign(one.phones.begin(), one.phones.end());
   f.word2ph = one.word2ph;
@@ -763,7 +657,6 @@ Feat featurize(const textfront::TextFrontend* tf,
   std::vector<int64_t> ids, tt, amask;
   tok->encode(f.normU8, &ids, &tt, &amask);
   // roberta forward 至 layer21 输出 (hidden_states[-3]); 权重只读复用。
-  const double bt0 = nowMs();
   const size_t Ln = ids.size(), C = bm.cfg.hidden;
   bert::Matrix x;
   x.reset(Ln, C);
@@ -777,15 +670,11 @@ Feat featurize(const textfront::TextFrontend* tf,
   for (size_t j = 0; j < Ln; ++j)
     ext[j] = (1.f - float(amask[j])) * bm.cfg.mask_neg;
   bert::Matrix y, scr, ctxh;
-  struct FrontBertTiming { double v = 0; };
-  static thread_local double s_bert_ms = 0; (void)s_bert_ms;
   const size_t stopAt = bm.cfg.layers - 3;
   for (size_t i = 0; i <= stopAt; ++i) {
     bm.stack[i].forward(x, ext, y, scr, ctxh);
     x.d.swap(y.d);
   }
-  if (std::getenv("GSV_FRONT_TIMING"))
-    std::fprintf(stderr, "[front] roberta 21层 forward=%.1fms (L=%zu)\n", nowMs()-bt0, Ln);
 
   const size_t nPhones = f.phones.size();
   f.bert.assign(nPhones * 1024, 0.f);

@@ -22,24 +22,6 @@ namespace gsv::bert {
 
 constexpr float kFinfoMin = -3.40282347e+38f;
 
-// E8: 分段耗时探针 (GSV_BERT_LAYERS_TIMING 开启时 stderr 输出每层分解)
-inline bool& bert_layer_timing_on() {
-  static bool b = std::getenv("GSV_BERT_LAYERS_TIMING") != nullptr;
-  return b;
-}
-inline double now_ms_bert() {
-  return std::chrono::duration<double, std::milli>(
-             std::chrono::steady_clock::now().time_since_epoch())
-      .count();
-}
-struct LayerTiming {
-  double qkv = 0, head = 0, wout_ln = 0, ffn = 0;
-};
-inline LayerTiming& last_layer_timing() {
-  static LayerTiming t;
-  return t;
-}
-
 inline float gelu_erf(float x) {
   return 0.5f * x * (1.f + erff(x * 0.70710678118654752440f));
 }
@@ -249,9 +231,7 @@ struct Linear {  // y[T,out] = x[T,in]·Wᵀ + b; fp16 直读权重 + FMLAL 前�
       // 契约: C[M,N] = pa·pbᵀ, y[T,out] = x_act[T,in]·W[out,in]ᵀ
       //   ⇒ M=T(pa=激活), N=out(pb=权重panel 预打包)
       thread_local std::vector<uint8_t> act_buf;
-      const double tp = bert_layer_timing_on() ? now_ms_bert() : 0.0;
       cast_pack_B_f32_to_panel(x.d.data(), T, in, act_buf);
-      if (bert_layer_timing_on()) last_layer_timing().wout_ln += now_ms_bert() - tp;
       kern::AmxPanel pb;
       pb.rows = T;
       pb.K = in;
@@ -326,9 +306,7 @@ struct BertLayer {
     km.reset(T, k.out);
     vm.reset(T, v.out);
     thread_local std::vector<uint8_t> act_buf;
-    const double tp = bert_layer_timing_on() ? now_ms_bert() : 0.0;
     cast_pack_B_f32_to_panel(x.d.data(), T, in_of_q(), act_buf);
-    if (bert_layer_timing_on()) last_layer_timing().wout_ln += now_ms_bert() - tp;
     kern::AmxPanel pb;
     pb.rows = T;
     pb.K = in_of_q();
@@ -371,8 +349,6 @@ struct BertLayer {
                std::vector<uint16_t>& xh) const {
     (void)xh;  // E8: xh 仅 FMLAL 路径用, AMX 同批分支不引用 (抑制警告)
     const size_t T = x.rows, C = x.cols, H = heads, dh = C / H;
-    const bool tim = bert_layer_timing_on();
-    const double t0 = tim ? now_ms_bert() : 0.0;
     // QKV 投影(FMLAL fp16×fp16→fp32 或 E8 AMX; AMX 同批三联派发)
     Matrix qm, km, vm;
 #if defined(GSV_AMX_GEMM)
@@ -389,7 +365,6 @@ struct BertLayer {
     k.forward(x, km, xh);
     v.forward(x, vm, xh);
 #endif
-    const double t1 = tim ? now_ms_bert() : 0.0;
     // 逐头: S = Q_h·K_hᵀ/√dh (+mask 列) → softmax → ctx[:,head] = S·V_h
     scr.reset(T, T);
     ctxh.reset(T, C);
@@ -409,12 +384,10 @@ struct BertLayer {
                          vm.d.data() + off, int(C), 0.f,
                          ctxh.d.data() + off, int(C));
     }
-    const double t2 = tim ? now_ms_bert() : 0.0;
     y.reset(T, C);
     attn_out.forward(ctxh, y, xh);   // dense(FMLAL/AMX)
     for (size_t i = 0; i < y.d.size(); ++i) y.d[i] += x.d[i];  // res(fp32)
     attn_ln.forward(y);   // LayerNorm fp32
-    const double t25 = tim ? now_ms_bert() : 0.0;
     // FFN(FMLAL/AMX)
     Matrix mid;
     inter.forward(y, mid, xh);
@@ -424,13 +397,6 @@ struct BertLayer {
     for (size_t i = 0; i < f2.d.size(); ++i) f2.d[i] += y.d[i];  // res(fp32)
     out_ln.forward(f2);
     y.d.swap(f2.d);
-    if (tim) {
-      auto& lt = last_layer_timing();
-      lt.qkv += t1 - t0;
-      lt.head += t2 - t1;
-      lt.wout_ln += t25 - t2;
-      lt.ffn += (tim ? now_ms_bert() : 0.0) - t25;
-    }
   }
 
   void forward(const Matrix& x, const std::vector<float>& ext_mask,

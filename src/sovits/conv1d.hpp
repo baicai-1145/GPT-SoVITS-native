@@ -127,45 +127,29 @@ class Conv1d {
       y.T = T;
       y.d.resize(out_c * T);
       thread_local std::vector<uint8_t> act_panel;
-      const bool prof = sov_timing_enabled();
-      const double tp0 = prof ? now_ms_e6() : 0.0;
       im2col_to_panel_f16(x.d.data(), in_c, T, k, dilation, act_panel,
                           /*append_ones_col=*/true);
-      if (prof) g_conv_split().prep += now_ms_e6() - tp0;
       kern::AmxPanel pb;
       pb.rows = T;
       pb.K = K + 1;
       pb.buf = std::move(act_panel);
-      const double tg0 = prof ? now_ms_e6() : 0.0;
       amx_gemm_1(panel_, pb, y.d.data(), out_c, T);
-      if (prof) {
-        g_conv_split().gemm += now_ms_e6() - tg0;
-        ++g_conv_split().n;
-      }
       return;  // bias 已折叠进 GEMM
     }
     // k==1 点积形: 同一直写布局 (k=1 退化为 cast_transpose→panel)
     if (has_panel_ && k == 1 && dilation == 1 &&
         T >= 64 && kern::amx_gemm_available()) {
-      const bool prof = sov_timing_enabled();
       y.C = out_c;
       y.T = T;
       y.d.resize(out_c * T);
       thread_local std::vector<uint8_t> act_panel;
-      const double tp1 = prof ? now_ms_e6() : 0.0;
       im2col_to_panel_f16(x.d.data(), in_c, T, 1, 1, act_panel,
                           /*append_ones_col=*/true);
-      if (prof) g_conv_split().prep += now_ms_e6() - tp1;
       kern::AmxPanel pb;
       pb.rows = T;
       pb.K = K + 1;
       pb.buf = std::move(act_panel);
-      const double tg1 = prof ? now_ms_e6() : 0.0;
       amx_gemm_1(panel_, pb, y.d.data(), out_c, T);
-      if (prof) {
-        g_conv_split().gemm += now_ms_e6() - tg1;
-        ++g_conv_split().n;
-      }
       return;  // bias 已折叠进 GEMM
     }
 #endif

@@ -1570,10 +1570,6 @@ template void T2SEngine::block_decode_impl<false, false>(size_t, float*,
                                                          size_t, size_t,
                                                          float*, uint16_t*,
                                                          float*, uint16_t*);
-template void T2SEngine::block_decode_impl<true, false>(size_t, float*, size_t,
-                                                        size_t, float*,
-                                                        uint16_t*, float*,
-                                                        uint16_t*);
 template void T2SEngine::block_decode_impl<true, true>(size_t, float*, size_t,
                                                        size_t, float*,
                                                        uint16_t*, float*,
@@ -1582,16 +1578,11 @@ template void T2SEngine::block_decode_splitk_impl<false, false>(size_t, float*,
                                                                 size_t, size_t,
                                                                 float*, uint16_t*,
                                                                 float*, uint16_t*);
-template void T2SEngine::block_decode_splitk_impl<true, false>(size_t, float*,
-                                                               size_t, size_t,
-                                                               float*, uint16_t*,
-                                                               float*, uint16_t*);
 template void T2SEngine::block_decode_splitk_impl<true, true>(size_t, float*,
                                                               size_t, size_t,
                                                               float*, uint16_t*,
                                                               float*, uint16_t*);
 template void T2SEngine::decode_step_splitk_impl<false, false>(float*, size_t, size_t, float*);
-template void T2SEngine::decode_step_splitk_impl<true, false>(float*, size_t, size_t, float*);
 template void T2SEngine::decode_step_splitk_impl<true, true>(float*, size_t, size_t, float*);
 
 // ---- 贪心采样(infer_panel_naive sample() top_k=1 同构) ----
@@ -1797,24 +1788,6 @@ GenResult T2SEngine::generate(const int64_t* phones, size_t T,
 
   // ---- B1: prefill(24 层, 大矩阵乘固定 Accelerate sgemm) ----
   if (dbg) dbg->on_input(xy_.data(), S);
-  bool hit = false;
-  if (kv_reuse_ && prompt_snapshot_.valid &&
-      prompt_snapshot_.is_fp16 == fp16_.kv &&
-      prompt_snapshot_.T == T && prompt_snapshot_.P == P &&
-      std::memcmp(prompt_snapshot_.phones.data(), phones, T * sizeof(int64_t)) == 0 &&
-      std::memcmp(prompt_snapshot_.prompt.data(), prompt, P * sizeof(int64_t)) == 0 &&
-      std::memcmp(prompt_snapshot_.bert1024.data(), bert1024, T * dims_.bert_dim * sizeof(float)) == 0) {
-    hit = true;
-    for (size_t l = 0; l < dims_.n_layers; ++l) {
-      if (fp16_.kv) {
-        std::memcpy(kc16_[l].data(), prompt_snapshot_.kc16[l].data(), S * D * sizeof(uint16_t));
-        std::memcpy(vc16_[l].data(), prompt_snapshot_.vc16[l].data(), S * D * sizeof(uint16_t));
-      } else {
-        std::memcpy(kc_[l].data(), prompt_snapshot_.kc[l].data(), S * D * sizeof(float));
-        std::memcpy(vc_[l].data(), prompt_snapshot_.vc[l].data(), S * D * sizeof(float));
-      }
-    }
-  } else {
   pf_wqkv_ms_ = 0; pf_sdpa_ms_ = 0; pf_wout_ms_ = 0;
   pf_w1_ms_ = 0; pf_w2_ms_ = 0; pf_ln_ms_ = 0;
   for (size_t l = 0; l < dims_.n_layers; ++l) {
@@ -1828,40 +1801,10 @@ GenResult T2SEngine::generate(const int64_t* phones, size_t T,
                                 nullptr);
     if (dbg) dbg->on_layer(l, xy_.data(), S);
   }
-    if (kv_reuse_) {
-      prompt_snapshot_.phones.assign(phones, phones + T);
-      prompt_snapshot_.prompt.assign(prompt, prompt + P);
-      prompt_snapshot_.bert1024.assign(bert1024, bert1024 + T * dims_.bert_dim);
-      prompt_snapshot_.S = S;
-      prompt_snapshot_.T = T;
-      prompt_snapshot_.P = P;
-      prompt_snapshot_.is_fp16 = fp16_.kv;
-      prompt_snapshot_.last_xy_row.assign(xy_.data() + (S - 1) * D, xy_.data() + S * D);
-      prompt_snapshot_.kc.assign(dims_.n_layers, {});
-      prompt_snapshot_.vc.assign(dims_.n_layers, {});
-      prompt_snapshot_.kc16.assign(dims_.n_layers, {});
-      prompt_snapshot_.vc16.assign(dims_.n_layers, {});
-      for (size_t l = 0; l < dims_.n_layers; ++l) {
-        if (fp16_.kv) {
-          prompt_snapshot_.kc16[l].assign(kc16_[l].begin(), kc16_[l].begin() + S * D);
-          prompt_snapshot_.vc16[l].assign(vc16_[l].begin(), vc16_[l].begin() + S * D);
-        } else {
-          prompt_snapshot_.kc[l].assign(kc_[l].begin(), kc_[l].begin() + S * D);
-          prompt_snapshot_.vc[l].assign(vc_[l].begin(), vc_[l].begin() + S * D);
-        }
-      }
-      prompt_snapshot_.valid = true;
-    }
-  }
-  last_prefill_hit_ = hit;
 
   // 首 logits 来自最后一个音频 prompt 位置(xy_dec[:, -1])
   logits_.resize(dims_.vocab);
-  if (hit) {
-    predict_layer_fp(prompt_snapshot_.last_xy_row.data(), logits_.data());
-  } else {
-    predict_layer_fp(xy_.data() + (S - 1) * D, logits_.data());
-  }
+  predict_layer_fp(xy_.data() + (S - 1) * D, logits_.data());
   const auto t_prefill_done = std::chrono::steady_clock::now();
 
   // ---- B2: decode 循环(GEMV + KV cache fp32 + 贪心) ----
@@ -1926,29 +1869,19 @@ GenResult T2SEngine::generate(const int64_t* phones, size_t T,
     for (size_t d = 0; d < D; ++d) x1_[d] = erow[d] + alpha_audio_ * pe_[d];
 
     if (ar_splitk_) {
-      if (fp16_.kv) {
-        if (fp16_.gemv)
-          decode_step_splitk_impl<true, true>(x1_.data(), cur_len, cur_len + 1,
-                                              logits_.data());
-        else
-          decode_step_splitk_impl<true, false>(x1_.data(), cur_len, cur_len + 1,
-                                               logits_.data());
+      if (fp16_.kv && fp16_.gemv) {
+        decode_step_splitk_impl<true, true>(x1_.data(), cur_len, cur_len + 1,
+                                            logits_.data());
       } else {
         decode_step_splitk_impl<false, false>(x1_.data(), cur_len, cur_len + 1,
                                               logits_.data());
       }
     } else {
       for (size_t l = 0; l < dims_.n_layers; ++l) {
-        if (fp16_.kv) {
-          if (fp16_.gemv)
-            block_decode_impl<true, true>(l, x1_.data(), cur_len, cur_len + 1,
-                                          nullptr, kc16_[l].data(), nullptr,
-                                          vc16_[l].data());
-          else
-            block_decode_impl<true, false>(l, x1_.data(), cur_len,
-                                           cur_len + 1, nullptr,
-                                           kc16_[l].data(), nullptr,
-                                           vc16_[l].data());
+        if (fp16_.kv && fp16_.gemv) {
+          block_decode_impl<true, true>(l, x1_.data(), cur_len, cur_len + 1,
+                                        nullptr, kc16_[l].data(), nullptr,
+                                        vc16_[l].data());
         } else {
           block_decode_impl<false, false>(l, x1_.data(), cur_len, cur_len + 1,
                                           kc_[l].data(), nullptr,

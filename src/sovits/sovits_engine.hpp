@@ -48,20 +48,13 @@ class SovitsEngine {
   void run(const Inputs& in, Tensor2D& wav_out, const Dumper& dm) {
     const size_t Tc = in.n_codes;
     const size_t Tq = Tc * 2;
-    StageTimers& T = sov_timers();
-    const bool prof = sov_timing_enabled();
-    auto tic = [&] { return prof ? now_ms_e6() : 0.0; };
-    double t0;
 
     // 1. RVQ decode → [768, Tc]
-    t0 = tic();
     Tensor2D quantized;
     quant_.decode(in.codes, Tc, quantized);
-    if (prof) T.quant += now_ms_e6() - t0;
     dm.dump("h_quantizer_dec", quantized);
 
     // 2. nearest ×2 上采样 → [768, Tq]
-    t0 = tic();
     Tensor2D quant_up(768, Tq);
     for (size_t c = 0; c < 768; ++c)
       for (size_t t = 0; t < Tc; ++t) {
@@ -69,46 +62,33 @@ class SovitsEngine {
         quant_up.d[c * Tq + 2 * t] = v;
         quant_up.d[c * Tq + 2 * t + 1] = v;
       }
-    if (prof) T.upsample += now_ms_e6() - t0;
     dm.dump("h_encp_input", quant_up);
 
     // 3. enc_p
-    t0 = tic();
     Tensor2D ge_text(512, 1);
     for (size_t i = 0; i < 512; ++i) ge_text.d[i] = in.ge_text[i];
     Tensor2D m_p, logs_p;
     enc_p_.forward(quant_up, in.phones, in.n_phones, ge_text, m_p, logs_p, dm);
-    if (prof) T.enc_p += now_ms_e6() - t0;
     dm.dump("dbg_m_p", m_p);
     dm.dump("dbg_logs_p", logs_p);
 
     // 4. z_p = m_p + noise · exp(logs_p) · 0.5
-    t0 = tic();
     Tensor2D z_p(192, Tq);
     for (size_t i = 0; i < 192 * Tq; ++i)
       z_p.d[i] = m_p.d[i] + (in.noise ? in.noise[i] : 0.f) *
                                 std::exp(logs_p.d[i]) * kNoiseScale;
-    if (prof) T.noise += now_ms_e6() - t0;
     dm.dump("h_flow_in", z_p);
 
     // 5. flow reverse (条件 ge 1024)
-    t0 = tic();
     Tensor2D ge(1024, 1);
     for (size_t i = 0; i < 1024; ++i) ge.d[i] = in.ge[i];
     Tensor2D mask(1, Tq);
     for (size_t t = 0; t < Tq; ++t) mask.d[t] = 1.f;
     flow_.forward_reverse(z_p, mask, ge, dm);
-    if (prof) T.flow += now_ms_e6() - t0;
     dm.dump("h_flow", z_p);
 
     // 6. dec
-    t0 = tic();
     dec_.forward(z_p, ge, wav_out, dm);
-    if (prof) {
-      T.dec += now_ms_e6() - t0;
-      ++T.calls;
-      if (T.calls >= 8) T.report_and_reset();  // 每 8 次汇总一次 stderr
-    }
     dm.dump("h_dec", wav_out);
   }
 

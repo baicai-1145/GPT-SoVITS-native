@@ -404,8 +404,6 @@ class G2PWConverter {
                     [](bool b) { return b; }))
       fillDefaultPinyins(simp, need_default, partial);
     if (!poly_idx.empty()) {
-      if (std::getenv("GSV_G2PW_DEBUG"))
-        std::fprintf(stderr, "[g2pw] poly_chars=%zu 窗口=%s\n", poly_idx.size(), trad.empty()?"":"(window)");
       constexpr size_t kCtx = 16;
       const size_t left =
           poly_idx.front() > kCtx ? poly_idx.front() - kCtx : 0;
@@ -591,7 +589,6 @@ class G2PWConverter {
     input_ids[T - 1] = 102;
 
     bert::Matrix h;
-    { static int n=0; if(std::getenv("GSV_G2PW_DEBUG")&&n<3) std::fprintf(stderr,"[g2pw] predictChar BERT fwd #%d T=%zu\n",n,T); ++n; }
     bert_.forward(input_ids, tt, am, h, dmNull());
     float hv[768];
     for (size_t c = 0; c < 768; ++c)
