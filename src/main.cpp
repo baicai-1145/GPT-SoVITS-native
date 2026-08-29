@@ -70,6 +70,7 @@ void printHelp(const char* argv0) {
       "  --kv-reuse        实验诊断; 仅在完全相同 prompt+text 重复合成时命中(位级一致), 长文本多段不同文本场景无收益(掩码语义)\n"
       "  --fp16-kv         AR KV cache 以 fp16 存储(等价 --fp16; 默认关)\n"
       "  --fp16-all        AR KV cache + GEMV 均启用 fp16 (实验开关; 默认关)\n"
+      "  --ar-sk           AR decode 启用 split-K 多核并行 (实验开关; 默认关)\n"
       "  --sample          AR 采样对齐 python(top_k=15/pen=1.35, 根治长文本复读; 默认贪心=位级口径)\n"
       "  --sample-top-k N  自定义 top_k (隐含 --sample)\n"
       "  --sample-seed S   采样种子(默认随机)\n"
@@ -156,6 +157,8 @@ int main(int argc, char** argv) {
     } else if (a == "--fp16-all") {
       opt.ar_fp16_kv = true;
       opt.ar_fp16_gemv = true;
+    } else if (a == "--ar-sk") {
+      opt.ar_splitk = true;
     } else if (a == "--kv-reuse") {
       opt.ar_kv_reuse = true;
     } else if (a == "--sample") {

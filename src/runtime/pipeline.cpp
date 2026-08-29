@@ -229,6 +229,10 @@ bool Pipeline::load(const std::string& weightsDir, const std::string& dataDir,
     fAr_ = std::make_unique<rt::GsvFile>(joinPath(weightsDir, "ar_s1v3.gsv"));
     ar_ = std::make_unique<ar::T2SEngine>(*fAr_);
     if (opt_.ar_kv_reuse) ar_->set_kv_reuse(true);
+    if (opt_.ar_splitk) {
+      ar_->set_splitk(true);
+      std::fprintf(stderr, "AR split-K: enabled (实验开关)\n");
+    }
     if (opt_.ar_fp16_kv || opt_.ar_fp16_gemv) {
       ar::T2SEngine::Fp16Options fo;
       fo.kv = opt_.ar_fp16_kv;

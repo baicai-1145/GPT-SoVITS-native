@@ -9,15 +9,23 @@
 #include "ar/t2s_engine.hpp"
 
 #include "kern/gemv_fmlal.hpp"
+#include "runtime/threadpool.hpp"
 
 #include <arm_neon.h>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <pthread.h>
 #include <stdexcept>
 #include <string>
+#include <sys/qos.h>
+#include <sys/resource.h>
+#include <thread>
+#include <vector>
 
 // ---- E11-1: SDPA NEON helpers (decode + prefill 共享) ----
 // 数值纪律:
@@ -137,6 +145,221 @@ inline void accum_f16kv(float* ov, const uint16_t* v16, float p, size_t HD) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// E18: Split-K GEMV Kernels & Barrier Persistent Pool
+// ---------------------------------------------------------------------------
+inline void gemv_slice_f16w_f32acc_4rows(const uint16_t* w, const float* x,
+                                         float* y_part, size_t out, size_t in,
+                                         size_t k_start, size_t k_end) {
+  const size_t k_chunk = k_end - k_start;
+  const size_t vec_end = k_chunk & ~size_t{7};
+  size_t r = 0;
+  for (; r + 4 <= out; r += 4) {
+    const uint16_t* wr0 = w + r * in + k_start;
+    const uint16_t* wr1 = w + (r + 1) * in + k_start;
+    const uint16_t* wr2 = w + (r + 2) * in + k_start;
+    const uint16_t* wr3 = w + (r + 3) * in + k_start;
+    const float* xr = x + k_start;
+    float32x4_t acc00 = vdupq_n_f32(0.0f), acc01 = vdupq_n_f32(0.0f);
+    float32x4_t acc10 = vdupq_n_f32(0.0f), acc11 = vdupq_n_f32(0.0f);
+    float32x4_t acc20 = vdupq_n_f32(0.0f), acc21 = vdupq_n_f32(0.0f);
+    float32x4_t acc30 = vdupq_n_f32(0.0f), acc31 = vdupq_n_f32(0.0f);
+    size_t k = 0;
+    for (; k < vec_end; k += 8, wr0 += 8, wr1 += 8, wr2 += 8, wr3 += 8, xr += 8) {
+      const float32x4_t x0 = vld1q_f32(xr);
+      const float32x4_t x1 = vld1q_f32(xr + 4);
+
+      const float16x8_t w0 = vld1q_f16(reinterpret_cast<const __fp16*>(wr0));
+      acc00 = vfmaq_f32(acc00, vcvt_f32_f16(vget_low_f16(w0)), x0);
+      acc01 = vfmaq_f32(acc01, vcvt_f32_f16(vget_high_f16(w0)), x1);
+
+      const float16x8_t w1 = vld1q_f16(reinterpret_cast<const __fp16*>(wr1));
+      acc10 = vfmaq_f32(acc10, vcvt_f32_f16(vget_low_f16(w1)), x0);
+      acc11 = vfmaq_f32(acc11, vcvt_f32_f16(vget_high_f16(w1)), x1);
+
+      const float16x8_t w2 = vld1q_f16(reinterpret_cast<const __fp16*>(wr2));
+      acc20 = vfmaq_f32(acc20, vcvt_f32_f16(vget_low_f16(w2)), x0);
+      acc21 = vfmaq_f32(acc21, vcvt_f32_f16(vget_high_f16(w2)), x1);
+
+      const float16x8_t w3 = vld1q_f16(reinterpret_cast<const __fp16*>(wr3));
+      acc30 = vfmaq_f32(acc30, vcvt_f32_f16(vget_low_f16(w3)), x0);
+      acc31 = vfmaq_f32(acc31, vcvt_f32_f16(vget_high_f16(w3)), x1);
+    }
+    float s0 = vaddvq_f32(vaddq_f32(acc00, acc01));
+    float s1 = vaddvq_f32(vaddq_f32(acc10, acc11));
+    float s2 = vaddvq_f32(vaddq_f32(acc20, acc21));
+    float s3 = vaddvq_f32(vaddq_f32(acc30, acc31));
+    for (; k < k_chunk; ++k, ++wr0, ++wr1, ++wr2, ++wr3, ++xr) {
+      __fp16 h0, h1, h2, h3;
+      std::memcpy(&h0, wr0, sizeof h0);
+      std::memcpy(&h1, wr1, sizeof h1);
+      std::memcpy(&h2, wr2, sizeof h2);
+      std::memcpy(&h3, wr3, sizeof h3);
+      s0 += static_cast<float>(h0) * (*xr);
+      s1 += static_cast<float>(h1) * (*xr);
+      s2 += static_cast<float>(h2) * (*xr);
+      s3 += static_cast<float>(h3) * (*xr);
+    }
+    y_part[r] = s0;
+    y_part[r + 1] = s1;
+    y_part[r + 2] = s2;
+    y_part[r + 3] = s3;
+  }
+  for (; r < out; ++r) {
+    const uint16_t* wr = w + r * in + k_start;
+    const float* xr = x + k_start;
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    size_t k = 0;
+    for (; k < vec_end; k += 8, wr += 8, xr += 8) {
+      const float16x8_t w8 = vld1q_f16(reinterpret_cast<const __fp16*>(wr));
+      acc0 = vfmaq_f32(acc0, vcvt_f32_f16(vget_low_f16(w8)), vld1q_f32(xr));
+      acc1 = vfmaq_f32(acc1, vcvt_f32_f16(vget_high_f16(w8)), vld1q_f32(xr + 4));
+    }
+    float s = vaddvq_f32(acc0) + vaddvq_f32(acc1);
+    for (; k < k_chunk; ++k, ++wr, ++xr) {
+      __fp16 h;
+      std::memcpy(&h, wr, sizeof h);
+      s += static_cast<float>(h) * (*xr);
+    }
+    y_part[r] = s;
+  }
+}
+
+inline void gemv_slice_f16x_fmlal_4rows(const uint16_t* w, const uint16_t* xh,
+                                        float* y_part, size_t out, size_t in,
+                                        size_t k_start, size_t k_end) {
+  const size_t k_chunk = k_end - k_start;
+  const size_t vec_end = k_chunk & ~size_t{15};
+  size_t r = 0;
+  for (; r + 4 <= out; r += 4) {
+    const uint16_t* wr0 = w + r * in + k_start;
+    const uint16_t* wr1 = w + (r + 1) * in + k_start;
+    const uint16_t* wr2 = w + (r + 2) * in + k_start;
+    const uint16_t* wr3 = w + (r + 3) * in + k_start;
+    const uint16_t* xr = xh + k_start;
+    float32x4_t acc00 = vdupq_n_f32(0.0f), acc01 = vdupq_n_f32(0.0f);
+    float32x4_t acc10 = vdupq_n_f32(0.0f), acc11 = vdupq_n_f32(0.0f);
+    float32x4_t acc20 = vdupq_n_f32(0.0f), acc21 = vdupq_n_f32(0.0f);
+    float32x4_t acc30 = vdupq_n_f32(0.0f), acc31 = vdupq_n_f32(0.0f);
+    size_t k = 0;
+    for (; k < vec_end; k += 16, wr0 += 16, wr1 += 16, wr2 += 16, wr3 += 16, xr += 16) {
+      const float16x8_t x0 = vld1q_f16(reinterpret_cast<const __fp16*>(xr));
+      const float16x8_t x1 = vld1q_f16(reinterpret_cast<const __fp16*>(xr + 8));
+
+      const float16x8_t w0_0 = vld1q_f16(reinterpret_cast<const __fp16*>(wr0));
+      const float16x8_t w0_1 = vld1q_f16(reinterpret_cast<const __fp16*>(wr0 + 8));
+      acc00 = vfmlalq_low_f16(acc00, w0_0, x0);
+      acc00 = vfmlalq_high_f16(acc00, w0_0, x0);
+      acc01 = vfmlalq_low_f16(acc01, w0_1, x1);
+      acc01 = vfmlalq_high_f16(acc01, w0_1, x1);
+
+      const float16x8_t w1_0 = vld1q_f16(reinterpret_cast<const __fp16*>(wr1));
+      const float16x8_t w1_1 = vld1q_f16(reinterpret_cast<const __fp16*>(wr1 + 8));
+      acc10 = vfmlalq_low_f16(acc10, w1_0, x0);
+      acc10 = vfmlalq_high_f16(acc10, w1_0, x0);
+      acc11 = vfmlalq_low_f16(acc11, w1_1, x1);
+      acc11 = vfmlalq_high_f16(acc11, w1_1, x1);
+
+      const float16x8_t w2_0 = vld1q_f16(reinterpret_cast<const __fp16*>(wr2));
+      const float16x8_t w2_1 = vld1q_f16(reinterpret_cast<const __fp16*>(wr2 + 8));
+      acc20 = vfmlalq_low_f16(acc20, w2_0, x0);
+      acc20 = vfmlalq_high_f16(acc20, w2_0, x0);
+      acc21 = vfmlalq_low_f16(acc21, w2_1, x1);
+      acc21 = vfmlalq_high_f16(acc21, w2_1, x1);
+
+      const float16x8_t w3_0 = vld1q_f16(reinterpret_cast<const __fp16*>(wr3));
+      const float16x8_t w3_1 = vld1q_f16(reinterpret_cast<const __fp16*>(wr3 + 8));
+      acc30 = vfmlalq_low_f16(acc30, w3_0, x0);
+      acc30 = vfmlalq_high_f16(acc30, w3_0, x0);
+      acc31 = vfmlalq_low_f16(acc31, w3_1, x1);
+      acc31 = vfmlalq_high_f16(acc31, w3_1, x1);
+    }
+    float s0 = vaddvq_f32(vaddq_f32(acc00, acc01));
+    float s1 = vaddvq_f32(vaddq_f32(acc10, acc11));
+    float s2 = vaddvq_f32(vaddq_f32(acc20, acc21));
+    float s3 = vaddvq_f32(vaddq_f32(acc30, acc31));
+    for (; k < k_chunk; ++k, ++wr0, ++wr1, ++wr2, ++wr3, ++xr) {
+      __fp16 wh0, wh1, wh2, wh3, xhh;
+      std::memcpy(&wh0, wr0, sizeof wh0);
+      std::memcpy(&wh1, wr1, sizeof wh1);
+      std::memcpy(&wh2, wr2, sizeof wh2);
+      std::memcpy(&wh3, wr3, sizeof wh3);
+      std::memcpy(&xhh, xr, sizeof xhh);
+      s0 += static_cast<float>(wh0) * static_cast<float>(xhh);
+      s1 += static_cast<float>(wh1) * static_cast<float>(xhh);
+      s2 += static_cast<float>(wh2) * static_cast<float>(xhh);
+      s3 += static_cast<float>(wh3) * static_cast<float>(xhh);
+    }
+    y_part[r] = s0;
+    y_part[r + 1] = s1;
+    y_part[r + 2] = s2;
+    y_part[r + 3] = s3;
+  }
+  for (; r < out; ++r) {
+    const uint16_t* wr = w + r * in + k_start;
+    const uint16_t* xr = xh + k_start;
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    size_t k = 0;
+    const size_t vec_end8 = k_chunk & ~size_t{7};
+    for (; k < vec_end8; k += 8, wr += 8, xr += 8) {
+      const float16x8_t w8 = vld1q_f16(reinterpret_cast<const __fp16*>(wr));
+      const float16x8_t x8 = vld1q_f16(reinterpret_cast<const __fp16*>(xr));
+      acc0 = vfmlalq_low_f16(acc0, w8, x8);
+      acc1 = vfmlalq_high_f16(acc1, w8, x8);
+    }
+    float s = vaddvq_f32(acc0) + vaddvq_f32(acc1);
+    for (; k < k_chunk; ++k, ++wr, ++xr) {
+      __fp16 wh, xhh;
+      std::memcpy(&wh, wr, sizeof wh);
+      std::memcpy(&xhh, xr, sizeof xhh);
+      s += static_cast<float>(wh) * static_cast<float>(xhh);
+    }
+    y_part[r] = s;
+  }
+}
+
+inline void reduce_parts(const float* const* parts, size_t n_parts, float* y, size_t out) {
+  if (n_parts == 1) {
+    if (y != parts[0]) std::memcpy(y, parts[0], out * sizeof(float));
+    return;
+  }
+  if (n_parts == 2) {
+    const float* p0 = parts[0];
+    const float* p1 = parts[1];
+    size_t r = 0;
+    for (; r + 4 <= out; r += 4) {
+      vst1q_f32(y + r, vaddq_f32(vld1q_f32(p0 + r), vld1q_f32(p1 + r)));
+    }
+    for (; r < out; ++r) y[r] = p0[r] + p1[r];
+    return;
+  }
+  if (n_parts == 4) {
+    const float* p0 = parts[0];
+    const float* p1 = parts[1];
+    const float* p2 = parts[2];
+    const float* p3 = parts[3];
+    size_t r = 0;
+    for (; r + 4 <= out; r += 4) {
+      float32x4_t a01 = vaddq_f32(vld1q_f32(p0 + r), vld1q_f32(p1 + r));
+      float32x4_t a23 = vaddq_f32(vld1q_f32(p2 + r), vld1q_f32(p3 + r));
+      vst1q_f32(y + r, vaddq_f32(a01, a23));
+    }
+    for (; r < out; ++r) y[r] = p0[r] + p1[r] + p2[r] + p3[r];
+    return;
+  }
+  std::memcpy(y, parts[0], out * sizeof(float));
+  for (size_t p = 1; p < n_parts; ++p) {
+    const float* src = parts[p];
+    size_t r = 0;
+    for (; r + 4 <= out; r += 4) {
+      vst1q_f32(y + r, vaddq_f32(vld1q_f32(y + r), vld1q_f32(src + r)));
+    }
+    for (; r < out; ++r) y[r] += src[r];
+  }
+}
+
 }  // namespace ar_neon
 }  // namespace
 
@@ -145,6 +368,172 @@ namespace gsv::ar {
 using DenseF16 = kern::accel::DenseF16;
 using rt::GsvFile;
 using rt::TensorView;
+
+// ---------------------------------------------------------------------------
+// ArSplitKPool: 4 P-Core Persistent Barrier Thread Pool for Split-K Decode
+// ---------------------------------------------------------------------------
+class T2SEngine::ArSplitKPool {
+ public:
+  static constexpr size_t kMaxThreads = 4;
+  struct alignas(64) WorkerSlot {
+    std::atomic<uint32_t> task_seq{0};
+    std::atomic<uint32_t> done_seq{0};
+  };
+
+  class GenerationBarrier {
+   public:
+    explicit GenerationBarrier(size_t total = 4) : total_(total) {
+      count_[0].store(0, std::memory_order_relaxed);
+      count_[1].store(0, std::memory_order_relaxed);
+      gen_[0].store(0, std::memory_order_relaxed);
+      gen_[1].store(0, std::memory_order_relaxed);
+    }
+
+    void sync(size_t phase) {
+      if (total_ <= 1) return;
+      const size_t slot = phase & 1;
+      const uint32_t cur_gen = gen_[slot].load(std::memory_order_relaxed);
+      if (count_[slot].fetch_add(1, std::memory_order_acq_rel) + 1 == total_) {
+        count_[slot].store(0, std::memory_order_relaxed);
+        gen_[slot].store(cur_gen + 1, std::memory_order_release);
+      } else {
+        while (gen_[slot].load(std::memory_order_acquire) == cur_gen) {
+          __builtin_arm_yield();
+        }
+      }
+    }
+
+   private:
+    size_t total_{4};
+    std::atomic<uint32_t> count_[2];
+    std::atomic<uint32_t> gen_[2];
+  };
+
+  explicit ArSplitKPool(size_t n_threads)
+      : n_threads_(n_threads),
+        stop_(false),
+        in_session_(false),
+        barrier_(n_threads) {
+    if (n_threads_ > 1) {
+      workers_.reserve(n_threads_ - 1);
+      for (size_t i = 1; i < n_threads_; ++i) {
+        workers_.emplace_back([this, i] {
+          ::pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+          worker_loop(i);
+        });
+      }
+    }
+  }
+
+  ~ArSplitKPool() {
+    if (!workers_.empty()) {
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        stop_.store(true, std::memory_order_release);
+        in_session_.store(false, std::memory_order_release);
+        for (size_t i = 1; i < n_threads_; ++i) {
+          slots_[i].task_seq.fetch_add(1, std::memory_order_release);
+        }
+      }
+      cv_.notify_all();
+      for (auto& t : workers_) t.join();
+    }
+  }
+
+  void begin_session() {
+    if (n_threads_ <= 1) return;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      in_session_.store(true, std::memory_order_release);
+    }
+    cv_.notify_all();
+  }
+
+  void end_session() {
+    if (n_threads_ <= 1) return;
+    std::lock_guard<std::mutex> lk(mu_);
+    in_session_.store(false, std::memory_order_release);
+  }
+
+  template <typename Fn>
+  void run_layer(Fn&& fn) {
+    if (n_threads_ <= 1) {
+      fn(0, 1, barrier_);
+      return;
+    }
+    struct Runner {
+      static void invoke(void* ctx, size_t tid, size_t nth,
+                         GenerationBarrier& bar) {
+        (*static_cast<std::decay_t<Fn>*>(ctx))(tid, nth, bar);
+      }
+    };
+    task_fn_ = &Runner::invoke;
+    task_ctx_ = (void*)&fn;
+    const uint32_t seq = cur_seq_ + 1;
+    cur_seq_ = seq;
+    if (!in_session_.load(std::memory_order_relaxed)) {
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (size_t i = 1; i < n_threads_; ++i) {
+          slots_[i].task_seq.store(seq, std::memory_order_release);
+        }
+      }
+      cv_.notify_all();
+    } else {
+      for (size_t i = 1; i < n_threads_; ++i) {
+        slots_[i].task_seq.store(seq, std::memory_order_release);
+      }
+    }
+    fn(0, n_threads_, barrier_);
+    for (size_t i = 1; i < n_threads_; ++i) {
+      while (slots_[i].done_seq.load(std::memory_order_acquire) != seq) {
+        __builtin_arm_yield();
+      }
+    }
+  }
+
+  size_t threads() const { return n_threads_; }
+
+ private:
+  void worker_loop(size_t tid) {
+    uint32_t last_seq = 0;
+    while (true) {
+      while (!stop_.load(std::memory_order_relaxed)) {
+        if (slots_[tid].task_seq.load(std::memory_order_acquire) != last_seq) break;
+        if (!in_session_.load(std::memory_order_relaxed)) {
+          std::unique_lock<std::mutex> lk(mu_);
+          if (slots_[tid].task_seq.load(std::memory_order_relaxed) != last_seq ||
+              stop_.load(std::memory_order_relaxed)) break;
+          cv_.wait(lk, [&] {
+            return stop_.load(std::memory_order_relaxed) ||
+                   in_session_.load(std::memory_order_relaxed) ||
+                   slots_[tid].task_seq.load(std::memory_order_relaxed) != last_seq;
+          });
+          break;
+        }
+        __builtin_arm_yield();
+      }
+      if (stop_.load(std::memory_order_acquire)) break;
+      if (slots_[tid].task_seq.load(std::memory_order_acquire) == last_seq) continue;
+
+      last_seq = slots_[tid].task_seq.load(std::memory_order_acquire);
+      task_fn_(task_ctx_, tid, n_threads_, barrier_);
+      slots_[tid].done_seq.store(last_seq, std::memory_order_release);
+    }
+  }
+
+  size_t n_threads_;
+  std::atomic<bool> stop_;
+  std::atomic<bool> in_session_;
+  uint32_t cur_seq_{0};
+  WorkerSlot slots_[kMaxThreads];
+  GenerationBarrier barrier_;
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::vector<std::thread> workers_;
+  void (*task_fn_)(void*, size_t, size_t, GenerationBarrier&){nullptr};
+  void* task_ctx_{nullptr};
+};
 
 T2SEngine::T2SEngine(const GsvFile& f) {
   // ---- 维度: 全部来自 ckpt 内嵌 config(convert.py 存入 .gsv header) ----
@@ -241,6 +630,45 @@ T2SEngine::T2SEngine(const GsvFile& f) {
 #ifdef GSV_AMX_GEMM
   prefill_amx_in_use_ = kern::amx_gemm_available();
 #endif
+
+  // E18: 初始化 split-K scratch 缓冲
+  sk_part_qkv_.assign(4 * 3 * D, 0.f);
+  sk_part_wout_.assign(4 * D, 0.f);
+  sk_part_w1_.assign(4 * dims_.ffn, 0.f);
+  sk_part_w2_.assign(4 * D, 0.f);
+  sk_qkv_.assign(3 * D, 0.f);
+  sk_attn_.assign(D, 0.f);
+  sk_xb_.assign(D, 0.f);
+  sk_ff_.assign(dims_.ffn, 0.f);
+  sk_hbuf_.assign(D, 0.f);
+  sk_scores_.assign(kMaxDecodeSteps + 500, 0.f);
+  sk_xh512_.assign(D, 0);
+  sk_attn16_.assign(D, 0);
+  sk_xb16_.assign(D, 0);
+  sk_ff16_.assign(dims_.ffn, 0);
+
+  for (size_t i = 0; i < 4; ++i) {
+    sk_qkv_ptrs_[i] = sk_part_qkv_.data() + i * 3 * D;
+    sk_wout_ptrs_[i] = sk_part_wout_.data() + i * D;
+    sk_w1_ptrs_[i] = sk_part_w1_.data() + i * dims_.ffn;
+    sk_w2_ptrs_[i] = sk_part_w2_.data() + i * D;
+  }
+}
+
+T2SEngine::~T2SEngine() = default;
+
+void T2SEngine::set_splitk(bool enable) {
+  ar_splitk_ = enable;
+  if (enable && !splitk_pool_) {
+    size_t pool_size = rt::p_core_count();
+    if (pool_size > 4) pool_size = 4;
+    if (pool_size == 0) pool_size = 1;
+    if (const char* e = std::getenv("GSV_AMX_THREADS")) {
+      long v = std::atol(e);
+      if (v > 0) pool_size = static_cast<size_t>(v);
+    }
+    splitk_pool_ = std::make_unique<ArSplitKPool>(pool_size);
+  }
 }
 
 const TensorView& T2SEngine::need(const GsvFile& f, const char* name) const {
@@ -667,6 +1095,146 @@ void T2SEngine::block_decode_impl(size_t l, float* x, size_t pos, size_t len,
   gsv::kern::layernorm(xb, L.n2g.data(), L.n2b.data(), x, D, dims_.ln_eps);
 }  // block_decode_impl<KV16,GEMV16>
 
+template <bool KV16, bool GEMV16>
+void T2SEngine::block_decode_splitk_impl(size_t l, float* x, size_t pos,
+                                         size_t len, float* kf32, uint16_t* k16,
+                                         float* vf32, uint16_t* v16) {
+  if (!splitk_pool_) set_splitk(true);
+  const size_t D = dims_.d_model, H = dims_.n_heads, HD = D / H, FF = dims_.ffn;
+  Layer& L = layers_[l];
+  const float scale = 1.0f / std::sqrt(static_cast<float>(HD));
+
+  splitk_pool_->run_layer([&](size_t tid, size_t nth, auto& barrier) {
+    size_t phase = 0;
+    const size_t k0_d = tid * (D / nth);
+    const size_t k1_d = (tid + 1) * (D / nth);
+    float* qkv_part = sk_part_qkv_.data() + tid * 3 * D;
+
+    if constexpr (GEMV16) {
+      if (tid == 0) kern::f32_to_f16(x, sk_xh512_.data(), D);
+      barrier.sync(phase++);
+      ar_neon::gemv_slice_f16x_fmlal_4rows(L.wqkv16.data(), sk_xh512_.data(),
+                                           qkv_part, 3 * D, D, k0_d, k1_d);
+    } else {
+      ar_neon::gemv_slice_f16w_f32acc_4rows(L.wqkv16.data(), x, qkv_part,
+                                            3 * D, D, k0_d, k1_d);
+    }
+
+    barrier.sync(phase++);
+
+    if (tid == 0) {
+      float* qkv = sk_qkv_.data();
+      ar_neon::reduce_parts(sk_qkv_ptrs_, nth, qkv, 3 * D);
+      for (size_t j = 0; j < 3 * D; ++j) qkv[j] += L.bqkv[j];
+
+      if constexpr (KV16) {
+        kern::f32_to_f16(qkv + D, k16 + pos * D, D);
+        kern::f32_to_f16(qkv + 2 * D, v16 + pos * D, D);
+      } else {
+        std::memcpy(kf32 + pos * D, qkv + D, D * sizeof(float));
+        std::memcpy(vf32 + pos * D, qkv + 2 * D, D * sizeof(float));
+      }
+
+      if (sk_scores_.size() < len) sk_scores_.resize(len);
+      sk_attn_.assign(D, 0.f);
+      for (size_t h = 0; h < H; ++h) {
+        const float* qv = qkv + h * HD;
+        for (size_t k = 0; k < len; ++k) {
+          float dot;
+          if constexpr (KV16) {
+            dot = ar_neon::dot_f16kv(qv, k16 + k * D + h * HD, HD);
+          } else {
+            dot = ar_neon::dot_f32(qv, kf32 + k * D + h * HD, HD);
+          }
+          sk_scores_[k] = dot * scale;
+        }
+        gsv::kern::softmax(sk_scores_.data(), sk_scores_.data(), len);
+        float* ov = sk_attn_.data() + h * HD;
+        for (size_t k = 0; k < len; ++k) {
+          const float p = sk_scores_[k];
+          if constexpr (KV16) {
+            ar_neon::accum_f16kv(ov, v16 + k * D + h * HD, p, HD);
+          } else {
+            ar_neon::accum_f32(ov, vf32 + k * D + h * HD, p, HD);
+          }
+        }
+      }
+
+      if constexpr (GEMV16) {
+        kern::f32_to_f16(sk_attn_.data(), sk_attn16_.data(), D);
+      }
+    }
+
+    barrier.sync(phase++);
+
+    float* wout_part = sk_part_wout_.data() + tid * D;
+    if constexpr (GEMV16) {
+      ar_neon::gemv_slice_f16x_fmlal_4rows(L.wout16.data(), sk_attn16_.data(),
+                                           wout_part, D, D, k0_d, k1_d);
+    } else {
+      ar_neon::gemv_slice_f16w_f32acc_4rows(L.wout16.data(), sk_attn_.data(),
+                                            wout_part, D, D, k0_d, k1_d);
+    }
+
+    barrier.sync(phase++);
+
+    if (tid == 0) {
+      float* xb = sk_xb_.data();
+      ar_neon::reduce_parts(sk_wout_ptrs_, nth, xb, D);
+      for (size_t i = 0; i < D; ++i) xb[i] += L.bout[i] + x[i];
+      gsv::kern::layernorm(xb, L.n1g.data(), L.n1b.data(), xb, D, dims_.ln_eps);
+      std::memcpy(sk_hbuf_.data(), xb, D * sizeof(float));
+      if constexpr (GEMV16) {
+        kern::f32_to_f16(xb, sk_xb16_.data(), D);
+      }
+    }
+
+    barrier.sync(phase++);
+
+    float* w1_part = sk_part_w1_.data() + tid * FF;
+    if constexpr (GEMV16) {
+      ar_neon::gemv_slice_f16x_fmlal_4rows(L.w116.data(), sk_xb16_.data(),
+                                           w1_part, FF, D, k0_d, k1_d);
+    } else {
+      ar_neon::gemv_slice_f16w_f32acc_4rows(L.w116.data(), sk_xb_.data(),
+                                            w1_part, FF, D, k0_d, k1_d);
+    }
+
+    barrier.sync(phase++);
+
+    if (tid == 0) {
+      float* ff = sk_ff_.data();
+      ar_neon::reduce_parts(sk_w1_ptrs_, nth, ff, FF);
+      for (size_t i = 0; i < FF; ++i) ff[i] += L.b1[i];
+      gsv::kern::relu(ff, ff, FF);
+      if constexpr (GEMV16) {
+        kern::f32_to_f16(ff, sk_ff16_.data(), FF);
+      }
+    }
+
+    barrier.sync(phase++);
+
+    const size_t k0_ff = tid * (FF / nth);
+    const size_t k1_ff = (tid + 1) * (FF / nth);
+    float* w2_part = sk_part_w2_.data() + tid * D;
+    if constexpr (GEMV16) {
+      ar_neon::gemv_slice_f16x_fmlal_4rows(L.w216.data(), sk_ff16_.data(),
+                                           w2_part, D, FF, k0_ff, k1_ff);
+    } else {
+      ar_neon::gemv_slice_f16w_f32acc_4rows(L.w216.data(), sk_ff_.data(),
+                                            w2_part, D, FF, k0_ff, k1_ff);
+    }
+
+    barrier.sync(phase++);
+
+    if (tid == 0) {
+      ar_neon::reduce_parts(sk_w2_ptrs_, nth, x, D);
+      for (size_t i = 0; i < D; ++i) x[i] += L.b2[i] + sk_hbuf_[i];
+      gsv::kern::layernorm(x, L.n2g.data(), L.n2b.data(), x, D, dims_.ln_eps);
+    }
+  });
+}
+
 template void T2SEngine::block_prefill_impl<false>(size_t, float*, size_t,
                                                    size_t, size_t, float*,
                                                    uint16_t*, float*, uint16_t*);
@@ -685,6 +1253,18 @@ template void T2SEngine::block_decode_impl<true, true>(size_t, float*, size_t,
                                                        size_t, float*,
                                                        uint16_t*, float*,
                                                        uint16_t*);
+template void T2SEngine::block_decode_splitk_impl<false, false>(size_t, float*,
+                                                                size_t, size_t,
+                                                                float*, uint16_t*,
+                                                                float*, uint16_t*);
+template void T2SEngine::block_decode_splitk_impl<true, false>(size_t, float*,
+                                                               size_t, size_t,
+                                                               float*, uint16_t*,
+                                                               float*, uint16_t*);
+template void T2SEngine::block_decode_splitk_impl<true, true>(size_t, float*,
+                                                              size_t, size_t,
+                                                              float*, uint16_t*,
+                                                              float*, uint16_t*);
 
 // ---- 贪心采样(infer_panel_naive sample() top_k=1 同构) ----
 // 关键语义: torch 的 logits_to_probs 用 scatter_ 就地修改传入的 logits 张量,
@@ -976,6 +1556,12 @@ GenResult T2SEngine::generate(const int64_t* phones, size_t T,
   size_t cur_len = S;  // 已写入 cache 的 token 数
   bool stop = false;
   size_t idx = 0;
+  if (ar_splitk_) {
+    if (!splitk_pool_) set_splitk(true);
+    if (splitk_pool_) splitk_pool_->begin_session();
+  }
+  struct rusage ru0{}, ru1{};
+  ::getrusage(RUSAGE_SELF, &ru0);
   for (; idx < max_steps && !stop; ++idx) {
     float* lg = logits_.data();
     int raw = -1;
@@ -1009,40 +1595,68 @@ GenResult T2SEngine::generate(const int64_t* phones, size_t T,
     for (size_t d = 0; d < D; ++d) x1_[d] = erow[d] + alpha_audio_ * pe_[d];
 
     for (size_t l = 0; l < dims_.n_layers; ++l) {
-      if (fp16_.kv) {
-        if (fp16_.gemv)
-          block_decode_impl<true, true>(l, x1_.data(), cur_len, cur_len + 1,
-                                        nullptr, kc16_[l].data(), nullptr,
-                                        vc16_[l].data());
-        else
-          block_decode_impl<true, false>(l, x1_.data(), cur_len,
-                                         cur_len + 1, nullptr,
-                                         kc16_[l].data(), nullptr,
-                                         vc16_[l].data());
+      if (ar_splitk_) {
+        if (fp16_.kv) {
+          if (fp16_.gemv)
+            block_decode_splitk_impl<true, true>(l, x1_.data(), cur_len, cur_len + 1,
+                                                 nullptr, kc16_[l].data(), nullptr,
+                                                 vc16_[l].data());
+          else
+            block_decode_splitk_impl<true, false>(l, x1_.data(), cur_len,
+                                                  cur_len + 1, nullptr,
+                                                  kc16_[l].data(), nullptr,
+                                                  vc16_[l].data());
+        } else {
+          block_decode_splitk_impl<false, false>(l, x1_.data(), cur_len, cur_len + 1,
+                                                 kc_[l].data(), nullptr,
+                                                 vc_[l].data(), nullptr);
+        }
       } else {
-        block_decode_impl<false, false>(l, x1_.data(), cur_len, cur_len + 1,
-                                        kc_[l].data(), nullptr,
-                                        vc_[l].data(), nullptr);
+        if (fp16_.kv) {
+          if (fp16_.gemv)
+            block_decode_impl<true, true>(l, x1_.data(), cur_len, cur_len + 1,
+                                          nullptr, kc16_[l].data(), nullptr,
+                                          vc16_[l].data());
+          else
+            block_decode_impl<true, false>(l, x1_.data(), cur_len,
+                                           cur_len + 1, nullptr,
+                                           kc16_[l].data(), nullptr,
+                                           vc16_[l].data());
+        } else {
+          block_decode_impl<false, false>(l, x1_.data(), cur_len, cur_len + 1,
+                                          kc_[l].data(), nullptr,
+                                          vc_[l].data(), nullptr);
+        }
       }
     }
     ++cur_len;
     predict_layer_fp(x1_.data(), logits_.data());
   }
+  if (ar_splitk_ && splitk_pool_) splitk_pool_->end_session();
   const auto t2 = std::chrono::steady_clock::now();
+  ::getrusage(RUSAGE_SELF, &ru1);
 
   r.steps = idx + 1;  // 含触发停止的当前步(hook 计数口径)
   r.logits_last.assign(logits_.data(), logits_.data() + dims_.vocab);
   last_prefill_ms_ = std::chrono::duration<double, std::milli>(t1 - t0).count();
   last_decode_ms_ = std::chrono::duration<double, std::milli>(t2 - t1).count();
-  // E11-2 起加 GSV_AR_TIMING=1 探针, stderr 打印 prefill/decode/全程耗时(用与 E11-1/E11-2 验收报表)
+  // E11-2/E18 GSV_AR_TIMING=1 探针
   if (std::getenv("GSV_AR_TIMING")) {
     const double ms_per_tok =
         last_decode_ms_ / static_cast<double>(r.steps);
+    const double user_s = (ru1.ru_utime.tv_sec - ru0.ru_utime.tv_sec) +
+                          (ru1.ru_utime.tv_usec - ru0.ru_utime.tv_usec) * 1e-6;
+    const double sys_s = (ru1.ru_stime.tv_sec - ru0.ru_stime.tv_sec) +
+                         (ru1.ru_stime.tv_usec - ru0.ru_stime.tv_usec) * 1e-6;
+    const double cpu_s = user_s + sys_s;
+    const double wall_s = last_decode_ms_ * 1e-3;
+    const double avg_cores = wall_s > 0 ? (cpu_s / wall_s) : 0.0;
     std::fprintf(stderr,
                  "[ar-timing] T=%zu P=%zu S=%zu steps=%zu prefill=%.2fms (hit=%d) "
-                 "decode=%.2fms (%.3f ms/tok)\n",
+                 "decode=%.2fms (%.3f ms/tok, CPU=%.2fs/%.2fs wall, avg %.1f cores, splitk=%d)\n",
                  T, P, S, r.steps, last_prefill_ms_, last_prefill_hit_ ? 1 : 0,
-                 last_decode_ms_, ms_per_tok);
+                 last_decode_ms_, ms_per_tok, cpu_s, wall_s, avg_cores,
+                 ar_splitk_ ? 1 : 0);
   }
   return r;
 }

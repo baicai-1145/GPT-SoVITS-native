@@ -101,6 +101,7 @@ class T2SEngine {
 
   // 从 .gsv 加载全部权重; 维度取自 config JSON(版本锁纪律, 不硬编码形状)。
   explicit T2SEngine(const rt::GsvFile& f);
+  ~T2SEngine();
   const T2SDims& dims() const { return dims_; }
 
   // 全链路: prefill + 贪心 decode。phones[T] 文本音素, prompt[P] 音频语义,
@@ -119,6 +120,10 @@ class T2SEngine {
   bool kv_reuse() const { return kv_reuse_; }
   bool last_prefill_hit() const { return last_prefill_hit_; }
   void reset_kv_cache() { prompt_snapshot_.valid = false; }
+
+  // E18: AR decode split-K 多核化开关 (默认关)
+  void set_splitk(bool enable);
+  bool splitk() const { return ar_splitk_; }
 
   double last_prefill_ms() const { return last_prefill_ms_; }
   double last_decode_ms() const { return last_decode_ms_; }
@@ -148,8 +153,12 @@ class T2SEngine {
     if (fp16_.kv)
       throw std::runtime_error(
           "fp16.kv 模式下请走 generate() 内部路径(缓冲类型不同)");
-    block_decode_impl<false, false>(l, x, pos, len, kcache, nullptr, vcache,
-                                    nullptr);
+    if (ar_splitk_)
+      block_decode_splitk_impl<false, false>(l, x, pos, len, kcache, nullptr,
+                                             vcache, nullptr);
+    else
+      block_decode_impl<false, false>(l, x, pos, len, kcache, nullptr, vcache,
+                                      nullptr);
   }
 
   // logits 投影(无 bias): y[vocab] = W·x —— 固定 fp32 路径(DenseF16 升位 sgemm)。
@@ -204,6 +213,10 @@ class T2SEngine {
   void block_decode_impl(size_t l, float* x, size_t pos, size_t len,
                          float* kf32, uint16_t* k16, float* vf32,
                          uint16_t* v16);
+  template <bool KV16, bool GEMV16>
+  void block_decode_splitk_impl(size_t l, float* x, size_t pos, size_t len,
+                                float* kf32, uint16_t* k16, float* vf32,
+                                uint16_t* v16);
 #ifdef GSV_AMX_GEMM
   // E11-5: prefill SDPA 走 AMX (Q·K^T + P·V 两次 GEMM per head, 16 头串行复用 scratch)
   // attn_out 布局 [S, D] 行主, head h 段不连续 (stride D), 内部分散写入。
@@ -283,6 +296,18 @@ class T2SEngine {
   std::vector<float> dec_qkv_, dec_xb_, dec_h_, x1_;  // decode 单 token scratch
 
   double last_prefill_ms_ = 0, last_decode_ms_ = 0;
+
+  // E18: split-K 多核 decode 成员与 scratch
+  class ArSplitKPool;
+  std::unique_ptr<ArSplitKPool> splitk_pool_;
+  bool ar_splitk_ = false;
+  std::vector<float> sk_part_qkv_, sk_part_wout_, sk_part_w1_, sk_part_w2_;
+  std::vector<float> sk_qkv_, sk_attn_, sk_xb_, sk_ff_, sk_hbuf_, sk_scores_;
+  std::vector<uint16_t> sk_xh512_, sk_attn16_, sk_xb16_, sk_ff16_;
+  const float* sk_qkv_ptrs_[4]{nullptr};
+  const float* sk_wout_ptrs_[4]{nullptr};
+  const float* sk_w1_ptrs_[4]{nullptr};
+  const float* sk_w2_ptrs_[4]{nullptr};
 };
 
 }  // namespace gsv::ar
