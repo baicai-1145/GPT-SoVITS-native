@@ -234,13 +234,12 @@ bool Pipeline::load(const std::string& weightsDir, const std::string& dataDir,
       ar_->set_splitk(true);
       std::fprintf(stderr, "AR split-K: enabled (实验开关)\n");
     }
-    if (opt_.ar_fp16_kv || opt_.ar_fp16_gemv) {
+    if (opt_.ar_fp16_all) {
       ar::T2SEngine::Fp16Options fo;
-      fo.kv = opt_.ar_fp16_kv;
-      fo.gemv = opt_.ar_fp16_gemv;
+      fo.kv = true;
+      fo.gemv = true;
       ar_->set_fp16(fo);
-      std::fprintf(stderr, "AR fp16: kv=%d gemv=%d (实验开关)\n", fo.kv,
-                   fo.gemv);
+      std::fprintf(stderr, "AR fp16: kv=1 gemv=1 (实验开关)\n");
     }
     profMark("ar_load(444MB)", &tStage);
     sovits_ = std::make_unique<sovits::SovitsEngine>();

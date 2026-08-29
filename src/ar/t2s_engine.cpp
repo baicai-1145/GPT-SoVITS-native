@@ -1570,10 +1570,6 @@ template void T2SEngine::block_decode_impl<false, false>(size_t, float*,
                                                          size_t, size_t,
                                                          float*, uint16_t*,
                                                          float*, uint16_t*);
-template void T2SEngine::block_decode_impl<true, false>(size_t, float*, size_t,
-                                                        size_t, float*,
-                                                        uint16_t*, float*,
-                                                        uint16_t*);
 template void T2SEngine::block_decode_impl<true, true>(size_t, float*, size_t,
                                                        size_t, float*,
                                                        uint16_t*, float*,
@@ -1582,16 +1578,11 @@ template void T2SEngine::block_decode_splitk_impl<false, false>(size_t, float*,
                                                                 size_t, size_t,
                                                                 float*, uint16_t*,
                                                                 float*, uint16_t*);
-template void T2SEngine::block_decode_splitk_impl<true, false>(size_t, float*,
-                                                               size_t, size_t,
-                                                               float*, uint16_t*,
-                                                               float*, uint16_t*);
 template void T2SEngine::block_decode_splitk_impl<true, true>(size_t, float*,
                                                               size_t, size_t,
                                                               float*, uint16_t*,
                                                               float*, uint16_t*);
 template void T2SEngine::decode_step_splitk_impl<false, false>(float*, size_t, size_t, float*);
-template void T2SEngine::decode_step_splitk_impl<true, false>(float*, size_t, size_t, float*);
 template void T2SEngine::decode_step_splitk_impl<true, true>(float*, size_t, size_t, float*);
 
 // ---- 贪心采样(infer_panel_naive sample() top_k=1 同构) ----
@@ -1926,29 +1917,19 @@ GenResult T2SEngine::generate(const int64_t* phones, size_t T,
     for (size_t d = 0; d < D; ++d) x1_[d] = erow[d] + alpha_audio_ * pe_[d];
 
     if (ar_splitk_) {
-      if (fp16_.kv) {
-        if (fp16_.gemv)
-          decode_step_splitk_impl<true, true>(x1_.data(), cur_len, cur_len + 1,
-                                              logits_.data());
-        else
-          decode_step_splitk_impl<true, false>(x1_.data(), cur_len, cur_len + 1,
-                                               logits_.data());
+      if (fp16_.kv && fp16_.gemv) {
+        decode_step_splitk_impl<true, true>(x1_.data(), cur_len, cur_len + 1,
+                                            logits_.data());
       } else {
         decode_step_splitk_impl<false, false>(x1_.data(), cur_len, cur_len + 1,
                                               logits_.data());
       }
     } else {
       for (size_t l = 0; l < dims_.n_layers; ++l) {
-        if (fp16_.kv) {
-          if (fp16_.gemv)
-            block_decode_impl<true, true>(l, x1_.data(), cur_len, cur_len + 1,
-                                          nullptr, kc16_[l].data(), nullptr,
-                                          vc16_[l].data());
-          else
-            block_decode_impl<true, false>(l, x1_.data(), cur_len,
-                                           cur_len + 1, nullptr,
-                                           kc16_[l].data(), nullptr,
-                                           vc16_[l].data());
+        if (fp16_.kv && fp16_.gemv) {
+          block_decode_impl<true, true>(l, x1_.data(), cur_len, cur_len + 1,
+                                        nullptr, kc16_[l].data(), nullptr,
+                                        vc16_[l].data());
         } else {
           block_decode_impl<false, false>(l, x1_.data(), cur_len, cur_len + 1,
                                           kc_[l].data(), nullptr,

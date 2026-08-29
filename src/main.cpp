@@ -68,7 +68,6 @@ void printHelp(const char* argv0) {
       "  --timing-csv F    per-segment 三阶段耗时 CSV 输出路径\n"
       "  --amx             SoVITS conv 启用 AMX fp16 GEMM 后端(实验; 默认关)\n"
       "  --kv-reuse        实验诊断; 仅在完全相同 prompt+text 重复合成时命中(位级一致), 长文本多段不同文本场景无收益(掩码语义)\n"
-      "  --fp16-kv         AR KV cache 以 fp16 存储(等价 --fp16; 默认关)\n"
       "  --fp16-all        AR KV cache + GEMV 均启用 fp16 (实验开关; 默认关)\n"
       "  --ar-sk           AR decode 启用 split-K 多核并行 (实验开关; 默认关)\n"
       "  --sample          AR 采样对齐 python(top_k=15/pen=1.35, 根治长文本复读; 默认贪心=位级口径)\n"
@@ -152,11 +151,8 @@ int main(int argc, char** argv) {
       // E12: HuBERT dense 层切换 AMX(参考音频编码侧); panel 在构造期预打包。
       opt.enc_amx = true;
 #endif
-    } else if (a == "--fp16" || a == "--fp16-kv") {
-      opt.ar_fp16_kv = true;
     } else if (a == "--fp16-all") {
-      opt.ar_fp16_kv = true;
-      opt.ar_fp16_gemv = true;
+      opt.ar_fp16_all = true;
     } else if (a == "--ar-sk") {
       opt.ar_splitk = true;
     } else if (a == "--kv-reuse") {
