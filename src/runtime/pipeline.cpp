@@ -538,7 +538,7 @@ bool Pipeline::buildReference(const std::string& refWavPath, SynthResult* out,
       //   数值护栏: fp32 块化累加序变化引入的绝对误差实测 ≤0.045(见
       //   .tmp/evidence-T5.md), 而 fp32 行 top-2 差实测 ≥3.0 ⇒ 默认 τ=1.0:
       //   差距 < GSV_RVQ_TIE_EPS 的帧回退原始双精度逐码精确复算(与基线判定
-      //   位级同构); GSV_RVQ_AUDIT=1 打印回退/捕获数。
+      //   位级同构)。
       {
         const char* epsEnv = std::getenv("GSV_RVQ_TIE_EPS");
         const double tieEps = epsEnv ? std::atof(epsEnv) : 1.0;
