@@ -15,6 +15,7 @@
 #include "kern/kern.hpp"
 #include "runtime/threadpool.hpp"
 #if defined(GSV_AMX_GEMM)
+#include "kern/amx.h"
 #include "kern/gemm_f16_amx.hpp"
 #define HAVE_AMX 1
 #else
@@ -453,6 +454,361 @@ class FastPool {
   void (*task_fn_)(void*, size_t, size_t){nullptr};
   void* task_ctx_{nullptr};
 };
+
+#if HAVE_AMX
+inline void bench_amx_tile_fn(const uint8_t* Xbase, const uint8_t* Ybase, float* C,
+                              size_t M, size_t N, size_t K, size_t mb, size_t nb) {
+  static thread_local __attribute__((aligned(64))) uint8_t z64[64] = {0};
+  static thread_local __attribute__((aligned(64))) uint8_t zb[64][64];
+  const size_t tm = std::min<size_t>(32, M - mb * 32);
+  const size_t tn = std::min<size_t>(32, N - nb * 32);
+  const uint8_t* X = Xbase + (mb * K) * 64;
+  const uint8_t* Y = Ybase + (nb * K) * 64;
+  for (int z = 0; z < 64; ++z) AMX_LDZ(gsv::kern::amx::ld_op(z64, (uint64_t)z));
+  const uint64_t op = gsv::kern::amx::matfp_f16f32(0, 0);
+  for (size_t k = 0; k < K; ++k) {
+    AMX_LDX((uint64_t)(X + k * 64));
+    AMX_LDY((uint64_t)(Y + k * 64));
+    AMX_MATFP(op);
+  }
+  for (int z = 0; z < 64; ++z) AMX_STZ(gsv::kern::amx::ld_op(zb[z], (uint64_t)z));
+  float* Crow = C + (mb * 32) * N + nb * 32;
+  for (size_t n = 0; n < tn; ++n) {
+    const uint8_t* fe = zb[n * 2];
+    const uint8_t* fo = zb[n * 2 + 1];
+    for (size_t m2 = 0; m2 < 16; ++m2) {
+      const size_t m = m2 * 2;
+      if (m < tm) std::memcpy(&Crow[m * N + n], fe + m2 * 4, 4);
+      if (m + 1 < tm) std::memcpy(&Crow[(m + 1) * N + n], fo + m2 * 4, 4);
+    }
+  }
+}
+
+class FastAmxBenchPool {
+ public:
+  struct alignas(64) Slot {
+    std::atomic<uint32_t> task_seq{0};
+    std::atomic<uint32_t> done_seq{0};
+  };
+
+  explicit FastAmxBenchPool(size_t n_threads) : n_threads_(n_threads), stop_(false) {
+    if (n_threads_ > 1) {
+      slots_ = new Slot[n_threads_];
+      workers_.reserve(n_threads_ - 1);
+      for (size_t i = 1; i < n_threads_; ++i) {
+        workers_.emplace_back([this, i] {
+          ::pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+          AMX_SET();
+          worker_loop(i);
+          AMX_CLR();
+        });
+      }
+    }
+  }
+
+  ~FastAmxBenchPool() {
+    if (!workers_.empty()) {
+      stop_.store(true, std::memory_order_release);
+      for (size_t i = 1; i < n_threads_; ++i) {
+        slots_[i].task_seq.fetch_add(1, std::memory_order_release);
+      }
+      for (auto& t : workers_) t.join();
+      delete[] slots_;
+    }
+  }
+
+  template <typename Fn>
+  void parallel_run(Fn&& fn) {
+    if (n_threads_ <= 1) {
+      AMX_SET();
+      fn(0, 1);
+      AMX_CLR();
+      return;
+    }
+    struct Caller {
+      static void invoke(void* ctx, size_t tid, size_t n_th) {
+        (*static_cast<std::decay_t<Fn>*>(ctx))(tid, n_th);
+      }
+    };
+    task_fn_ = &Caller::invoke;
+    task_ctx_ = (void*)&fn;
+    const uint32_t seq = cur_seq_ + 1;
+    cur_seq_ = seq;
+    for (size_t i = 1; i < n_threads_; ++i) {
+      slots_[i].task_seq.store(seq, std::memory_order_release);
+    }
+    AMX_SET();
+    fn(0, n_threads_);
+    AMX_CLR();
+    for (size_t i = 1; i < n_threads_; ++i) {
+      while (slots_[i].done_seq.load(std::memory_order_acquire) != seq) {
+        __builtin_arm_yield();
+      }
+    }
+  }
+
+  size_t threads() const { return n_threads_; }
+
+ private:
+  void worker_loop(size_t tid) {
+    uint32_t last_seq = 0;
+    while (true) {
+      while (!stop_.load(std::memory_order_relaxed)) {
+        if (slots_[tid].task_seq.load(std::memory_order_acquire) != last_seq) break;
+        __builtin_arm_yield();
+      }
+      if (stop_.load(std::memory_order_acquire)) break;
+      last_seq = slots_[tid].task_seq.load(std::memory_order_acquire);
+      task_fn_(task_ctx_, tid, n_threads_);
+      slots_[tid].done_seq.store(last_seq, std::memory_order_release);
+    }
+  }
+
+  size_t n_threads_;
+  std::atomic<bool> stop_;
+  uint32_t cur_seq_{0};
+  Slot* slots_{nullptr};
+  std::vector<std::thread> workers_;
+  void (*task_fn_)(void*, size_t, size_t){nullptr};
+  void* task_ctx_{nullptr};
+};
+
+struct PrefillSimData {
+  size_t S;
+  size_t D = 512, H = 16, HD = 32, FF = 2048, NL = 24;
+
+  struct LayerData {
+    gsv::kern::AmxPanel wqkv, wout, w1, w2;
+    std::vector<float> bqkv, bout, b1, b2, n1g, n1b, n2g, n2b;
+  };
+  std::vector<LayerData> layers;
+
+  std::vector<float> x, qkv, attn, tmp, ff;
+  std::vector<uint16_t> x16, ff16;
+  std::vector<uint8_t> pa_x, pa_ff;
+
+  struct ThreadScratch {
+    std::vector<uint16_t> Q_f16, K_f16, V_T_f16, P_f16;
+    std::vector<uint8_t> pa_Q, pa_K, pa_V, pa_P;
+    std::vector<float> scores, probs, attn_head;
+  };
+  std::vector<ThreadScratch> scr;
+
+  void init(size_t s_len, size_t max_th) {
+    S = s_len;
+    layers.resize(NL);
+    std::vector<uint16_t> wqkv_raw(1536 * 512, 0x3c00);
+    std::vector<uint16_t> wout_raw(512 * 512, 0x3c00);
+    std::vector<uint16_t> w1_raw(2048 * 512, 0x3c00);
+    std::vector<uint16_t> w2_raw(512 * 2048, 0x3c00);
+
+    for (size_t l = 0; l < NL; ++l) {
+      layers[l].wqkv = gsv::kern::amx_pack(wqkv_raw.data(), 1536, 512);
+      layers[l].wout = gsv::kern::amx_pack(wout_raw.data(), 512, 512);
+      layers[l].w1 = gsv::kern::amx_pack(w1_raw.data(), 2048, 512);
+      layers[l].w2 = gsv::kern::amx_pack(w2_raw.data(), 512, 2048);
+      layers[l].bqkv.assign(1536, 0.01f);
+      layers[l].bout.assign(512, 0.01f);
+      layers[l].b1.assign(2048, 0.01f);
+      layers[l].b2.assign(512, 0.01f);
+      layers[l].n1g.assign(512, 1.0f);
+      layers[l].n1b.assign(512, 0.0f);
+      layers[l].n2g.assign(512, 1.0f);
+      layers[l].n2b.assign(512, 0.0f);
+    }
+
+    x.assign(S * 512, 0.1f);
+    x16.assign(S * 512, 0x3c00);
+    qkv.assign(S * 1536, 0.0f);
+    attn.assign(S * 512, 0.0f);
+    tmp.assign(S * 512, 0.0f);
+    ff.assign(S * 2048, 0.0f);
+    ff16.assign(S * 2048, 0x3c00);
+
+    scr.resize(max_th);
+    for (size_t t = 0; t < max_th; ++t) {
+      scr[t].Q_f16.assign(S * 32, 0x3c00);
+      scr[t].K_f16.assign(S * 32, 0x3c00);
+      scr[t].V_T_f16.assign(32 * S, 0x3c00);
+      scr[t].P_f16.assign(S * S, 0x3c00);
+      scr[t].scores.assign(S * S, 0.0f);
+      scr[t].probs.assign(S * S, 0.0f);
+      scr[t].attn_head.assign(S * 32, 0.0f);
+    }
+  }
+};
+
+inline void simulate_prefill(FastAmxBenchPool& pool, PrefillSimData& d) {
+  const size_t S = d.S, D = d.D, H = d.H, HD = d.HD, FF = d.FF, NL = d.NL;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(HD));
+  const size_t text_len = S / 2;
+
+  const size_t nmb_S = (S + 31) / 32;
+  const size_t nnb_qkv = (1536 + 31) / 32;
+  const size_t ntiles_qkv = nmb_S * nnb_qkv;
+  const size_t nnb_wout = (512 + 31) / 32;
+  const size_t ntiles_wout = nmb_S * nnb_wout;
+  const size_t nnb_w1 = (2048 + 31) / 32;
+  const size_t ntiles_w1 = nmb_S * nnb_w1;
+  const size_t nnb_w2 = (512 + 31) / 32;
+  const size_t ntiles_w2 = nmb_S * nnb_w2;
+
+  for (size_t l = 0; l < NL; ++l) {
+    auto& L = d.layers[l];
+
+    // 1. Pack x -> pa_x
+    gsv::kern::f32_to_f16(d.x.data(), d.x16.data(), S * D);
+    gsv::kern::amx_pack_into(d.x16.data(), S, D, d.pa_x);
+    const uint8_t* pa_x_ptr = d.pa_x.data() + ((64 - ((uintptr_t)d.pa_x.data() & 63)) & 63);
+
+    // 2. QKV GEMM [S, 512] x [1536, 512]^T -> [S, 1536]
+    pool.parallel_run([&](size_t tid, size_t nth) {
+      const size_t t0 = tid * ntiles_qkv / nth;
+      const size_t t1 = (tid + 1) * ntiles_qkv / nth;
+      for (size_t t = t0; t < t1; ++t) {
+        bench_amx_tile_fn(pa_x_ptr, L.wqkv.data(), d.qkv.data(), S, 1536, D, t / nnb_qkv, t % nnb_qkv);
+      }
+    });
+
+    // Bias add
+    for (size_t i = 0; i < S; ++i) {
+      for (size_t j = 0; j < 3 * D; ++j) {
+        d.qkv[i * 3 * D + j] += L.bqkv[j];
+      }
+    }
+
+    // 3. SDPA (16 heads partitioned across threads)
+    pool.parallel_run([&](size_t tid, size_t nth) {
+      const size_t h0 = tid * H / nth;
+      const size_t h1 = (tid + 1) * H / nth;
+      auto& scr = d.scr[tid];
+
+      for (size_t h = h0; h < h1; ++h) {
+        for (size_t t = 0; t < S; ++t) {
+          const float* q_src = d.qkv.data() + t * 3 * D + h * HD;
+          const float* k_src = d.qkv.data() + t * 3 * D + D + h * HD;
+          const float* v_src = d.qkv.data() + t * 3 * D + 2 * D + h * HD;
+          for (size_t e = 0; e < HD; ++e) {
+            __fp16 qh = static_cast<__fp16>(q_src[e]);
+            __fp16 kh = static_cast<__fp16>(k_src[e]);
+            __fp16 vh = static_cast<__fp16>(v_src[e]);
+            std::memcpy(&scr.Q_f16[t * HD + e], &qh, 2);
+            std::memcpy(&scr.K_f16[t * HD + e], &kh, 2);
+            std::memcpy(&scr.V_T_f16[e * S + t], &vh, 2);
+          }
+        }
+
+        gsv::kern::amx_pack_into(scr.Q_f16.data(), S, HD, scr.pa_Q);
+        gsv::kern::amx_pack_into(scr.K_f16.data(), S, HD, scr.pa_K);
+        gsv::kern::amx_pack_into(scr.V_T_f16.data(), HD, S, scr.pa_V);
+
+        const uint8_t* pa_Q_ptr = scr.pa_Q.data() + ((64 - ((uintptr_t)scr.pa_Q.data() & 63)) & 63);
+        const uint8_t* pa_K_ptr = scr.pa_K.data() + ((64 - ((uintptr_t)scr.pa_K.data() & 63)) & 63);
+        const uint8_t* pa_V_ptr = scr.pa_V.data() + ((64 - ((uintptr_t)scr.pa_V.data() & 63)) & 63);
+
+        const size_t nnb_S = (S + 31) / 32;
+        const size_t ntiles_qk = nmb_S * nnb_S;
+        for (size_t t = 0; t < ntiles_qk; ++t) {
+          bench_amx_tile_fn(pa_Q_ptr, pa_K_ptr, scr.scores.data(), S, S, HD, t / nnb_S, t % nnb_S);
+        }
+
+        for (size_t q = 0; q < S; ++q) {
+          float* row = scr.scores.data() + q * S;
+          float mx = -1e30f;
+          for (size_t k = 0; k < S; ++k) {
+            if (k < text_len || k <= q) {
+              row[k] *= scale;
+              if (row[k] > mx) mx = row[k];
+            } else {
+              row[k] = -1e30f;
+            }
+          }
+          float sum = 0.0f;
+          for (size_t k = 0; k < S; ++k) {
+            float e = (k < text_len || k <= q) ? std::exp(row[k] - mx) : 0.0f;
+            scr.probs[q * S + k] = e;
+            sum += e;
+          }
+          float inv = sum > 0.f ? 1.0f / sum : 0.0f;
+          for (size_t k = 0; k < S; ++k) {
+            scr.probs[q * S + k] *= inv;
+            __fp16 ph = static_cast<__fp16>(scr.probs[q * S + k]);
+            std::memcpy(&scr.P_f16[q * S + k], &ph, 2);
+          }
+        }
+
+        gsv::kern::amx_pack_into(scr.P_f16.data(), S, S, scr.pa_P);
+        const uint8_t* pa_P_ptr = scr.pa_P.data() + ((64 - ((uintptr_t)scr.pa_P.data() & 63)) & 63);
+        const size_t ntiles_pv = nmb_S * 1;
+        for (size_t t = 0; t < ntiles_pv; ++t) {
+          bench_amx_tile_fn(pa_P_ptr, pa_V_ptr, scr.attn_head.data(), S, HD, S, t, 0);
+        }
+
+        for (size_t q = 0; q < S; ++q) {
+          std::memcpy(d.attn.data() + q * D + h * HD, scr.attn_head.data() + q * HD, HD * sizeof(float));
+        }
+      }
+    });
+
+    // 4. OutProj GEMM [S, 512] x [512, 512]^T -> [S, 512]
+    gsv::kern::f32_to_f16(d.attn.data(), d.x16.data(), S * D);
+    gsv::kern::amx_pack_into(d.x16.data(), S, D, d.pa_x);
+    pa_x_ptr = d.pa_x.data() + ((64 - ((uintptr_t)d.pa_x.data() & 63)) & 63);
+
+    pool.parallel_run([&](size_t tid, size_t nth) {
+      const size_t t0 = tid * ntiles_wout / nth;
+      const size_t t1 = (tid + 1) * ntiles_wout / nth;
+      for (size_t t = t0; t < t1; ++t) {
+        bench_amx_tile_fn(pa_x_ptr, L.wout.data(), d.tmp.data(), S, 512, D, t / nnb_wout, t % nnb_wout);
+      }
+    });
+
+    // Residual + LN1
+    for (size_t i = 0; i < S * D; ++i) d.x[i] += d.tmp[i] + L.bout[i % D];
+    for (size_t t = 0; t < S; ++t) {
+      gsv::kern::layernorm(d.x.data() + t * D, L.n1g.data(), L.n1b.data(), d.x.data() + t * D, D, 1e-5f);
+    }
+
+    // 5. W1 GEMM [S, 512] x [2048, 512]^T -> [S, 2048]
+    gsv::kern::f32_to_f16(d.x.data(), d.x16.data(), S * D);
+    gsv::kern::amx_pack_into(d.x16.data(), S, D, d.pa_x);
+    pa_x_ptr = d.pa_x.data() + ((64 - ((uintptr_t)d.pa_x.data() & 63)) & 63);
+
+    pool.parallel_run([&](size_t tid, size_t nth) {
+      const size_t t0 = tid * ntiles_w1 / nth;
+      const size_t t1 = (tid + 1) * ntiles_w1 / nth;
+      for (size_t t = t0; t < t1; ++t) {
+        bench_amx_tile_fn(pa_x_ptr, L.w1.data(), d.ff.data(), S, 2048, D, t / nnb_w1, t % nnb_w1);
+      }
+    });
+
+    // Bias + ReLU
+    for (size_t i = 0; i < S * FF; ++i) {
+      float v = d.ff[i] + L.b1[i % FF];
+      d.ff[i] = v > 0.f ? v : 0.f;
+    }
+
+    // 6. W2 GEMM [S, 2048] x [512, 2048]^T -> [S, 512]
+    gsv::kern::f32_to_f16(d.ff.data(), d.ff16.data(), S * FF);
+    gsv::kern::amx_pack_into(d.ff16.data(), S, FF, d.pa_ff);
+    const uint8_t* pa_ff_ptr = d.pa_ff.data() + ((64 - ((uintptr_t)d.pa_ff.data() & 63)) & 63);
+
+    pool.parallel_run([&](size_t tid, size_t nth) {
+      const size_t t0 = tid * ntiles_w2 / nth;
+      const size_t t1 = (tid + 1) * ntiles_w2 / nth;
+      for (size_t t = t0; t < t1; ++t) {
+        bench_amx_tile_fn(pa_ff_ptr, L.w2.data(), d.tmp.data(), S, 512, FF, t / nnb_w2, t % nnb_w2);
+      }
+    });
+
+    // Residual + LN2
+    for (size_t i = 0; i < S * D; ++i) d.x[i] += d.tmp[i] + L.b2[i % D];
+    for (size_t t = 0; t < S; ++t) {
+      gsv::kern::layernorm(d.x.data() + t * D, L.n2g.data(), L.n2b.data(), d.x.data() + t * D, D, 1e-5f);
+    }
+  }
+}
+#endif
 
 }  // namespace
 
@@ -1297,6 +1653,160 @@ int main(int argc, char** argv) {
     std::printf("24-Layer W1 Elementwise: Unfused=%.2f us  Fused=%.2f us  Speedup=%.2fx (Gain: +%.1f%%, Gate: %s)\n",
                 t_unfused, t_fused, sp, gain_pct, gain_pct >= 5.0 ? "PASS >=5%" : "FAIL <5%");
   }
+
+#if HAVE_AMX
+  // -------------------------------------------------------------------------
+  // P0: 24-Layer Full-Chain Prefill Microbenchmark (1T / 2T / 4T / 6T)
+  // -------------------------------------------------------------------------
+  std::printf("\n========================================================================================\n");
+  std::printf("P0: 24-Layer Full-Chain Prefill Microbenchmark (1T / 2T / 4T / 6T)\n");
+  std::printf("========================================================================================\n");
+
+  for (size_t S : {280, 560}) {
+    std::printf("\n--- Prefill Full-Chain 24-Layer Simulation: S=%zu ---\n", S);
+    std::printf("%-12s %12s %12s %10s\n", "Threads", "Latency (ms)", "Speedup", "Gate >=1.8x");
+    PrefillSimData pdata;
+    pdata.init(S, 6);
+
+    double t1 = 0;
+    for (size_t th : {1, 2, 4, 6}) {
+      FastAmxBenchPool pool(th);
+      simulate_prefill(pool, pdata); // Warmup
+
+      const int PF_ITERS = 4;
+      double best_ms = 1e30;
+      for (int rd = 0; rd < 3; ++rd) {
+        auto t_start = std::chrono::steady_clock::now();
+        for (int it = 0; it < PF_ITERS; ++it) {
+          simulate_prefill(pool, pdata);
+        }
+        auto t_end = std::chrono::steady_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t_end - t_start).count() / PF_ITERS;
+        best_ms = std::min(best_ms, ms);
+      }
+      if (th == 1) t1 = best_ms;
+
+      double sp = t1 / best_ms;
+      const char* gate_str = (th == 4) ? (sp >= 1.8 ? "PASS >=1.8x" : "FAIL <1.8x") : "-";
+      std::printf("%-12zu %10.2f ms %10.2fx %12s\n", th, best_ms, sp, gate_str);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // P2: Inter-Segment S-Dim Batching Microbenchmark
+  // -------------------------------------------------------------------------
+  std::printf("\n========================================================================================\n");
+  std::printf("P2: Inter-Segment S-Dim Batching Evaluation (13 Segments, S=288)\n");
+  std::printf("========================================================================================\n");
+
+  {
+    const size_t batch = 13;
+    const size_t S = 288;
+    const size_t total_S = batch * S; // 3744
+
+    struct BatchShape {
+      const char* name;
+      size_t N, K;
+    };
+    std::vector<BatchShape> b_cases = {
+        {"QKV GEMM", 1536, 512},
+        {"W1  GEMM", 2048, 512},
+        {"W2  GEMM",  512, 2048},
+    };
+
+    std::printf("%-12s %8s %8s %12s %12s %10s %16s\n",
+                "Layer", "N", "K", "13x Seq (us)", "1x Batch (us)", "Speedup", "Bitwise Match");
+
+    for (const auto& bc : b_cases) {
+      const size_t N = bc.N, K = bc.K;
+      std::vector<uint16_t> W(N * K, 0x3c00);
+      gsv::kern::AmxPanel pa_W = gsv::kern::amx_pack(W.data(), N, K);
+
+      std::vector<std::vector<uint16_t>> X_segs(batch, std::vector<uint16_t>(S * K, 0x3c00));
+      std::vector<uint16_t> X_batch(total_S * K, 0x3c00);
+
+      std::vector<gsv::kern::AmxPanel> pa_X_segs(batch);
+      for (size_t b = 0; b < batch; ++b) {
+        pa_X_segs[b] = gsv::kern::amx_pack(X_segs[b].data(), S, K);
+      }
+      gsv::kern::AmxPanel pa_X_batch = gsv::kern::amx_pack(X_batch.data(), total_S, K);
+
+      std::vector<std::vector<float>> C_segs(batch, std::vector<float>(S * N, 0.0f));
+      std::vector<float> C_batch(total_S * N, 0.0f);
+
+      // Verify bitwise equivalence
+      AMX_SET();
+      for (size_t b = 0; b < batch; ++b) {
+        const size_t nmb = (S + 31) / 32, nnb = (N + 31) / 32;
+        for (size_t mb = 0; mb < nmb; ++mb) {
+          for (size_t nb = 0; nb < nnb; ++nb) {
+            bench_amx_tile_fn(pa_X_segs[b].data(), pa_W.data(), C_segs[b].data(), S, N, K, mb, nb);
+          }
+        }
+      }
+      {
+        const size_t nmb = (total_S + 31) / 32, nnb = (N + 31) / 32;
+        for (size_t mb = 0; mb < nmb; ++mb) {
+          for (size_t nb = 0; nb < nnb; ++nb) {
+            bench_amx_tile_fn(pa_X_batch.data(), pa_W.data(), C_batch.data(), total_S, N, K, mb, nb);
+          }
+        }
+      }
+      AMX_CLR();
+
+      int diff_segs = 0;
+      for (size_t b = 0; b < batch; ++b) {
+        if (std::memcmp(C_segs[b].data(), C_batch.data() + b * S * N, S * N * sizeof(float)) != 0) {
+          diff_segs++;
+        }
+      }
+
+      // Timing
+      const int B_ITERS = 20;
+      double seq_us = 1e30, bat_us = 1e30;
+      for (int rd = 0; rd < 4; ++rd) {
+        auto t0 = std::chrono::steady_clock::now();
+        for (int it = 0; it < B_ITERS; ++it) {
+          AMX_SET();
+          for (size_t b = 0; b < batch; ++b) {
+            const size_t nmb = (S + 31) / 32, nnb = (N + 31) / 32;
+            for (size_t mb = 0; mb < nmb; ++mb) {
+              for (size_t nb = 0; nb < nnb; ++nb) {
+                bench_amx_tile_fn(pa_X_segs[b].data(), pa_W.data(), C_segs[b].data(), S, N, K, mb, nb);
+              }
+            }
+          }
+          AMX_CLR();
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / B_ITERS;
+        seq_us = std::min(seq_us, us);
+      }
+
+      for (int rd = 0; rd < 4; ++rd) {
+        auto t0 = std::chrono::steady_clock::now();
+        for (int it = 0; it < B_ITERS; ++it) {
+          AMX_SET();
+          const size_t nmb = (total_S + 31) / 32, nnb = (N + 31) / 32;
+          for (size_t mb = 0; mb < nmb; ++mb) {
+            for (size_t nb = 0; nb < nnb; ++nb) {
+              bench_amx_tile_fn(pa_X_batch.data(), pa_W.data(), C_batch.data(), total_S, N, K, mb, nb);
+            }
+          }
+          AMX_CLR();
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / B_ITERS;
+        bat_us = std::min(bat_us, us);
+      }
+
+      double b_sp = seq_us / bat_us;
+      std::printf("%-12s %8zu %8zu %10.2f us %10.2f us %9.2fx %16s\n",
+                  bc.name, N, K, seq_us, bat_us, b_sp, diff_segs == 0 ? "100% BIT-EXACT" : "DIFF");
+    }
+  }
+#endif
+
   std::printf("========================================================================================\n\n");
 
   return 0;
