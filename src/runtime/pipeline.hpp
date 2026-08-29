@@ -54,7 +54,6 @@ struct PipelineOptions {
   std::string timing_csv;  // D2: per-segment 三阶段耗时 CSV 路径 (空=不写)
   std::string sovits_in_dump;  // SoVITS专攻: 全链后快照落盘路径 (空=不存)
   bool ar_fp16_all = false;   // AR KV cache + GEMV fp16 (--fp16-all 最快档; 默认关)
-  bool ar_kv_reuse = false;   // K1: AR prompt KV 跨段复用 (--kv-reuse; 默认关)
   bool ar_splitk = false;     // E18: AR decode split-K 多核化 (--ar-sk; 默认关)
   bool sovits_amx = false; // E5-P2: SoVITS conv 接入 AMX 后端 (--amx; 默认关)
   // E4: AR 采样对齐 python (--sample; 空=贪心默认, golden 位级口径)

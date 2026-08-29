@@ -67,7 +67,6 @@ void printHelp(const char* argv0) {
       "  --overlap         流水重叠模式: AR(N+1) ‖ SoVITS(N) (数值同串行)\n"
       "  --timing-csv F    per-segment 三阶段耗时 CSV 输出路径\n"
       "  --amx             SoVITS conv 启用 AMX fp16 GEMM 后端(实验; 默认关)\n"
-      "  --kv-reuse        实验诊断; 仅在完全相同 prompt+text 重复合成时命中(位级一致), 长文本多段不同文本场景无收益(掩码语义)\n"
       "  --fp16-all        AR KV cache + GEMV 均启用 fp16 (实验开关; 默认关)\n"
       "  --ar-sk           AR decode 启用 split-K 多核并行 (实验开关; 默认关)\n"
       "  --sample          AR 采样对齐 python(top_k=15/pen=1.35, 根治长文本复读; 默认贪心=位级口径)\n"
@@ -155,8 +154,6 @@ int main(int argc, char** argv) {
       opt.ar_fp16_all = true;
     } else if (a == "--ar-sk") {
       opt.ar_splitk = true;
-    } else if (a == "--kv-reuse") {
-      opt.ar_kv_reuse = true;
     } else if (a == "--sample") {
       // E4: python 口径采样(top_k=15/pen=1.35) 根治长段贪心复读
       opt.ar_sample_on = true;
