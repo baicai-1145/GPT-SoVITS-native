@@ -12,6 +12,7 @@
 // 用法: ./amx_bench [--reps N]
 #include "kern/accel.hpp"
 #include "kern/gemv_fmlal.hpp"
+#include "kern/kern.hpp"
 #include "runtime/threadpool.hpp"
 #if defined(GSV_AMX_GEMM)
 #include "kern/gemm_f16_amx.hpp"
@@ -886,6 +887,415 @@ int main(int argc, char** argv) {
     std::printf("  1T: %6.3f ms (BW: %6.1f GB/s)\n", sn1, (total_stream_bytes / (sn1 * 1e-3)) / 1e9);
     std::printf("  2T: %6.3f ms (BW: %6.1f GB/s, Speedup: %.2fx)\n", sn2, (total_stream_bytes / (sn2 * 1e-3)) / 1e9, sn1 / sn2);
     std::printf("  4T: %6.3f ms (BW: %6.1f GB/s, Speedup: %.2fx)\n", sn4, (total_stream_bytes / (sn4 * 1e-3)) / 1e9, sn1 / sn4);
+  }
+
+  // -------------------------------------------------------------------------
+  // P0: SDPA Head-Parallel Microbenchmark (E19: 1T / 2T / 4T persistent pool)
+  // -------------------------------------------------------------------------
+  std::printf("\n========================================================================================\n");
+  std::printf("P0: SDPA Head-Parallel Microbenchmark (E19: 1T / 2T / 4T Persistent P-Core Pool)\n");
+  std::printf("========================================================================================\n");
+
+  auto dot_f32_bench = [](const float* qv, const float* kv, size_t HD) -> float {
+    float32x4_t a0 = vdupq_n_f32(0.f);
+    float32x4_t a1 = vdupq_n_f32(0.f);
+    float32x4_t a2 = vdupq_n_f32(0.f);
+    float32x4_t a3 = vdupq_n_f32(0.f);
+    size_t e = 0;
+    for (; e + 16 <= HD; e += 16) {
+      a0 = vfmaq_f32(a0, vld1q_f32(qv + e + 0),  vld1q_f32(kv + e + 0));
+      a1 = vfmaq_f32(a1, vld1q_f32(qv + e + 4),  vld1q_f32(kv + e + 4));
+      a2 = vfmaq_f32(a2, vld1q_f32(qv + e + 8),  vld1q_f32(kv + e + 8));
+      a3 = vfmaq_f32(a3, vld1q_f32(qv + e + 12), vld1q_f32(kv + e + 12));
+    }
+    float32x4_t s01 = vaddq_f32(a0, a1);
+    float32x4_t s23 = vaddq_f32(a2, a3);
+    float32x4_t s = vaddq_f32(s01, s23);
+    float32x2_t lo = vget_low_f32(s);
+    float32x2_t hi = vget_high_f32(s);
+    float32x2_t sum2 = vadd_f32(lo, hi);
+    float32x2_t sum1 = vpadd_f32(sum2, sum2);
+    float dot = vget_lane_f32(sum1, 0);
+    for (; e < HD; ++e) dot += qv[e] * kv[e];
+    return dot;
+  };
+
+  auto dot_f16kv_bench = [](const float* qv, const uint16_t* k16, size_t HD) -> float {
+    float32x4_t a0 = vdupq_n_f32(0.f);
+    float32x4_t a1 = vdupq_n_f32(0.f);
+    float32x4_t a2 = vdupq_n_f32(0.f);
+    float32x4_t a3 = vdupq_n_f32(0.f);
+    size_t e = 0;
+    for (; e + 16 <= HD; e += 16) {
+      float16x8_t h0 = vld1q_f16(reinterpret_cast<const __fp16*>(k16 + e));
+      float16x8_t h1 = vld1q_f16(reinterpret_cast<const __fp16*>(k16 + e + 8));
+      a0 = vfmaq_f32(a0, vld1q_f32(qv + e + 0),  vcvt_f32_f16(vget_low_f16(h0)));
+      a1 = vfmaq_f32(a1, vld1q_f32(qv + e + 4),  vcvt_f32_f16(vget_high_f16(h0)));
+      a2 = vfmaq_f32(a2, vld1q_f32(qv + e + 8),  vcvt_f32_f16(vget_low_f16(h1)));
+      a3 = vfmaq_f32(a3, vld1q_f32(qv + e + 12), vcvt_f32_f16(vget_high_f16(h1)));
+    }
+    float32x4_t s01 = vaddq_f32(a0, a1);
+    float32x4_t s23 = vaddq_f32(a2, a3);
+    float32x4_t s = vaddq_f32(s01, s23);
+    float32x2_t lo = vget_low_f32(s);
+    float32x2_t hi = vget_high_f32(s);
+    float32x2_t sum2 = vadd_f32(lo, hi);
+    float32x2_t sum1 = vpadd_f32(sum2, sum2);
+    float dot = vget_lane_f32(sum1, 0);
+    for (; e < HD; ++e) {
+      __fp16 h;
+      __builtin_memcpy(&h, k16 + e, 2);
+      dot += qv[e] * static_cast<float>(h);
+    }
+    return dot;
+  };
+
+  auto accum_f32_bench = [](float* ov, const float* vv, float p, size_t HD) {
+    float32x4_t p4 = vdupq_n_f32(p);
+    size_t e = 0;
+    for (; e + 16 <= HD; e += 16) {
+      float32x4_t a0 = vmulq_f32(p4, vld1q_f32(vv + e + 0));
+      float32x4_t a1 = vmulq_f32(p4, vld1q_f32(vv + e + 4));
+      float32x4_t a2 = vmulq_f32(p4, vld1q_f32(vv + e + 8));
+      float32x4_t a3 = vmulq_f32(p4, vld1q_f32(vv + e + 12));
+      vst1q_f32(ov + e + 0,  vaddq_f32(vld1q_f32(ov + e + 0),  a0));
+      vst1q_f32(ov + e + 4,  vaddq_f32(vld1q_f32(ov + e + 4),  a1));
+      vst1q_f32(ov + e + 8,  vaddq_f32(vld1q_f32(ov + e + 8),  a2));
+      vst1q_f32(ov + e + 12, vaddq_f32(vld1q_f32(ov + e + 12), a3));
+    }
+    for (; e < HD; ++e) ov[e] += p * vv[e];
+  };
+
+  auto accum_f16kv_bench = [](float* ov, const uint16_t* v16, float p, size_t HD) {
+    float32x4_t p4 = vdupq_n_f32(p);
+    size_t e = 0;
+    for (; e + 16 <= HD; e += 16) {
+      float16x8_t h0 = vld1q_f16(reinterpret_cast<const __fp16*>(v16 + e));
+      float16x8_t h1 = vld1q_f16(reinterpret_cast<const __fp16*>(v16 + e + 8));
+      float32x4_t a0 = vmulq_f32(p4, vcvt_f32_f16(vget_low_f16(h0)));
+      float32x4_t a1 = vmulq_f32(p4, vcvt_f32_f16(vget_high_f16(h0)));
+      float32x4_t a2 = vmulq_f32(p4, vcvt_f32_f16(vget_low_f16(h1)));
+      float32x4_t a3 = vmulq_f32(p4, vcvt_f32_f16(vget_high_f16(h1)));
+      vst1q_f32(ov + e + 0,  vaddq_f32(vld1q_f32(ov + e + 0),  a0));
+      vst1q_f32(ov + e + 4,  vaddq_f32(vld1q_f32(ov + e + 4),  a1));
+      vst1q_f32(ov + e + 8,  vaddq_f32(vld1q_f32(ov + e + 8),  a2));
+      vst1q_f32(ov + e + 12, vaddq_f32(vld1q_f32(ov + e + 12), a3));
+    }
+    for (; e < HD; ++e) {
+      __fp16 h;
+      __builtin_memcpy(&h, v16 + e, 2);
+      ov[e] += p * static_cast<float>(h);
+    }
+  };
+
+  struct SdpaBenchCase {
+    const char* name;
+    size_t H;
+    size_t HD;
+    size_t S;
+  };
+
+  std::vector<SdpaBenchCase> sdpa_cases = {
+      {"sdpa_h16_s280", 16, 32, 280},
+      {"sdpa_h16_s560", 16, 32, 560},
+      {"sdpa_h24_s280", 24, 32, 280},
+      {"sdpa_h24_s560", 24, 32, 560},
+  };
+
+  const int SDPA_ROUNDS = 20;
+  const int SDPA_ITERS = 200;
+
+  std::printf("\n--- Mode 1: FP32 KV Cache (Single Layer SDPA) ---\n");
+  std::printf("%-20s %6s %6s %10s %10s %10s %8s %8s %7s %7s %8s\n",
+              "Shape", "H", "S", "1T (us)", "2T (us)", "4T (us)",
+              "BW-1T", "BW-4T", "2T/1T", "4T/1T", "Gate>=2.2x");
+
+  for (const auto& sc : sdpa_cases) {
+    const size_t H = sc.H, HD = sc.HD, S = sc.S, D = H * HD;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(HD));
+    const size_t kv_bytes = 2 * S * D * sizeof(float); // K + V read
+
+    std::vector<float> q(D);
+    std::vector<float> kcache(S * D);
+    std::vector<float> vcache(S * D);
+    std::vector<float> attn(D);
+    for (size_t i = 0; i < D; ++i) q[i] = (static_cast<float>(rng() % 1000) - 500.f) * 0.001f;
+    for (size_t i = 0; i < S * D; ++i) kcache[i] = (static_cast<float>(rng() % 1000) - 500.f) * 0.001f;
+    for (size_t i = 0; i < S * D; ++i) vcache[i] = (static_cast<float>(rng() % 1000) - 500.f) * 0.001f;
+
+    std::vector<std::vector<float>> thread_scores(4, std::vector<float>(S));
+
+    auto run_sdpa = [&](FastPool& pool, size_t /*n_threads*/) -> double {
+      double best_us = 1e30;
+      for (int rd = 0; rd < SDPA_ROUNDS; ++rd) {
+        auto t0 = now_us();
+        for (int it = 0; it < SDPA_ITERS; ++it) {
+          pool.parallel_run([&](size_t tid, size_t num_threads) {
+            const size_t h0 = tid * (H / num_threads);
+            const size_t h1 = (tid + 1) * (H / num_threads);
+            float* scores = thread_scores[tid].data();
+            for (size_t h = h0; h < h1; ++h) {
+              const float* qv = q.data() + h * HD;
+              for (size_t k = 0; k < S; ++k) {
+                float dot = dot_f32_bench(qv, kcache.data() + k * D + h * HD, HD);
+                scores[k] = dot * scale;
+              }
+              gsv::kern::softmax(scores, scores, S);
+              float* ov = attn.data() + h * HD;
+              std::memset(ov, 0, HD * sizeof(float));
+              for (size_t k = 0; k < S; ++k) {
+                accum_f32_bench(ov, vcache.data() + k * D + h * HD, scores[k], HD);
+              }
+            }
+          });
+        }
+        auto t1 = now_us();
+        best_us = std::min(best_us, (t1 - t0) / SDPA_ITERS);
+      }
+      return best_us;
+    };
+
+    double t1_us = run_sdpa(pool1, 1);
+    double t2_us = run_sdpa(pool2, 2);
+    double t4_us = run_sdpa(pool4, 4);
+
+    double bw1 = (static_cast<double>(kv_bytes) / (t1_us * 1e-6)) / 1e9;
+    double bw4 = (static_cast<double>(kv_bytes) / (t4_us * 1e-6)) / 1e9;
+    double sp2 = t1_us / t2_us;
+    double sp4 = t1_us / t4_us;
+    bool pass = sp4 >= 2.2;
+
+    std::printf("%-20s %6zu %6zu %10.2f %10.2f %10.2f %7.1fG %7.1fG %6.2fx %6.2fx %8s\n",
+                sc.name, H, S, t1_us, t2_us, t4_us, bw1, bw4, sp2, sp4, pass ? "PASS" : "FAIL");
+  }
+
+  std::printf("\n--- Mode 2: FP16 KV Cache (Single Layer SDPA) ---\n");
+  std::printf("%-20s %6s %6s %10s %10s %10s %8s %8s %7s %7s %8s\n",
+              "Shape", "H", "S", "1T (us)", "2T (us)", "4T (us)",
+              "BW-1T", "BW-4T", "2T/1T", "4T/1T", "Gate>=2.2x");
+
+  for (const auto& sc : sdpa_cases) {
+    const size_t H = sc.H, HD = sc.HD, S = sc.S, D = H * HD;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(HD));
+    const size_t kv_bytes = 2 * S * D * sizeof(uint16_t); // K + V read fp16
+
+    std::vector<float> q(D);
+    std::vector<uint16_t> kcache16(S * D);
+    std::vector<uint16_t> vcache16(S * D);
+    std::vector<float> attn(D);
+    for (size_t i = 0; i < D; ++i) q[i] = (static_cast<float>(rng() % 1000) - 500.f) * 0.001f;
+    for (size_t i = 0; i < S * D; ++i) kcache16[i] = static_cast<uint16_t>(rng() % 4096);
+    for (size_t i = 0; i < S * D; ++i) vcache16[i] = static_cast<uint16_t>(rng() % 4096);
+
+    std::vector<std::vector<float>> thread_scores(4, std::vector<float>(S));
+
+    auto run_sdpa16 = [&](FastPool& pool, size_t /*n_threads*/) -> double {
+      double best_us = 1e30;
+      for (int rd = 0; rd < SDPA_ROUNDS; ++rd) {
+        auto t0 = now_us();
+        for (int it = 0; it < SDPA_ITERS; ++it) {
+          pool.parallel_run([&](size_t tid, size_t num_threads) {
+            const size_t h0 = tid * (H / num_threads);
+            const size_t h1 = (tid + 1) * (H / num_threads);
+            float* scores = thread_scores[tid].data();
+            for (size_t h = h0; h < h1; ++h) {
+              const float* qv = q.data() + h * HD;
+              for (size_t k = 0; k < S; ++k) {
+                float dot = dot_f16kv_bench(qv, kcache16.data() + k * D + h * HD, HD);
+                scores[k] = dot * scale;
+              }
+              gsv::kern::softmax(scores, scores, S);
+              float* ov = attn.data() + h * HD;
+              std::memset(ov, 0, HD * sizeof(float));
+              for (size_t k = 0; k < S; ++k) {
+                accum_f16kv_bench(ov, vcache16.data() + k * D + h * HD, scores[k], HD);
+              }
+            }
+          });
+        }
+        auto t1 = now_us();
+        best_us = std::min(best_us, (t1 - t0) / SDPA_ITERS);
+      }
+      return best_us;
+    };
+
+    double t1_us = run_sdpa16(pool1, 1);
+    double t2_us = run_sdpa16(pool2, 2);
+    double t4_us = run_sdpa16(pool4, 4);
+
+    double bw1 = (static_cast<double>(kv_bytes) / (t1_us * 1e-6)) / 1e9;
+    double bw4 = (static_cast<double>(kv_bytes) / (t4_us * 1e-6)) / 1e9;
+    double sp2 = t1_us / t2_us;
+    double sp4 = t1_us / t4_us;
+    bool pass = sp4 >= 2.2;
+
+    std::printf("%-20s %6zu %6zu %10.2f %10.2f %10.2f %7.1fG %7.1fG %6.2fx %6.2fx %8s\n",
+                sc.name, H, S, t1_us, t2_us, t4_us, bw1, bw4, sp2, sp4, pass ? "PASS" : "FAIL");
+  }
+
+  // 24-layer Full AR Decode SDPA Extrapolation
+  std::printf("\n--- Mode 3: 24-Layer Full AR Decode SDPA (24 Layers x SDPA) ---\n");
+  for (const auto& sc : sdpa_cases) {
+    if (sc.H != 16) continue;
+    const size_t H = sc.H, HD = sc.HD, S = sc.S, D = H * HD;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(HD));
+    std::vector<float> q(D);
+    std::vector<std::vector<uint16_t>> kcache16(24, std::vector<uint16_t>(S * D));
+    std::vector<std::vector<uint16_t>> vcache16(24, std::vector<uint16_t>(S * D));
+    std::vector<float> attn(D);
+    std::vector<std::vector<float>> thread_scores(4, std::vector<float>(S));
+
+    auto run_sdpa24 = [&](FastPool& pool, size_t /*n_threads*/) -> double {
+      double best_ms = 1e30;
+      for (int rd = 0; rd < 10; ++rd) {
+        auto t0 = now_ms();
+        for (int it = 0; it < 50; ++it) {
+          for (size_t l = 0; l < 24; ++l) {
+            pool.parallel_run([&](size_t tid, size_t num_threads) {
+              const size_t h0 = tid * (H / num_threads);
+              const size_t h1 = (tid + 1) * (H / num_threads);
+              float* scores = thread_scores[tid].data();
+              for (size_t h = h0; h < h1; ++h) {
+                const float* qv = q.data() + h * HD;
+                for (size_t k = 0; k < S; ++k) {
+                  float dot = dot_f16kv_bench(qv, kcache16[l].data() + k * D + h * HD, HD);
+                  scores[k] = dot * scale;
+                }
+                gsv::kern::softmax(scores, scores, S);
+                float* ov = attn.data() + h * HD;
+                std::memset(ov, 0, HD * sizeof(float));
+                for (size_t k = 0; k < S; ++k) {
+                  accum_f16kv_bench(ov, vcache16[l].data() + k * D + h * HD, scores[k], HD);
+                }
+              }
+            });
+          }
+        }
+        auto t1 = now_ms();
+        best_ms = std::min(best_ms, (t1 - t0) / 50.0);
+      }
+      return best_ms;
+    };
+
+    double t1_ms = run_sdpa24(pool1, 1);
+    double t2_ms = run_sdpa24(pool2, 2);
+    double t4_ms = run_sdpa24(pool4, 4);
+
+    std::printf("24-Layer SDPA (FP16 KV, S=%zu): 1T=%.3f ms  2T=%.3f ms (%.2fx)  4T=%.3f ms (%.2fx)  [Gate: %s]\n",
+                S, t1_ms, t2_ms, t1_ms / t2_ms, t4_ms, t1_ms / t4_ms, (t1_ms / t4_ms >= 2.2) ? "PASS" : "FAIL");
+  }
+  // -------------------------------------------------------------------------
+  // P2: Elementwise Fusion Microbenchmarks
+  // -------------------------------------------------------------------------
+  std::printf("\n========================================================================================\n");
+  std::printf("P2: Elementwise Fusion Microbenchmark (W1 Reduce+Bias+ReLU+F16 & KV Write)\n");
+  std::printf("========================================================================================\n");
+
+  {
+    const size_t FF = 2048;
+    std::vector<float> part0(FF, 1.0f), part1(FF, 0.5f), part2(FF, -0.2f), part3(FF, 0.1f);
+    const float* parts[4] = {part0.data(), part1.data(), part2.data(), part3.data()};
+    std::vector<float> b1(FF, -0.1f);
+    std::vector<float> ff_out(FF);
+    std::vector<uint16_t> ff16_out(FF);
+
+    // Unfused baseline (4 separate steps)
+    auto unfused_w1 = [&](size_t ff0, size_t ff1) {
+      const size_t ff_len = ff1 - ff0;
+      float* dst = ff_out.data() + ff0;
+      const float* p0 = parts[0] + ff0;
+      const float* p1 = parts[1] + ff0;
+      const float* p2 = parts[2] + ff0;
+      const float* p3 = parts[3] + ff0;
+      for (size_t i = 0; i < ff_len; ++i) dst[i] = p0[i] + p1[i] + p2[i] + p3[i];
+      for (size_t i = ff0; i < ff1; ++i) ff_out[i] += b1[i];
+      gsv::kern::relu(ff_out.data() + ff0, ff_out.data() + ff0, ff_len);
+      gsv::kern::f32_to_f16(ff_out.data() + ff0, ff16_out.data() + ff0, ff_len);
+    };
+
+    // Fused kernel (single pass SIMD 8-lane)
+    auto fused_w1 = [&](size_t ff0, size_t ff1) {
+      const float* p0 = parts[0];
+      const float* p1 = parts[1];
+      const float* p2 = parts[2];
+      const float* p3 = parts[3];
+      const float* b = b1.data();
+      float* dst_f32 = ff_out.data();
+      uint16_t* dst_f16 = ff16_out.data();
+      const float32x4_t vzero = vdupq_n_f32(0.0f);
+      size_t i = ff0;
+      for (; i + 8 <= ff1; i += 8) {
+        float32x4_t s0_0 = vaddq_f32(vld1q_f32(p0 + i),     vld1q_f32(p1 + i));
+        float32x4_t s0_1 = vaddq_f32(vld1q_f32(p2 + i),     vld1q_f32(p3 + i));
+        float32x4_t s0   = vaddq_f32(vaddq_f32(s0_0, s0_1), vld1q_f32(b + i));
+        s0 = vmaxq_f32(s0, vzero);
+        vst1q_f32(dst_f32 + i, s0);
+
+        float32x4_t s1_0 = vaddq_f32(vld1q_f32(p0 + i + 4), vld1q_f32(p1 + i + 4));
+        float32x4_t s1_1 = vaddq_f32(vld1q_f32(p2 + i + 4), vld1q_f32(p3 + i + 4));
+        float32x4_t s1   = vaddq_f32(vaddq_f32(s1_0, s1_1), vld1q_f32(b + i + 4));
+        s1 = vmaxq_f32(s1, vzero);
+        vst1q_f32(dst_f32 + i + 4, s1);
+
+        float16x4_t h0 = vcvt_f16_f32(s0);
+        float16x4_t h1 = vcvt_f16_f32(s1);
+        float16x8_t h01 = vcombine_f16(h0, h1);
+        vst1q_u16(dst_f16 + i, vreinterpretq_u16_f16(h01));
+      }
+      for (; i < ff1; ++i) {
+        float s = (p0[i] + p1[i] + p2[i] + p3[i]) + b[i];
+        if (s < 0.0f) s = 0.0f;
+        dst_f32[i] = s;
+        __fp16 hh = static_cast<__fp16>(s);
+        std::memcpy(dst_f16 + i, &hh, sizeof(hh));
+      }
+    };
+
+    // Verify correctness
+    std::vector<uint16_t> ref_f16(FF);
+    unfused_w1(0, FF);
+    ref_f16 = ff16_out;
+    std::fill(ff16_out.begin(), ff16_out.end(), 0);
+    fused_w1(0, FF);
+    int diff_count = 0;
+    for (size_t i = 0; i < FF; ++i) {
+      if (ref_f16[i] != ff16_out[i]) diff_count++;
+    }
+    std::printf("W1 Fusion Correctness: diff_count=%d / %zu (%s)\n",
+                diff_count, FF, diff_count == 0 ? "EXACT MATCH" : "DIFF");
+
+    // Benchmark 4 threads x 24 layers
+    const int FUSION_ITERS = 1000;
+    double t_unfused = 0, t_fused = 0;
+    {
+      auto t0 = now_us();
+      for (int it = 0; it < FUSION_ITERS; ++it) {
+        pool4.parallel_run([&](size_t tid, size_t nth) {
+          const size_t ff0 = tid * FF / nth;
+          const size_t ff1 = (tid + 1) * FF / nth;
+          for (int l = 0; l < 24; ++l) unfused_w1(ff0, ff1);
+        });
+      }
+      auto t1 = now_us();
+      t_unfused = (t1 - t0) / FUSION_ITERS;
+    }
+    {
+      auto t0 = now_us();
+      for (int it = 0; it < FUSION_ITERS; ++it) {
+        pool4.parallel_run([&](size_t tid, size_t nth) {
+          const size_t ff0 = tid * FF / nth;
+          const size_t ff1 = (tid + 1) * FF / nth;
+          for (int l = 0; l < 24; ++l) fused_w1(ff0, ff1);
+        });
+      }
+      auto t1 = now_us();
+      t_fused = (t1 - t0) / FUSION_ITERS;
+    }
+
+    double sp = t_unfused / t_fused;
+    double gain_pct = (1.0 - t_fused / t_unfused) * 100.0;
+    std::printf("24-Layer W1 Elementwise: Unfused=%.2f us  Fused=%.2f us  Speedup=%.2fx (Gain: +%.1f%%, Gate: %s)\n",
+                t_unfused, t_fused, sp, gain_pct, gain_pct >= 5.0 ? "PASS >=5%" : "FAIL <5%");
   }
   std::printf("========================================================================================\n\n");
 
