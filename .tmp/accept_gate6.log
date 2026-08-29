@@ -1,0 +1,4 @@
+== 门6 c2_pairs_run + 快照对拍 ==
+c2_pairs_run rc=0
+prompt_codes vs golden: EXACT (199 码)
+pre/post-T6 textfront+AR 快照: BITWISE EQUAL

@@ -1,0 +1,4 @@
+输出: .tmp/f1work/on_vo_mimiTomo_ly_hutao_bedroom_01.wav (8.18 秒 @32000 Hz, 1 段)
+参考: prompt_semantic=155, ge/ge_text 已构建
+  段00 phones=23 tokens=197 ar=1748ms voc=1174ms eos=1
+计时: load=281ms infer=3908ms RTF=0.478 首包≈3908ms

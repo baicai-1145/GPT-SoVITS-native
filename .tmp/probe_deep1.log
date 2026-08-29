@@ -1,0 +1,16 @@
+[refenc-timing] spectral=2.1ms temporal_conv=65.2ms qkv_lin=0.5ms attn_core=15.6ms attfc=0.1ms fc_pool=1.3ms T=369
+[cond-timing] spectrogram=3.0ms transpose=0.1ms ref_enc=84.8ms svproj_prelu=1.3ms ge_to512=0.0ms TOTAL=89.2ms frames=369
+[hubert-sdpa] sdpa_total=440.1ms T=399 layers=12
+[hubert-conv] total_gemm=255.4ms
+[hubert-conv] L0 c1*len127894 k10s5 -> out[c512,len25577] fmlal=11.8ms
+[hubert-conv] L1 c512*len25577 k3s2 -> out[c512,len12788] fmlal=129.0ms
+[hubert-conv] L2 c512*len12788 k3s2 -> out[c512,len6393] fmlal=60.9ms
+[hubert-conv] L3 c512*len6393 k3s2 -> out[c512,len3196] fmlal=30.2ms
+[hubert-conv] L4 c512*len3196 k3s2 -> out[c512,len1597] fmlal=15.5ms
+[hubert-conv] L5 c512*len1597 k2s2 -> out[c512,len798] fmlal=5.4ms
+[hubert-conv] L6 c512*len798 k2s2 -> out[c512,len399] fmlal=2.7ms
+[ref-timing] sv.forward3=949ms(737帧) cond=92ms hubert.run=955ms(T=399) 前处理(resample+fbank+load)=13ms 合计=2009ms
+输出: .tmp/e13_out.wav (2.90 秒 @32000 Hz, 1 段)
+参考: prompt_semantic=199, ge/ge_text 已构建
+  段00 phones=23 tokens=65 ar=621ms voc=334ms eos=1
+计时: load=3715ms infer=3266ms RTF=1.126 首包≈3266ms

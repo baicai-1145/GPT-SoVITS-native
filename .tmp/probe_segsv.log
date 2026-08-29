@@ -1,0 +1,15 @@
+[sv-inner] conv2d_sgemm_total=0.5ms conv2d_f16_fmlal_total=218.1ms aff_w1=4.9ms(18次) aff_w2=5.6ms blk_conv1=6.3ms(S=58960) T=737
+[sv-f16rank] #0 x4     70.9ms(cum   70.9) 192,40,369 k1s1->512
+[sv-f16rank] #1 x3     58.3ms(cum  129.2) 96,80,737 k1s1->256
+[sv-f16rank] #2 x12     48.8ms(cum  178.0) 24,80,737 k3s3->24
+[sv-f16rank] #3 x1     14.7ms(cum  192.7) 64,80,737 k1s1->256
+[sv-f16rank] #4 x1      9.1ms(cum  201.7) 256,80,737 k1s1->192
+[sv-f16rank] #5 x1      8.7ms(cum  210.4) 1024,20,185 k1s1->768
+[sv-f16rank] #6 x1      7.7ms(cum  218.1) 512,40,369 k1s1->384
+[sv-seg] stem=2.9 stage1=374.5 stage2=262.0 stage3=199.3 stage4=74.4 l3ds_fuse34_emb=3459.0ms
+[ref-timing] sv.forward3=4372ms(737帧) cond=92ms hubert.run=983ms(T=399) 前处理(resample+fbank+load)=13ms 合计=5460ms
+[ref-timing] extract_latent=84ms(Tq=199) = open1 + proj1 + rvq83
+输出: .tmp/e13_out.wav (2.50 秒 @32000 Hz, 1 段)
+参考: prompt_semantic=199, ge/ge_text 已构建
+  段00 phones=23 tokens=55 ar=569ms voc=299ms eos=1
+计时: load=262ms infer=6668ms RTF=2.667 首包≈6668ms

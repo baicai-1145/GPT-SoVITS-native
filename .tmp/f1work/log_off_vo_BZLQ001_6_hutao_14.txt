@@ -1,0 +1,4 @@
+输出: .tmp/f1work/off_vo_BZLQ001_6_hutao_14.wav (6.26 秒 @32000 Hz, 1 段)
+参考: prompt_semantic=108, ge/ge_text 已构建
+  段00 phones=23 tokens=149 ar=1054ms voc=790ms eos=1
+计时: load=194ms infer=3566ms RTF=0.570 首包≈3566ms

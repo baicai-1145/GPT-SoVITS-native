@@ -1,0 +1,4 @@
+输出: .tmp/f1work/on_vo_HTLQ001_3_hutao_16.wav (2.70 秒 @32000 Hz, 1 段)
+参考: prompt_semantic=199, ge/ge_text 已构建
+  段00 phones=23 tokens=60 ar=650ms voc=351ms eos=1
+计时: load=252ms infer=2083ms RTF=0.771 首包≈2082ms

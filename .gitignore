@@ -16,3 +16,16 @@ tests/regen/
 
 # BERT fixtures(由 tools/export_bert_fixtures.py 再生)
 tests/golden_local/
+
+# E22: 本地性能工具与 bench 档案(决策者裁定: 本地保留, 不入库)
+tools/bench/
+tools/amx_batch_bench.cpp
+tools/ar_hot_test.cpp
+tools/bench_bw.cpp
+tools/bench_gemv.cpp
+tools/bench_pool.cpp
+tools/bench_sdpa.cpp
+tools/bench_topk.cpp
+tools/prefill_bench.cpp
+tools/s2_tile_chain_bench.cpp
+tools/sdpa_bench.cpp

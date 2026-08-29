@@ -1,0 +1,7 @@
+== 门2 GSV_RVQ_DUMP codes 段对比 ==
+# 注: dump=codes(Tq*8B)+proj; proj 随 --amx-enc 的 HuBERT tile 累加序呈 1e-3 级允许差,
+#      故位级门只对 codes 段。
+sizes: base=612920 amx=612920 Tq=199 codes_bytes=1592
+base codes md5: 43c52d14f179b3465af3501af3e28ad9
+amx  codes md5: 43c52d14f179b3465af3501af3e28ad9
+CMP: BITWISE EQUAL

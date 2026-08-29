@@ -1,0 +1,8 @@
+== [f2c/base] 12:28:38 load=2.31 3.32 3.47
+[hubert-sdpa] sdpa_total=444.0ms T=399 layers=12
+[ref-timing] sv.forward3=918ms(737帧) cond=91ms hubert.run=915ms(T=399) 前处理(resample+fbank+load)=13ms 合计=1937ms
+[ref-timing] extract_latent=80ms(Tq=199) = open1 + proj1 + rvq78
+输出: .tmp/f2_base_f2c.wav (2.70 秒 @32000 Hz, 1 段)
+参考: prompt_semantic=199, ge/ge_text 已构建
+  段00 phones=23 tokens=60 ar=540ms voc=277ms eos=1
+计时: load=233ms infer=3050ms RTF=1.130 首包≈3050ms

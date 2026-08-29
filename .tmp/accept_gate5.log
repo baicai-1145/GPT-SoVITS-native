@@ -1,0 +1,21 @@
+Test project /Volumes/2T/wt-gsv/E13/build
+    Start 1: test_gsv_header
+1/8 Test #1: test_gsv_header ..................   Passed    0.06 sec
+    Start 2: test_gsv_loader
+2/8 Test #2: test_gsv_loader ..................   Passed    0.07 sec
+    Start 3: test_kern
+3/8 Test #3: test_kern ........................   Passed    0.68 sec
+    Start 4: test_accel
+4/8 Test #4: test_accel .......................   Passed    0.01 sec
+    Start 5: test_bert_amx
+5/8 Test #5: test_bert_amx ....................   Passed    1.07 sec
+    Start 6: test_langsegment
+6/8 Test #6: test_langsegment .................   Passed    0.20 sec
+    Start 7: test_ar_unit
+7/8 Test #7: test_ar_unit .....................   Passed    0.95 sec
+    Start 8: test_c1_unit
+8/8 Test #8: test_c1_unit .....................   Passed    0.10 sec
+
+100% tests passed, 0 tests failed out of 8
+
+Total Test time (real) =   3.26 sec

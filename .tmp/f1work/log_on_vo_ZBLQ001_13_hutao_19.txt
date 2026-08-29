@@ -1,0 +1,4 @@
+输出: .tmp/f1work/on_vo_ZBLQ001_13_hutao_19.wav (1.06 秒 @32000 Hz, 1 段)
+参考: prompt_semantic=215, ge/ge_text 已构建
+  段00 phones=23 tokens=19 ar=366ms voc=107ms eos=1
+计时: load=265ms infer=1744ms RTF=1.645 首包≈1743ms

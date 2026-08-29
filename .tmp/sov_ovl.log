@@ -1,0 +1,15 @@
+AR split-K: enabled (实验开关)
+AR fp16: kv=1 gemv=1 (实验开关)
+[ar-timing] T=79 P=199 S=278 steps=63 prefill=139.63ms (hit=0) decode=187.43ms (2.975 ms/tok, CPU=0.75s/0.19s wall, avg 4.0 cores, splitk=1)
+[ar-timing] T=71 P=199 S=270 steps=38 prefill=135.16ms (hit=0) decode=110.14ms (2.898 ms/tok, CPU=0.44s/0.11s wall, avg 4.0 cores, splitk=1)
+[ar-timing] T=71 P=199 S=270 steps=28 prefill=135.91ms (hit=0) decode=78.82ms (2.815 ms/tok, CPU=0.31s/0.08s wall, avg 4.0 cores, splitk=1)
+[ar-timing] T=79 P=199 S=278 steps=52 prefill=137.17ms (hit=0) decode=147.74ms (2.841 ms/tok, CPU=0.59s/0.15s wall, avg 4.0 cores, splitk=1)
+[ar-timing] T=85 P=199 S=284 steps=68 prefill=146.66ms (hit=0) decode=195.30ms (2.872 ms/tok, CPU=0.77s/0.20s wall, avg 4.0 cores, splitk=1)
+输出: /dev/null (11.26 秒 @32000 Hz, 5 段)
+参考: prompt_semantic=199, ge/ge_text 已构建
+  段00 phones=17 tokens=62 ar=396ms voc=297ms eos=1
+  段01 phones=9 tokens=37 ar=246ms voc=147ms eos=1
+  段02 phones=9 tokens=27 ar=215ms voc=104ms eos=1
+  段03 phones=17 tokens=51 ar=285ms voc=208ms eos=1
+  段04 phones=23 tokens=67 ar=348ms voc=292ms eos=1
+计时: load=229ms infer=7327ms RTF=0.651 首包≈5324ms

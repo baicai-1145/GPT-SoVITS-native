@@ -1,0 +1,21 @@
+AR split-K: enabled (实验开关)
+AR fp16: kv=1 gemv=1 (实验开关)
+[ref-timing] sv.forward3=465ms(737帧) cond=9ms hubert.run=403ms(T=399) 前处理(resample+fbank+load)=128ms 并行总耗时=602ms (串行估算=1008ms)
+[ref-timing] extract_latent=3ms(Tq=199) = open0 + proj1 + rvq2
+[pipeline] 警告: 混合/英文段 word2ph(4)!=字符数(5), 该段 BERT 特征置零 (夜色渐深,)
+输出: /dev/null (29.38 秒 @32000 Hz, 13 段)
+参考: prompt_semantic=199, ge/ge_text 已构建
+  段00 phones=23 tokens=63 ar=341ms voc=447ms eos=1
+  段01 phones=9 tokens=37 ar=418ms voc=239ms eos=1
+  段02 phones=9 tokens=37 ar=345ms voc=222ms eos=1
+  段03 phones=19 tokens=48 ar=376ms voc=338ms eos=1
+  段04 phones=17 tokens=66 ar=492ms voc=452ms eos=1
+  段05 phones=8 tokens=29 ar=379ms voc=182ms eos=1
+  段06 phones=13 tokens=37 ar=343ms voc=220ms eos=1
+  段07 phones=23 tokens=74 ar=505ms voc=469ms eos=1
+  段08 phones=23 tokens=63 ar=551ms voc=389ms eos=1
+  段09 phones=17 tokens=51 ar=510ms voc=315ms eos=1
+  段10 phones=9 tokens=32 ar=368ms voc=255ms eos=1
+  段11 phones=17 tokens=45 ar=395ms voc=280ms eos=1
+  段12 phones=19 tokens=55 ar=424ms voc=248ms eos=1
+计时: load=46100ms infer=6513ms RTF=0.222 首包≈1605ms

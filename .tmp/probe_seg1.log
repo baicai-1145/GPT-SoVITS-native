@@ -1,0 +1,15 @@
+[hubert-sdpa] sdpa_total=1048.1ms T=399 layers=12
+[hubert-conv] total_gemm=428.8ms
+[hubert-conv] L0 c1*len127894 k10s5 -> out[c512,len25577] fmlal=15.4ms
+[hubert-conv] L1 c512*len25577 k3s2 -> out[c512,len12788] fmlal=209.1ms
+[hubert-conv] L2 c512*len12788 k3s2 -> out[c512,len6393] fmlal=107.0ms
+[hubert-conv] L3 c512*len6393 k3s2 -> out[c512,len3196] fmlal=51.2ms
+[hubert-conv] L4 c512*len3196 k3s2 -> out[c512,len1597] fmlal=27.9ms
+[hubert-conv] L5 c512*len1597 k2s2 -> out[c512,len798] fmlal=13.3ms
+[hubert-conv] L6 c512*len798 k2s2 -> out[c512,len399] fmlal=5.0ms
+[ref-timing] sv.forward3=1384ms(737帧) cond=187ms hubert.run=1993ms(T=399) 前处理(resample+fbank+load)=14ms 合计=3578ms
+[ref-timing] extract_latent=175ms(Tq=199) = open1 + proj2 + rvq172
+输出: .tmp/e13_out.wav (2.66 秒 @32000 Hz, 1 段)
+参考: prompt_semantic=199, ge/ge_text 已构建
+  段00 phones=23 tokens=59 ar=1053ms voc=572ms eos=1
+计时: load=5768ms infer=5840ms RTF=2.195 首包≈5840ms
