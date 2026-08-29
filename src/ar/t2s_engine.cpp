@@ -320,44 +320,50 @@ inline void gemv_slice_f16x_fmlal_4rows(const uint16_t* w, const uint16_t* xh,
   }
 }
 
-inline void reduce_parts(const float* const* parts, size_t n_parts, float* y, size_t out) {
+inline void reduce_slice(const float* const* parts, size_t n_parts, float* y, size_t r_start, size_t r_end) {
+  const size_t out = r_end - r_start;
+  float* dst = y + r_start;
   if (n_parts == 1) {
-    if (y != parts[0]) std::memcpy(y, parts[0], out * sizeof(float));
+    if (dst != parts[0] + r_start) std::memcpy(dst, parts[0] + r_start, out * sizeof(float));
     return;
   }
   if (n_parts == 2) {
-    const float* p0 = parts[0];
-    const float* p1 = parts[1];
+    const float* p0 = parts[0] + r_start;
+    const float* p1 = parts[1] + r_start;
     size_t r = 0;
     for (; r + 4 <= out; r += 4) {
-      vst1q_f32(y + r, vaddq_f32(vld1q_f32(p0 + r), vld1q_f32(p1 + r)));
+      vst1q_f32(dst + r, vaddq_f32(vld1q_f32(p0 + r), vld1q_f32(p1 + r)));
     }
-    for (; r < out; ++r) y[r] = p0[r] + p1[r];
+    for (; r < out; ++r) dst[r] = p0[r] + p1[r];
     return;
   }
   if (n_parts == 4) {
-    const float* p0 = parts[0];
-    const float* p1 = parts[1];
-    const float* p2 = parts[2];
-    const float* p3 = parts[3];
+    const float* p0 = parts[0] + r_start;
+    const float* p1 = parts[1] + r_start;
+    const float* p2 = parts[2] + r_start;
+    const float* p3 = parts[3] + r_start;
     size_t r = 0;
     for (; r + 4 <= out; r += 4) {
       float32x4_t a01 = vaddq_f32(vld1q_f32(p0 + r), vld1q_f32(p1 + r));
       float32x4_t a23 = vaddq_f32(vld1q_f32(p2 + r), vld1q_f32(p3 + r));
-      vst1q_f32(y + r, vaddq_f32(a01, a23));
+      vst1q_f32(dst + r, vaddq_f32(a01, a23));
     }
-    for (; r < out; ++r) y[r] = p0[r] + p1[r] + p2[r] + p3[r];
+    for (; r < out; ++r) dst[r] = p0[r] + p1[r] + p2[r] + p3[r];
     return;
   }
-  std::memcpy(y, parts[0], out * sizeof(float));
+  std::memcpy(dst, parts[0] + r_start, out * sizeof(float));
   for (size_t p = 1; p < n_parts; ++p) {
-    const float* src = parts[p];
+    const float* src = parts[p] + r_start;
     size_t r = 0;
     for (; r + 4 <= out; r += 4) {
-      vst1q_f32(y + r, vaddq_f32(vld1q_f32(y + r), vld1q_f32(src + r)));
+      vst1q_f32(dst + r, vaddq_f32(vld1q_f32(dst + r), vld1q_f32(src + r)));
     }
-    for (; r < out; ++r) y[r] += src[r];
+    for (; r < out; ++r) dst[r] += src[r];
   }
+}
+
+inline void reduce_parts(const float* const* parts, size_t n_parts, float* y, size_t out) {
+  reduce_slice(parts, n_parts, y, 0, out);
 }
 
 }  // namespace ar_neon
@@ -641,7 +647,7 @@ T2SEngine::T2SEngine(const GsvFile& f) {
   sk_xb_.assign(D, 0.f);
   sk_ff_.assign(dims_.ffn, 0.f);
   sk_hbuf_.assign(D, 0.f);
-  sk_scores_.assign(kMaxDecodeSteps + 500, 0.f);
+  sk_scores_.assign(4 * (kMaxDecodeSteps + 500), 0.f);
   sk_xh512_.assign(D, 0);
   sk_attn16_.assign(D, 0);
   sk_xb16_.assign(D, 0);
@@ -1103,6 +1109,7 @@ void T2SEngine::block_decode_splitk_impl(size_t l, float* x, size_t pos,
   const size_t D = dims_.d_model, H = dims_.n_heads, HD = D / H, FF = dims_.ffn;
   Layer& L = layers_[l];
   const float scale = 1.0f / std::sqrt(static_cast<float>(HD));
+  const size_t max_scores_stride = kMaxDecodeSteps + 500;
 
   splitk_pool_->run_layer([&](size_t tid, size_t nth, auto& barrier) {
     size_t phase = 0;
@@ -1111,8 +1118,7 @@ void T2SEngine::block_decode_splitk_impl(size_t l, float* x, size_t pos,
     float* qkv_part = sk_part_qkv_.data() + tid * 3 * D;
 
     if constexpr (GEMV16) {
-      if (tid == 0) kern::f32_to_f16(x, sk_xh512_.data(), D);
-      barrier.sync(phase++);
+      kern::f32_to_f16(x + k0_d, sk_xh512_.data() + k0_d, k1_d - k0_d);
       ar_neon::gemv_slice_f16x_fmlal_4rows(L.wqkv16.data(), sk_xh512_.data(),
                                            qkv_part, 3 * D, D, k0_d, k1_d);
     } else {
@@ -1122,47 +1128,58 @@ void T2SEngine::block_decode_splitk_impl(size_t l, float* x, size_t pos,
 
     barrier.sync(phase++);
 
-    if (tid == 0) {
-      float* qkv = sk_qkv_.data();
-      ar_neon::reduce_parts(sk_qkv_ptrs_, nth, qkv, 3 * D);
-      for (size_t j = 0; j < 3 * D; ++j) qkv[j] += L.bqkv[j];
+    // --- E19: SDPA Head-Parallel + QKV Reduction + KV Write in Parallel ---
+    const size_t h0 = tid * H / nth;
+    const size_t h1 = (tid + 1) * H / nth;
+    const size_t q_off = h0 * HD;
+    const size_t q_len = (h1 - h0) * HD;
+    const size_t k_off = D + q_off;
+    const size_t v_off = 2 * D + q_off;
 
-      if constexpr (KV16) {
-        kern::f32_to_f16(qkv + D, k16 + pos * D, D);
-        kern::f32_to_f16(qkv + 2 * D, v16 + pos * D, D);
-      } else {
-        std::memcpy(kf32 + pos * D, qkv + D, D * sizeof(float));
-        std::memcpy(vf32 + pos * D, qkv + 2 * D, D * sizeof(float));
-      }
+    ar_neon::reduce_slice(sk_qkv_ptrs_, nth, sk_qkv_.data(), q_off, q_off + q_len);
+    for (size_t j = q_off; j < q_off + q_len; ++j) sk_qkv_[j] += L.bqkv[j];
 
-      if (sk_scores_.size() < len) sk_scores_.resize(len);
-      sk_attn_.assign(D, 0.f);
-      for (size_t h = 0; h < H; ++h) {
-        const float* qv = qkv + h * HD;
-        for (size_t k = 0; k < len; ++k) {
-          float dot;
-          if constexpr (KV16) {
-            dot = ar_neon::dot_f16kv(qv, k16 + k * D + h * HD, HD);
-          } else {
-            dot = ar_neon::dot_f32(qv, kf32 + k * D + h * HD, HD);
-          }
-          sk_scores_[k] = dot * scale;
+    ar_neon::reduce_slice(sk_qkv_ptrs_, nth, sk_qkv_.data(), k_off, k_off + q_len);
+    for (size_t j = k_off; j < k_off + q_len; ++j) sk_qkv_[j] += L.bqkv[j];
+
+    ar_neon::reduce_slice(sk_qkv_ptrs_, nth, sk_qkv_.data(), v_off, v_off + q_len);
+    for (size_t j = v_off; j < v_off + q_len; ++j) sk_qkv_[j] += L.bqkv[j];
+
+    if constexpr (KV16) {
+      kern::f32_to_f16(sk_qkv_.data() + k_off, k16 + pos * D + q_off, q_len);
+      kern::f32_to_f16(sk_qkv_.data() + v_off, v16 + pos * D + q_off, q_len);
+    } else {
+      std::memcpy(kf32 + pos * D + q_off, sk_qkv_.data() + k_off, q_len * sizeof(float));
+      std::memcpy(vf32 + pos * D + q_off, sk_qkv_.data() + v_off, q_len * sizeof(float));
+    }
+
+    float* scores = sk_scores_.data() + tid * max_scores_stride;
+    for (size_t h = h0; h < h1; ++h) {
+      const float* qv = sk_qkv_.data() + h * HD;
+      for (size_t k = 0; k < len; ++k) {
+        float dot;
+        if constexpr (KV16) {
+          dot = ar_neon::dot_f16kv(qv, k16 + k * D + h * HD, HD);
+        } else {
+          dot = ar_neon::dot_f32(qv, kf32 + k * D + h * HD, HD);
         }
-        gsv::kern::softmax(sk_scores_.data(), sk_scores_.data(), len);
-        float* ov = sk_attn_.data() + h * HD;
-        for (size_t k = 0; k < len; ++k) {
-          const float p = sk_scores_[k];
-          if constexpr (KV16) {
-            ar_neon::accum_f16kv(ov, v16 + k * D + h * HD, p, HD);
-          } else {
-            ar_neon::accum_f32(ov, vf32 + k * D + h * HD, p, HD);
-          }
+        scores[k] = dot * scale;
+      }
+      gsv::kern::softmax(scores, scores, len);
+      float* ov = sk_attn_.data() + h * HD;
+      std::memset(ov, 0, HD * sizeof(float));
+      for (size_t k = 0; k < len; ++k) {
+        const float p = scores[k];
+        if constexpr (KV16) {
+          ar_neon::accum_f16kv(ov, v16 + k * D + h * HD, p, HD);
+        } else {
+          ar_neon::accum_f32(ov, vf32 + k * D + h * HD, p, HD);
         }
       }
+    }
 
-      if constexpr (GEMV16) {
-        kern::f32_to_f16(sk_attn_.data(), sk_attn16_.data(), D);
-      }
+    if constexpr (GEMV16) {
+      kern::f32_to_f16(sk_attn_.data() + q_off, sk_attn16_.data() + q_off, q_len);
     }
 
     barrier.sync(phase++);
@@ -1202,14 +1219,15 @@ void T2SEngine::block_decode_splitk_impl(size_t l, float* x, size_t pos,
 
     barrier.sync(phase++);
 
-    if (tid == 0) {
-      float* ff = sk_ff_.data();
-      ar_neon::reduce_parts(sk_w1_ptrs_, nth, ff, FF);
-      for (size_t i = 0; i < FF; ++i) ff[i] += L.b1[i];
-      gsv::kern::relu(ff, ff, FF);
-      if constexpr (GEMV16) {
-        kern::f32_to_f16(ff, sk_ff16_.data(), FF);
-      }
+    // --- E19: W1 Reduction + Bias + ReLU + F16 in Parallel ---
+    const size_t ff0 = tid * FF / nth;
+    const size_t ff1 = (tid + 1) * FF / nth;
+    const size_t ff_len = ff1 - ff0;
+    ar_neon::reduce_slice(sk_w1_ptrs_, nth, sk_ff_.data(), ff0, ff1);
+    for (size_t i = ff0; i < ff1; ++i) sk_ff_[i] += L.b1[i];
+    gsv::kern::relu(sk_ff_.data() + ff0, sk_ff_.data() + ff0, ff_len);
+    if constexpr (GEMV16) {
+      kern::f32_to_f16(sk_ff_.data() + ff0, sk_ff16_.data() + ff0, ff_len);
     }
 
     barrier.sync(phase++);
@@ -1233,6 +1251,295 @@ void T2SEngine::block_decode_splitk_impl(size_t l, float* x, size_t pos,
       gsv::kern::layernorm(x, L.n2g.data(), L.n2b.data(), x, D, dims_.ln_eps);
     }
   });
+}
+
+template <bool KV16, bool GEMV16>
+void T2SEngine::decode_step_splitk_impl(float* x, size_t pos, size_t len,
+                                        float* logits_out) {
+  if (!splitk_pool_) set_splitk(true);
+  const size_t D = dims_.d_model, H = dims_.n_heads, HD = D / H, FF = dims_.ffn, NL = dims_.n_layers;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(HD));
+  const size_t max_scores_stride = kMaxDecodeSteps + 500;
+
+  splitk_pool_->run_layer([&](size_t tid, size_t nth, auto& barrier) {
+    size_t phase = 0;
+    const size_t k0_d = tid * (D / nth);
+    const size_t k1_d = (tid + 1) * (D / nth);
+    const size_t k0_ff = tid * (FF / nth);
+    const size_t k1_ff = (tid + 1) * (FF / nth);
+    const size_t ff0 = k0_ff;
+    const size_t ff1 = k1_ff;
+    const size_t ff_len = ff1 - ff0;
+
+    const size_t h0 = tid * H / nth;
+    const size_t h1 = (tid + 1) * H / nth;
+    const size_t q_off = h0 * HD;
+    const size_t q_len = (h1 - h0) * HD;
+    const size_t k_off = D + q_off;
+    const size_t v_off = 2 * D + q_off;
+
+    float* qkv_part = sk_part_qkv_.data() + tid * 3 * D;
+    float* wout_part = sk_part_wout_.data() + tid * D;
+    float* w1_part = sk_part_w1_.data() + tid * FF;
+    float* w2_part = sk_part_w2_.data() + tid * D;
+    float* scores = sk_scores_.data() + tid * max_scores_stride;
+
+    for (size_t l = 0; l < NL; ++l) {
+      Layer& L = layers_[l];
+      uint16_t* k16 = KV16 ? kc16_[l].data() : nullptr;
+      uint16_t* v16 = KV16 ? vc16_[l].data() : nullptr;
+      float* kf32 = !KV16 ? kc_[l].data() : nullptr;
+      float* vf32 = !KV16 ? vc_[l].data() : nullptr;
+
+      if constexpr (GEMV16) {
+        kern::f32_to_f16(x + k0_d, sk_xh512_.data() + k0_d, k1_d - k0_d);
+        ar_neon::gemv_slice_f16x_fmlal_4rows(L.wqkv16.data(), sk_xh512_.data(),
+                                             qkv_part, 3 * D, D, k0_d, k1_d);
+      } else {
+        ar_neon::gemv_slice_f16w_f32acc_4rows(L.wqkv16.data(), x, qkv_part,
+                                              3 * D, D, k0_d, k1_d);
+      }
+
+      barrier.sync(phase++);
+
+      ar_neon::reduce_slice(sk_qkv_ptrs_, nth, sk_qkv_.data(), q_off, q_off + q_len);
+      for (size_t j = q_off; j < q_off + q_len; ++j) sk_qkv_[j] += L.bqkv[j];
+
+      ar_neon::reduce_slice(sk_qkv_ptrs_, nth, sk_qkv_.data(), k_off, k_off + q_len);
+      for (size_t j = k_off; j < k_off + q_len; ++j) sk_qkv_[j] += L.bqkv[j];
+
+      ar_neon::reduce_slice(sk_qkv_ptrs_, nth, sk_qkv_.data(), v_off, v_off + q_len);
+      for (size_t j = v_off; j < v_off + q_len; ++j) sk_qkv_[j] += L.bqkv[j];
+
+      if constexpr (KV16) {
+        kern::f32_to_f16(sk_qkv_.data() + k_off, k16 + pos * D + q_off, q_len);
+        kern::f32_to_f16(sk_qkv_.data() + v_off, v16 + pos * D + q_off, q_len);
+      } else {
+        std::memcpy(kf32 + pos * D + q_off, sk_qkv_.data() + k_off, q_len * sizeof(float));
+        std::memcpy(vf32 + pos * D + q_off, sk_qkv_.data() + v_off, q_len * sizeof(float));
+      }
+
+      if (HD == 32) {
+        for (size_t h = h0; h < h1; ++h) {
+          const float* qv = sk_qkv_.data() + h * HD;
+          const float32x4_t q0 = vld1q_f32(qv + 0);
+          const float32x4_t q1 = vld1q_f32(qv + 4);
+          const float32x4_t q2 = vld1q_f32(qv + 8);
+          const float32x4_t q3 = vld1q_f32(qv + 12);
+          const float32x4_t q4 = vld1q_f32(qv + 16);
+          const float32x4_t q5 = vld1q_f32(qv + 20);
+          const float32x4_t q6 = vld1q_f32(qv + 24);
+          const float32x4_t q7 = vld1q_f32(qv + 28);
+
+          for (size_t k = 0; k < len; ++k) {
+            if constexpr (KV16) {
+              const uint16_t* k_ptr = k16 + k * D + h * HD;
+              float16x8_t kh0 = vld1q_f16(reinterpret_cast<const __fp16*>(k_ptr + 0));
+              float16x8_t kh1 = vld1q_f16(reinterpret_cast<const __fp16*>(k_ptr + 8));
+              float16x8_t kh2 = vld1q_f16(reinterpret_cast<const __fp16*>(k_ptr + 16));
+              float16x8_t kh3 = vld1q_f16(reinterpret_cast<const __fp16*>(k_ptr + 24));
+
+              float32x4_t a0 = vmulq_f32(q0, vcvt_f32_f16(vget_low_f16(kh0)));
+              float32x4_t a1 = vmulq_f32(q1, vcvt_f32_f16(vget_high_f16(kh0)));
+              float32x4_t a2 = vmulq_f32(q2, vcvt_f32_f16(vget_low_f16(kh1)));
+              float32x4_t a3 = vmulq_f32(q3, vcvt_f32_f16(vget_high_f16(kh1)));
+              float32x4_t a4 = vmulq_f32(q4, vcvt_f32_f16(vget_low_f16(kh2)));
+              float32x4_t a5 = vmulq_f32(q5, vcvt_f32_f16(vget_high_f16(kh2)));
+              float32x4_t a6 = vmulq_f32(q6, vcvt_f32_f16(vget_low_f16(kh3)));
+              float32x4_t a7 = vmulq_f32(q7, vcvt_f32_f16(vget_high_f16(kh3)));
+
+              float32x4_t s01 = vaddq_f32(a0, a1);
+              float32x4_t s23 = vaddq_f32(a2, a3);
+              float32x4_t s45 = vaddq_f32(a4, a5);
+              float32x4_t s67 = vaddq_f32(a6, a7);
+              float32x4_t s = vaddq_f32(vaddq_f32(s01, s23), vaddq_f32(s45, s67));
+              float32x2_t lo = vget_low_f32(s);
+              float32x2_t hi = vget_high_f32(s);
+              float32x2_t sum2 = vadd_f32(lo, hi);
+              float32x2_t sum1 = vpadd_f32(sum2, sum2);
+              float dot = vget_lane_f32(sum1, 0);
+              scores[k] = dot * scale;
+            } else {
+              const float* k_ptr = kf32 + k * D + h * HD;
+              float32x4_t a0 = vmulq_f32(q0, vld1q_f32(k_ptr + 0));
+              float32x4_t a1 = vmulq_f32(q1, vld1q_f32(k_ptr + 4));
+              float32x4_t a2 = vmulq_f32(q2, vld1q_f32(k_ptr + 8));
+              float32x4_t a3 = vmulq_f32(q3, vld1q_f32(k_ptr + 12));
+              float32x4_t a4 = vmulq_f32(q4, vld1q_f32(k_ptr + 16));
+              float32x4_t a5 = vmulq_f32(q5, vld1q_f32(k_ptr + 20));
+              float32x4_t a6 = vmulq_f32(q6, vld1q_f32(k_ptr + 24));
+              float32x4_t a7 = vmulq_f32(q7, vld1q_f32(k_ptr + 28));
+
+              float32x4_t s01 = vaddq_f32(a0, a1);
+              float32x4_t s23 = vaddq_f32(a2, a3);
+              float32x4_t s45 = vaddq_f32(a4, a5);
+              float32x4_t s67 = vaddq_f32(a6, a7);
+              float32x4_t s = vaddq_f32(vaddq_f32(s01, s23), vaddq_f32(s45, s67));
+              float32x2_t lo = vget_low_f32(s);
+              float32x2_t hi = vget_high_f32(s);
+              float32x2_t sum2 = vadd_f32(lo, hi);
+              float32x2_t sum1 = vpadd_f32(sum2, sum2);
+              float dot = vget_lane_f32(sum1, 0);
+              scores[k] = dot * scale;
+            }
+          }
+
+          gsv::kern::softmax(scores, scores, len);
+
+          float32x4_t o0 = vdupq_n_f32(0.f), o1 = vdupq_n_f32(0.f);
+          float32x4_t o2 = vdupq_n_f32(0.f), o3 = vdupq_n_f32(0.f);
+          float32x4_t o4 = vdupq_n_f32(0.f), o5 = vdupq_n_f32(0.f);
+          float32x4_t o6 = vdupq_n_f32(0.f), o7 = vdupq_n_f32(0.f);
+
+          for (size_t k = 0; k < len; ++k) {
+            const float32x4_t p4 = vdupq_n_f32(scores[k]);
+            if constexpr (KV16) {
+              const uint16_t* v_ptr = v16 + k * D + h * HD;
+              float16x8_t vh0 = vld1q_f16(reinterpret_cast<const __fp16*>(v_ptr + 0));
+              float16x8_t vh1 = vld1q_f16(reinterpret_cast<const __fp16*>(v_ptr + 8));
+              float16x8_t vh2 = vld1q_f16(reinterpret_cast<const __fp16*>(v_ptr + 16));
+              float16x8_t vh3 = vld1q_f16(reinterpret_cast<const __fp16*>(v_ptr + 24));
+
+              o0 = vfmaq_f32(o0, p4, vcvt_f32_f16(vget_low_f16(vh0)));
+              o1 = vfmaq_f32(o1, p4, vcvt_f32_f16(vget_high_f16(vh0)));
+              o2 = vfmaq_f32(o2, p4, vcvt_f32_f16(vget_low_f16(vh1)));
+              o3 = vfmaq_f32(o3, p4, vcvt_f32_f16(vget_high_f16(vh1)));
+              o4 = vfmaq_f32(o4, p4, vcvt_f32_f16(vget_low_f16(vh2)));
+              o5 = vfmaq_f32(o5, p4, vcvt_f32_f16(vget_high_f16(vh2)));
+              o6 = vfmaq_f32(o6, p4, vcvt_f32_f16(vget_low_f16(vh3)));
+              o7 = vfmaq_f32(o7, p4, vcvt_f32_f16(vget_high_f16(vh3)));
+            } else {
+              const float* v_ptr = vf32 + k * D + h * HD;
+              o0 = vfmaq_f32(o0, p4, vld1q_f32(v_ptr + 0));
+              o1 = vfmaq_f32(o1, p4, vld1q_f32(v_ptr + 4));
+              o2 = vfmaq_f32(o2, p4, vld1q_f32(v_ptr + 8));
+              o3 = vfmaq_f32(o3, p4, vld1q_f32(v_ptr + 12));
+              o4 = vfmaq_f32(o4, p4, vld1q_f32(v_ptr + 16));
+              o5 = vfmaq_f32(o5, p4, vld1q_f32(v_ptr + 20));
+              o6 = vfmaq_f32(o6, p4, vld1q_f32(v_ptr + 24));
+              o7 = vfmaq_f32(o7, p4, vld1q_f32(v_ptr + 28));
+            }
+          }
+
+          float* ov = sk_attn_.data() + h * HD;
+          vst1q_f32(ov + 0, o0);
+          vst1q_f32(ov + 4, o1);
+          vst1q_f32(ov + 8, o2);
+          vst1q_f32(ov + 12, o3);
+          vst1q_f32(ov + 16, o4);
+          vst1q_f32(ov + 20, o5);
+          vst1q_f32(ov + 24, o6);
+          vst1q_f32(ov + 28, o7);
+
+          if constexpr (GEMV16) {
+            uint16_t* ov16 = sk_attn16_.data() + h * HD;
+            float16x8_t h01 = vcombine_f16(vcvt_f16_f32(o0), vcvt_f16_f32(o1));
+            float16x8_t h23 = vcombine_f16(vcvt_f16_f32(o2), vcvt_f16_f32(o3));
+            float16x8_t h45 = vcombine_f16(vcvt_f16_f32(o4), vcvt_f16_f32(o5));
+            float16x8_t h67 = vcombine_f16(vcvt_f16_f32(o6), vcvt_f16_f32(o7));
+            vst1q_u16(ov16 + 0, vreinterpretq_u16_f16(h01));
+            vst1q_u16(ov16 + 8, vreinterpretq_u16_f16(h23));
+            vst1q_u16(ov16 + 16, vreinterpretq_u16_f16(h45));
+            vst1q_u16(ov16 + 24, vreinterpretq_u16_f16(h67));
+          }
+        }
+      } else {
+        for (size_t h = h0; h < h1; ++h) {
+          const float* qv = sk_qkv_.data() + h * HD;
+          for (size_t k = 0; k < len; ++k) {
+            float dot;
+            if constexpr (KV16) {
+              dot = ar_neon::dot_f16kv(qv, k16 + k * D + h * HD, HD);
+            } else {
+              dot = ar_neon::dot_f32(qv, kf32 + k * D + h * HD, HD);
+            }
+            scores[k] = dot * scale;
+          }
+          gsv::kern::softmax(scores, scores, len);
+          float* ov = sk_attn_.data() + h * HD;
+          std::memset(ov, 0, HD * sizeof(float));
+          for (size_t k = 0; k < len; ++k) {
+            const float p = scores[k];
+            if constexpr (KV16) {
+              ar_neon::accum_f16kv(ov, v16 + k * D + h * HD, p, HD);
+            } else {
+              ar_neon::accum_f32(ov, vf32 + k * D + h * HD, p, HD);
+            }
+          }
+        }
+
+        if constexpr (GEMV16) {
+          kern::f32_to_f16(sk_attn_.data() + q_off, sk_attn16_.data() + q_off, q_len);
+        }
+      }
+
+      barrier.sync(phase++);
+
+      if constexpr (GEMV16) {
+        ar_neon::gemv_slice_f16x_fmlal_4rows(L.wout16.data(), sk_attn16_.data(),
+                                             wout_part, D, D, k0_d, k1_d);
+      } else {
+        ar_neon::gemv_slice_f16w_f32acc_4rows(L.wout16.data(), sk_attn_.data(),
+                                              wout_part, D, D, k0_d, k1_d);
+      }
+
+      barrier.sync(phase++);
+
+      if (tid == 0) {
+        float* xb = sk_xb_.data();
+        ar_neon::reduce_parts(sk_wout_ptrs_, nth, xb, D);
+        for (size_t i = 0; i < D; ++i) xb[i] += L.bout[i] + x[i];
+        gsv::kern::layernorm(xb, L.n1g.data(), L.n1b.data(), xb, D, dims_.ln_eps);
+        std::memcpy(sk_hbuf_.data(), xb, D * sizeof(float));
+        if constexpr (GEMV16) {
+          kern::f32_to_f16(xb, sk_xb16_.data(), D);
+        }
+      }
+
+      barrier.sync(phase++);
+
+      if constexpr (GEMV16) {
+        ar_neon::gemv_slice_f16x_fmlal_4rows(L.w116.data(), sk_xb16_.data(),
+                                             w1_part, FF, D, k0_d, k1_d);
+      } else {
+        ar_neon::gemv_slice_f16w_f32acc_4rows(L.w116.data(), sk_xb_.data(),
+                                              w1_part, FF, D, k0_d, k1_d);
+      }
+
+      barrier.sync(phase++);
+
+      ar_neon::reduce_slice(sk_w1_ptrs_, nth, sk_ff_.data(), ff0, ff1);
+      for (size_t i = ff0; i < ff1; ++i) sk_ff_[i] += L.b1[i];
+      gsv::kern::relu(sk_ff_.data() + ff0, sk_ff_.data() + ff0, ff_len);
+      if constexpr (GEMV16) {
+        kern::f32_to_f16(sk_ff_.data() + ff0, sk_ff16_.data() + ff0, ff_len);
+      }
+
+      barrier.sync(phase++);
+
+      if constexpr (GEMV16) {
+        ar_neon::gemv_slice_f16x_fmlal_4rows(L.w216.data(), sk_ff16_.data(),
+                                             w2_part, D, FF, k0_ff, k1_ff);
+      } else {
+        ar_neon::gemv_slice_f16w_f32acc_4rows(L.w216.data(), sk_ff_.data(),
+                                              w2_part, D, FF, k0_ff, k1_ff);
+      }
+
+      barrier.sync(phase++);
+
+      if (tid == 0) {
+        ar_neon::reduce_parts(sk_w2_ptrs_, nth, x, D);
+        for (size_t i = 0; i < D; ++i) x[i] += L.b2[i] + sk_hbuf_[i];
+        gsv::kern::layernorm(x, L.n2g.data(), L.n2b.data(), x, D, dims_.ln_eps);
+      }
+
+      if (l + 1 < NL) {
+        barrier.sync(phase++);
+      }
+    }
+  });
+
+  predict_layer_fp(x, logits_out);
 }
 
 template void T2SEngine::block_prefill_impl<false>(size_t, float*, size_t,
@@ -1265,6 +1572,9 @@ template void T2SEngine::block_decode_splitk_impl<true, true>(size_t, float*,
                                                               size_t, size_t,
                                                               float*, uint16_t*,
                                                               float*, uint16_t*);
+template void T2SEngine::decode_step_splitk_impl<false, false>(float*, size_t, size_t, float*);
+template void T2SEngine::decode_step_splitk_impl<true, false>(float*, size_t, size_t, float*);
+template void T2SEngine::decode_step_splitk_impl<true, true>(float*, size_t, size_t, float*);
 
 // ---- 贪心采样(infer_panel_naive sample() top_k=1 同构) ----
 // 关键语义: torch 的 logits_to_probs 用 scatter_ 就地修改传入的 logits 张量,
@@ -1594,24 +1904,20 @@ GenResult T2SEngine::generate(const int64_t* phones, size_t T,
     pe_row(pe_.data(), P + idx);
     for (size_t d = 0; d < D; ++d) x1_[d] = erow[d] + alpha_audio_ * pe_[d];
 
-    for (size_t l = 0; l < dims_.n_layers; ++l) {
-      if (ar_splitk_) {
-        if (fp16_.kv) {
-          if (fp16_.gemv)
-            block_decode_splitk_impl<true, true>(l, x1_.data(), cur_len, cur_len + 1,
-                                                 nullptr, kc16_[l].data(), nullptr,
-                                                 vc16_[l].data());
-          else
-            block_decode_splitk_impl<true, false>(l, x1_.data(), cur_len,
-                                                  cur_len + 1, nullptr,
-                                                  kc16_[l].data(), nullptr,
-                                                  vc16_[l].data());
-        } else {
-          block_decode_splitk_impl<false, false>(l, x1_.data(), cur_len, cur_len + 1,
-                                                 kc_[l].data(), nullptr,
-                                                 vc_[l].data(), nullptr);
-        }
+    if (ar_splitk_) {
+      if (fp16_.kv) {
+        if (fp16_.gemv)
+          decode_step_splitk_impl<true, true>(x1_.data(), cur_len, cur_len + 1,
+                                              logits_.data());
+        else
+          decode_step_splitk_impl<true, false>(x1_.data(), cur_len, cur_len + 1,
+                                               logits_.data());
       } else {
+        decode_step_splitk_impl<false, false>(x1_.data(), cur_len, cur_len + 1,
+                                              logits_.data());
+      }
+    } else {
+      for (size_t l = 0; l < dims_.n_layers; ++l) {
         if (fp16_.kv) {
           if (fp16_.gemv)
             block_decode_impl<true, true>(l, x1_.data(), cur_len, cur_len + 1,
@@ -1628,9 +1934,9 @@ GenResult T2SEngine::generate(const int64_t* phones, size_t T,
                                           vc_[l].data(), nullptr);
         }
       }
+      predict_layer_fp(x1_.data(), logits_.data());
     }
     ++cur_len;
-    predict_layer_fp(x1_.data(), logits_.data());
   }
   if (ar_splitk_ && splitk_pool_) splitk_pool_->end_session();
   const auto t2 = std::chrono::steady_clock::now();

@@ -217,6 +217,9 @@ class T2SEngine {
   void block_decode_splitk_impl(size_t l, float* x, size_t pos, size_t len,
                                 float* kf32, uint16_t* k16, float* vf32,
                                 uint16_t* v16);
+  template <bool KV16, bool GEMV16>
+  void decode_step_splitk_impl(float* x, size_t pos, size_t len,
+                               float* logits_out);
 #ifdef GSV_AMX_GEMM
   // E11-5: prefill SDPA 走 AMX (Q·K^T + P·V 两次 GEMM per head, 16 头串行复用 scratch)
   // attn_out 布局 [S, D] 行主, head h 段不连续 (stride D), 内部分散写入。

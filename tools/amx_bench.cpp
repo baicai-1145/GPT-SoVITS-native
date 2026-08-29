@@ -1184,6 +1184,119 @@ int main(int argc, char** argv) {
     std::printf("24-Layer SDPA (FP16 KV, S=%zu): 1T=%.3f ms  2T=%.3f ms (%.2fx)  4T=%.3f ms (%.2fx)  [Gate: %s]\n",
                 S, t1_ms, t2_ms, t1_ms / t2_ms, t4_ms, t1_ms / t4_ms, (t1_ms / t4_ms >= 2.2) ? "PASS" : "FAIL");
   }
+  // -------------------------------------------------------------------------
+  // P2: Elementwise Fusion Microbenchmarks
+  // -------------------------------------------------------------------------
+  std::printf("\n========================================================================================\n");
+  std::printf("P2: Elementwise Fusion Microbenchmark (W1 Reduce+Bias+ReLU+F16 & KV Write)\n");
+  std::printf("========================================================================================\n");
+
+  {
+    const size_t FF = 2048;
+    std::vector<float> part0(FF, 1.0f), part1(FF, 0.5f), part2(FF, -0.2f), part3(FF, 0.1f);
+    const float* parts[4] = {part0.data(), part1.data(), part2.data(), part3.data()};
+    std::vector<float> b1(FF, -0.1f);
+    std::vector<float> ff_out(FF);
+    std::vector<uint16_t> ff16_out(FF);
+
+    // Unfused baseline (4 separate steps)
+    auto unfused_w1 = [&](size_t ff0, size_t ff1) {
+      const size_t ff_len = ff1 - ff0;
+      float* dst = ff_out.data() + ff0;
+      const float* p0 = parts[0] + ff0;
+      const float* p1 = parts[1] + ff0;
+      const float* p2 = parts[2] + ff0;
+      const float* p3 = parts[3] + ff0;
+      for (size_t i = 0; i < ff_len; ++i) dst[i] = p0[i] + p1[i] + p2[i] + p3[i];
+      for (size_t i = ff0; i < ff1; ++i) ff_out[i] += b1[i];
+      gsv::kern::relu(ff_out.data() + ff0, ff_out.data() + ff0, ff_len);
+      gsv::kern::f32_to_f16(ff_out.data() + ff0, ff16_out.data() + ff0, ff_len);
+    };
+
+    // Fused kernel (single pass SIMD 8-lane)
+    auto fused_w1 = [&](size_t ff0, size_t ff1) {
+      const float* p0 = parts[0];
+      const float* p1 = parts[1];
+      const float* p2 = parts[2];
+      const float* p3 = parts[3];
+      const float* b = b1.data();
+      float* dst_f32 = ff_out.data();
+      uint16_t* dst_f16 = ff16_out.data();
+      const float32x4_t vzero = vdupq_n_f32(0.0f);
+      size_t i = ff0;
+      for (; i + 8 <= ff1; i += 8) {
+        float32x4_t s0_0 = vaddq_f32(vld1q_f32(p0 + i),     vld1q_f32(p1 + i));
+        float32x4_t s0_1 = vaddq_f32(vld1q_f32(p2 + i),     vld1q_f32(p3 + i));
+        float32x4_t s0   = vaddq_f32(vaddq_f32(s0_0, s0_1), vld1q_f32(b + i));
+        s0 = vmaxq_f32(s0, vzero);
+        vst1q_f32(dst_f32 + i, s0);
+
+        float32x4_t s1_0 = vaddq_f32(vld1q_f32(p0 + i + 4), vld1q_f32(p1 + i + 4));
+        float32x4_t s1_1 = vaddq_f32(vld1q_f32(p2 + i + 4), vld1q_f32(p3 + i + 4));
+        float32x4_t s1   = vaddq_f32(vaddq_f32(s1_0, s1_1), vld1q_f32(b + i + 4));
+        s1 = vmaxq_f32(s1, vzero);
+        vst1q_f32(dst_f32 + i + 4, s1);
+
+        float16x4_t h0 = vcvt_f16_f32(s0);
+        float16x4_t h1 = vcvt_f16_f32(s1);
+        float16x8_t h01 = vcombine_f16(h0, h1);
+        vst1q_u16(dst_f16 + i, vreinterpretq_u16_f16(h01));
+      }
+      for (; i < ff1; ++i) {
+        float s = (p0[i] + p1[i] + p2[i] + p3[i]) + b[i];
+        if (s < 0.0f) s = 0.0f;
+        dst_f32[i] = s;
+        __fp16 hh = static_cast<__fp16>(s);
+        std::memcpy(dst_f16 + i, &hh, sizeof(hh));
+      }
+    };
+
+    // Verify correctness
+    std::vector<uint16_t> ref_f16(FF);
+    unfused_w1(0, FF);
+    ref_f16 = ff16_out;
+    std::fill(ff16_out.begin(), ff16_out.end(), 0);
+    fused_w1(0, FF);
+    int diff_count = 0;
+    for (size_t i = 0; i < FF; ++i) {
+      if (ref_f16[i] != ff16_out[i]) diff_count++;
+    }
+    std::printf("W1 Fusion Correctness: diff_count=%d / %zu (%s)\n",
+                diff_count, FF, diff_count == 0 ? "EXACT MATCH" : "DIFF");
+
+    // Benchmark 4 threads x 24 layers
+    const int FUSION_ITERS = 1000;
+    double t_unfused = 0, t_fused = 0;
+    {
+      auto t0 = now_us();
+      for (int it = 0; it < FUSION_ITERS; ++it) {
+        pool4.parallel_run([&](size_t tid, size_t nth) {
+          const size_t ff0 = tid * FF / nth;
+          const size_t ff1 = (tid + 1) * FF / nth;
+          for (int l = 0; l < 24; ++l) unfused_w1(ff0, ff1);
+        });
+      }
+      auto t1 = now_us();
+      t_unfused = (t1 - t0) / FUSION_ITERS;
+    }
+    {
+      auto t0 = now_us();
+      for (int it = 0; it < FUSION_ITERS; ++it) {
+        pool4.parallel_run([&](size_t tid, size_t nth) {
+          const size_t ff0 = tid * FF / nth;
+          const size_t ff1 = (tid + 1) * FF / nth;
+          for (int l = 0; l < 24; ++l) fused_w1(ff0, ff1);
+        });
+      }
+      auto t1 = now_us();
+      t_fused = (t1 - t0) / FUSION_ITERS;
+    }
+
+    double sp = t_unfused / t_fused;
+    double gain_pct = (1.0 - t_fused / t_unfused) * 100.0;
+    std::printf("24-Layer W1 Elementwise: Unfused=%.2f us  Fused=%.2f us  Speedup=%.2fx (Gain: +%.1f%%, Gate: %s)\n",
+                t_unfused, t_fused, sp, gain_pct, gain_pct >= 5.0 ? "PASS >=5%" : "FAIL <5%");
+  }
   std::printf("========================================================================================\n\n");
 
   return 0;
