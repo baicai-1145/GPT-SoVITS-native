@@ -416,10 +416,10 @@ class T2SEngine::ArSplitKPool {
   };
 
   explicit ArSplitKPool(size_t n_threads)
-      : n_threads_(n_threads),
+      : n_threads_(std::min(n_threads == 0 ? size_t{1} : n_threads, kMaxThreads)),
         stop_(false),
         in_session_(false),
-        barrier_(n_threads) {
+        barrier_(std::min(n_threads == 0 ? size_t{1} : n_threads, kMaxThreads)) {
     if (n_threads_ > 1) {
       workers_.reserve(n_threads_ - 1);
       for (size_t i = 1; i < n_threads_; ++i) {
@@ -672,6 +672,9 @@ void T2SEngine::set_splitk(bool enable) {
     if (const char* e = std::getenv("GSV_AMX_THREADS")) {
       long v = std::atol(e);
       if (v > 0) pool_size = static_cast<size_t>(v);
+    }
+    if (pool_size > ArSplitKPool::kMaxThreads) {
+      pool_size = ArSplitKPool::kMaxThreads;
     }
     splitk_pool_ = std::make_unique<ArSplitKPool>(pool_size);
   }
