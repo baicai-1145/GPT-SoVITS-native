@@ -57,6 +57,9 @@ struct GenResult {
   std::vector<float> logits_last;    // 最后一步(惩罚后)logits [vocab] ↔ logits_last
   size_t steps = 0;                  // 执行的 decode 步数(含触发停止的最后一步) ↔ n_ar_steps
   bool hit_eos = false;              // true=EOS 正常终止; false=max_steps 用尽
+  double prep_ms = 0.0;              // E21: 输入准备耗时
+  double prefill_ms = 0.0;           // E21: prefill 耗时
+  double decode_ms = 0.0;            // E21: decode 耗时
 };
 
 // E4: 采样参数(对齐 python infer_panel_naive LogitsProcessor 链)。
@@ -254,16 +257,21 @@ class T2SEngine {
 
   // E11-2: prefill AMX 路径复用 scratch(按最大 S 一次性分配, 避免逐层重分配)
   std::vector<uint16_t> prefill_xh_;        // 激活 f16 暂存 [cap_prefill_max*D]
+  kern::AmxPanel prefill_pa_act_;           // 激活面板复用
   size_t prefill_cap_ = 0;                  // 已分配 cap(按 S 重分配)
   bool prefill_amx_in_use_ = false;          // 构造期 amx_gemm_available() 快照
 
-  // E11-5: prefill SDPA AMX 路径 scratch — per-head 拼接缓冲与 panel 复用
-  // sdpa_scores_/sdpa_probs_: [S, S] 行主, 16 头串行复用同一片
-  // sdpa_xh_: [max(S,D)] fp16 复用 (供 P fp16 转换 + pack)
-  std::vector<float> sdpa_scores_;
-  std::vector<float> sdpa_probs_;
-  std::vector<uint16_t> sdpa_xh_;
-  size_t sdpa_cap_ = 0;
+  // E11-5/E21: prefill SDPA AMX 路径多线程 scratch — 4 线程并行
+  struct SdpaThreadScratch {
+    std::vector<float> scores;
+    std::vector<float> probs;
+    std::vector<uint16_t> xh;
+    std::vector<uint16_t> Q_f16, K_f16, V_f16, VT_f16;
+    std::vector<float> attn_tmp;
+    kern::AmxPanel pa_Q, pa_K, pa_V, pa_P;
+    size_t cap = 0;
+  };
+  std::vector<SdpaThreadScratch> sdpa_threads_;
 
   // E4: topk_sample scratch — 1025 词表, idx+val 各占 4KB, 贴 L1
   // 在 generate() 入口按 V 一次性 resize, 之后复用
@@ -299,6 +307,7 @@ class T2SEngine {
   std::vector<float> dec_qkv_, dec_xb_, dec_h_, x1_;  // decode 单 token scratch
 
   double last_prefill_ms_ = 0, last_decode_ms_ = 0;
+  double pf_wqkv_ms_ = 0, pf_sdpa_ms_ = 0, pf_wout_ms_ = 0, pf_w1_ms_ = 0, pf_w2_ms_ = 0, pf_ln_ms_ = 0;
 
   // E18: split-K 多核 decode 成员与 scratch
   class ArSplitKPool;

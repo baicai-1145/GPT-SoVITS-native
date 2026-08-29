@@ -127,11 +127,19 @@ void amx_tile_chain_run(const AmxTileChainLink* nodes, size_t n);
 void gemm_f16_amx(const uint16_t* a, const uint16_t* b, float* c,
                   size_t M, size_t N, size_t K);
 
+// E21: 在 AMX 专用线程池中并行执行独立任务批 (无 DAG/Phase 屏障, 线程安全)
+void amx_run_batch(std::vector<std::function<void()>> tasks);
+size_t amx_pool_healthy_threads();
+
 #else
 
 struct AmxPanel {};  // 空壳: 非 AMX 构建下可引用类型, 不可调用函数
 
 inline bool amx_gemm_available() { return false; }
+inline void amx_run_batch(std::vector<std::function<void()>> tasks) {
+  for (auto& t : tasks) t();
+}
+inline size_t amx_pool_healthy_threads() { return 0; }
 
 #endif  // GSV_AMX_GEMM
 

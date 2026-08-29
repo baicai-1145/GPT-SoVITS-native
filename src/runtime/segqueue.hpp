@@ -51,12 +51,24 @@ struct SegTiming {
     double t_arMs = 0.0;
     double t_sovMs = 0.0;
     double t_waitMs = 0.0;
+    double t_arIdleWaitMs = 0.0;
+    double t_arPrepMs = 0.0;
+    double t_arPrefillMs = 0.0;
+    double t_arDecodeMs = 0.0;
+    double t_arNoiseMs = 0.0;
+    double t_sovOverlapMs = 0.0;
 
     void add(const SegTiming& o) {
         t_textfrontMs += o.t_textfrontMs;
         t_arMs += o.t_arMs;
         t_sovMs += o.t_sovMs;
         t_waitMs += o.t_waitMs;
+        t_arIdleWaitMs += o.t_arIdleWaitMs;
+        t_arPrepMs += o.t_arPrepMs;
+        t_arPrefillMs += o.t_arPrefillMs;
+        t_arDecodeMs += o.t_arDecodeMs;
+        t_arNoiseMs += o.t_arNoiseMs;
+        t_sovOverlapMs += o.t_sovOverlapMs;
     }
 };
 
@@ -319,15 +331,22 @@ private:
                   Fn& fn) {
         detail::applyQos(qos);
         typename InQ::Item it;
-        while (in.pop(it)) {
+        while (true) {
+            TimePoint popStart = SteadyClock::now();
+            if (!in.pop(it)) break;
+            TimePoint popEnd = SteadyClock::now();
             if (!it.timing) it.timing = std::make_shared<SegTiming>();
             SegTiming& tm = *it.timing;
             // queue wait accumulated BEFORE processing so the field reflects
             // pure waiting regardless of what the stage does to clocks
             tm.t_waitMs +=
-                std::chrono::duration<double, std::milli>(SteadyClock::now() -
+                std::chrono::duration<double, std::milli>(popEnd -
                                                           it.enqueuedAt)
                     .count();
+            if (stageIdx == 2) {
+                tm.t_arIdleWaitMs = std::chrono::duration<double, std::milli>(
+                    popEnd - popStart).count();
+            }
             typename OutQ::Item o;
             o.timing = it.timing;
             if (!it.exc) {

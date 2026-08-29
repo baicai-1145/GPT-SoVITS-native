@@ -736,46 +736,54 @@ void T2SEngine::sdpa_amx_prefill(size_t H, size_t S, size_t HD, float scale,
                                  const float* kf32, const uint16_t* k16,
                                  const float* vf32, const uint16_t* v16,
                                  float* attn_out) {
-  // 确保 scratch 足够: sdpa_xh_ 需 max(S*D, S*S) fp16 容量
-  const size_t need = S * S > S * HD ? S * S : S * HD;
-  if (sdpa_cap_ < need) {
-    sdpa_xh_.resize(need);
-    sdpa_cap_ = need;
-  }
-  sdpa_scores_.assign(S * S, 0.f);
-  sdpa_probs_.assign(S * S, 0.f);
-
-  // 为每头分配临时 Q/K/V fp16 缓冲 + AmxPanel (在栈上, 大小 S*HD fp16 + panel 头)
-  // 16 头 × 3 面板 = 48 面板, 不大; 但 AmxPanel.buf 约 S*HD*64B(panel 1MB) 太大。
-  // 改为串行 16 头, 复用同一个 Q/K/V scratch + 同一 AmxPanel。
-  std::vector<uint16_t> Q_f16(S * HD);
-  std::vector<uint16_t> K_f16(S * HD);
-  std::vector<uint16_t> V_f16(S * HD);
-  // V_T 供 P·V 的 pa_V 用: pa_V 形状 [HD, S] (rows=HD, K=S)
-  // V[S,HD] → V_T[HD,S]: V_T[e, t] = V_f16[t*HD + e]
-  std::vector<uint16_t> V_T_f16(HD * S);
   const size_t D = H * HD;
+  const size_t need = S * S > S * HD ? S * S : S * HD;
+  const size_t nth = std::min(size_t{4}, kern::amx_pool_healthy_threads());
+  const size_t use_nth = nth > 0 ? nth : 1;
 
-  for (size_t h = 0; h < H; ++h) {
+  if (sdpa_threads_.size() < use_nth) {
+    sdpa_threads_.resize(use_nth);
+  }
+
+  for (size_t tid = 0; tid < use_nth; ++tid) {
+    auto& scr = sdpa_threads_[tid];
+    if (scr.cap < need) {
+      scr.xh.resize(need);
+      scr.cap = need;
+    }
+    if (scr.scores.size() < S * S) scr.scores.assign(S * S, 0.f);
+    if (scr.probs.size() < S * S) scr.probs.assign(S * S, 0.f);
+    if (scr.Q_f16.size() < S * HD) scr.Q_f16.resize(S * HD);
+    if (scr.K_f16.size() < S * HD) scr.K_f16.resize(S * HD);
+    if (scr.V_f16.size() < S * HD) scr.V_f16.resize(S * HD);
+    if (scr.VT_f16.size() < HD * S) scr.VT_f16.resize(HD * S);
+    if (scr.attn_tmp.size() < S * HD) scr.attn_tmp.resize(S * HD);
+    scr.pa_Q.rows = S; scr.pa_Q.K = HD;
+    scr.pa_K.rows = S; scr.pa_K.K = HD;
+    scr.pa_V.rows = HD; scr.pa_V.K = S;
+    scr.pa_P.rows = S; scr.pa_P.K = S;
+  }
+
+  auto run_head = [&](size_t h, SdpaThreadScratch& scr) {
     // 1) 从 qkv_ 抽取 Q_h: qkv_ 布局 [S, 3D] (D=H*HD), 每 token Q 段起点 = q*3D
     //    head h 段起点 = q*3D + h*HD; Q_h[t, e] = qkv_[t*3D + h*HD + e]
     for (size_t t = 0; t < S; ++t) {
       const float* src = qkv_buf + t * 3 * D + h * HD;
       for (size_t e = 0; e < HD; ++e) {
         __fp16 hh = static_cast<__fp16>(src[e]);
-        __builtin_memcpy(&Q_f16[t * HD + e], &hh, 2);
+        __builtin_memcpy(&scr.Q_f16[t * HD + e], &hh, 2);
       }
     }
     // 2) 抽取 K_h: KV cache 布局 [S, D] 行主, head h 段起点 = t*D + h*HD
     for (size_t t = 0; t < S; ++t) {
       if constexpr (KV16) {
         const uint16_t* src = k16 + t * D + h * HD;
-        std::memcpy(&K_f16[t * HD], src, HD * sizeof(uint16_t));
+        std::memcpy(&scr.K_f16[t * HD], src, HD * sizeof(uint16_t));
       } else {
         const float* src = kf32 + t * D + h * HD;
         for (size_t e = 0; e < HD; ++e) {
           __fp16 hh = static_cast<__fp16>(src[e]);
-          __builtin_memcpy(&K_f16[t * HD + e], &hh, 2);
+          __builtin_memcpy(&scr.K_f16[t * HD + e], &hh, 2);
         }
       }
     }
@@ -783,41 +791,33 @@ void T2SEngine::sdpa_amx_prefill(size_t H, size_t S, size_t HD, float scale,
     for (size_t t = 0; t < S; ++t) {
       if constexpr (KV16) {
         const uint16_t* src = v16 + t * D + h * HD;
-        std::memcpy(&V_f16[t * HD], src, HD * sizeof(uint16_t));
+        std::memcpy(&scr.V_f16[t * HD], src, HD * sizeof(uint16_t));
       } else {
         const float* src = vf32 + t * D + h * HD;
         for (size_t e = 0; e < HD; ++e) {
           __fp16 hh = static_cast<__fp16>(src[e]);
-          __builtin_memcpy(&V_f16[t * HD + e], &hh, 2);
+          __builtin_memcpy(&scr.V_f16[t * HD + e], &hh, 2);
         }
       }
     }
 
-    // 4) Pack Q/K/V 进 AmxPanel (调用方在主线程 pack, AmxPool 跑 GEMM 不重 pack)
-    kern::AmxPanel pa_Q, pa_K, pa_V;
-    pa_Q.rows = S; pa_Q.K = HD;
-    pa_K.rows = S; pa_K.K = HD;
-    // pa_V 形状 [HD, S]: N=HD (输出列), K=S (P 的 reduction 维)
-    // 需要 V 转置为 [HD, S] 行主 (从 V_f16 [S, HD] 转置)
-    pa_V.rows = HD; pa_V.K = S;
+    // 4) Pack Q/K/V 进 AmxPanel
     for (size_t t = 0; t < S; ++t) {
       for (size_t e = 0; e < HD; ++e) {
-        V_T_f16[e * S + t] = V_f16[t * HD + e];
+        scr.VT_f16[e * S + t] = scr.V_f16[t * HD + e];
       }
     }
-    kern::amx_pack_into(Q_f16.data(), S, HD, pa_Q.buf);
-    kern::amx_pack_into(K_f16.data(), S, HD, pa_K.buf);
-    kern::amx_pack_into(V_T_f16.data(), HD, S, pa_V.buf);
+    kern::amx_pack_into(scr.Q_f16.data(), S, HD, scr.pa_Q.buf);
+    kern::amx_pack_into(scr.K_f16.data(), S, HD, scr.pa_K.buf);
+    kern::amx_pack_into(scr.VT_f16.data(), HD, S, scr.pa_V.buf);
 
     // 5) Q·K^T via AMX: pa_Q [S,HD] (M=S), pa_K [S,HD] (N=S) → scores [S, S]
-    float* scores = sdpa_scores_.data();
-    kern::gemm_f16_amx_pp(pa_Q, pa_K, scores, S, S);
+    float* scores = scr.scores.data();
+    kern::gemm_f16_amx_pp(scr.pa_Q, scr.pa_K, scores, S, S);
     // scale
     for (size_t i = 0; i < S * S; ++i) scores[i] *= scale;
 
     // 6) 应用掩码: k < text_len || k <= q → 保持; 否则 -inf
-    // torch 同构: text_len>0 时, q<text_len 看到全部 text_len 个 key (即 k<text_len 总是真);
-    //             q≥text_len 看到 [0..q] (k<=q)。
     for (size_t q = 0; q < S; ++q) {
       for (size_t k = 0; k < S; ++k) {
         const bool allowed = (k < text_len) || (k <= q);
@@ -825,13 +825,11 @@ void T2SEngine::sdpa_amx_prefill(size_t H, size_t S, size_t HD, float scale,
       }
     }
     // 7) 行 softmax: 复制到 probs, in-place 稳定 softmax
-    float* probs = sdpa_probs_.data();
+    float* probs = scr.probs.data();
     for (size_t q = 0; q < S; ++q) {
       float* row = scores + q * S;
-      // 找 max (仅在 allowed 集, 但 -inf 不参与 max, 可以全局)
       float mx = row[0];
       for (size_t k = 1; k < S; ++k) mx = std::max(mx, row[k]);
-      // exp + sum (inf → 0, 正常)
       float sum = 0.f;
       for (size_t k = 0; k < S; ++k) {
         const float e = std::exp(row[k] - mx);
@@ -842,31 +840,40 @@ void T2SEngine::sdpa_amx_prefill(size_t H, size_t S, size_t HD, float scale,
       for (size_t k = 0; k < S; ++k) probs[q * S + k] *= inv;
     }
     // 8) Pack P 进 AmxPanel
-    // P 是 fp32 → fp16 转换 + pack
-    kern::AmxPanel pa_P;
-    pa_P.rows = S; pa_P.K = S;
-    // 用 sdpa_xh_ 暂存 P fp16
-    if (sdpa_cap_ < S * S) {
-      sdpa_xh_.resize(S * S);
-      sdpa_cap_ = S * S;
+    if (scr.cap < S * S) {
+      scr.xh.resize(S * S);
+      scr.cap = S * S;
     }
     for (size_t i = 0; i < S * S; ++i) {
       __fp16 hh = static_cast<__fp16>(probs[i]);
-      __builtin_memcpy(&sdpa_xh_[i], &hh, 2);
+      __builtin_memcpy(&scr.xh[i], &hh, 2);
     }
-    kern::amx_pack_into(sdpa_xh_.data(), S, S, pa_P.buf);
+    kern::amx_pack_into(scr.xh.data(), S, S, scr.pa_P.buf);
 
     // 9) P·V via AMX: pa_P [S, S] (M=S), pa_V [HD, S] (N=HD, K=S)
-    //    pa_V 是 V 转置 [HD, S] (从 V_f16 [S, HD] 转置), 否则 pa_P.K!=pa_V.K 被契约拒挥。
-    //    输出是 [S, HD] 行主连续 (gemm_f16_amx_pp 标准输出布局),
-    //    而 attn_ 是 [S, D] 行主, head h 段以 D 步距 — 先写临时 attn_tmp 再 scatter。
-    std::vector<float> attn_tmp(S * HD, 0.f);
-    kern::gemm_f16_amx_pp(pa_P, pa_V, attn_tmp.data(), S, HD);
+    kern::gemm_f16_amx_pp(scr.pa_P, scr.pa_V, scr.attn_tmp.data(), S, HD);
     // scatter: attn_[q*D + h*HD + e] = attn_tmp[q*HD + e]  (D 上面已定义)
     for (size_t q = 0; q < S; ++q) {
-      std::memcpy(attn_out + q * D + h * HD, attn_tmp.data() + q * HD,
+      std::memcpy(attn_out + q * D + h * HD, scr.attn_tmp.data() + q * HD,
                   HD * sizeof(float));
     }
+  };
+
+  if (use_nth <= 1) {
+    for (size_t h = 0; h < H; ++h) run_head(h, sdpa_threads_[0]);
+  } else {
+    std::vector<std::function<void()>> batch;
+    batch.reserve(use_nth);
+    for (size_t tid = 0; tid < use_nth; ++tid) {
+      const size_t h0 = tid * H / use_nth;
+      const size_t h1 = (tid + 1) * H / use_nth;
+      batch.emplace_back([&, tid, h0, h1] {
+        for (size_t h = h0; h < h1; ++h) {
+          run_head(h, sdpa_threads_[tid]);
+        }
+      });
+    }
+    kern::amx_run_batch(std::move(batch));
   }
 }
 #endif  // GSV_AMX_GEMM
@@ -879,11 +886,8 @@ void T2SEngine::block_prefill_impl(size_t l, float* x, size_t S, size_t pos,
   Layer& L = layers_[l];
   const float scale = 1.0f / std::sqrt(static_cast<float>(HD));
 
+  const auto t_start_wqkv = std::chrono::steady_clock::now();
   // fused QKV: qkv[S,3D] = x·Wqkvᵀ+b
-  // E11-2: prefill 优先走 AMX(预打包面板) → gemm_f16_amx_pp;
-  // 不可用时回退 DenseF16::forward(FMLAL) —— 数值同源(fp16 存储 + FMLAL 扩展精度累加),
-  // 差异仅在中位 bit 舍入顺序。
-  // gemm_f16_amx_pp 语义: C[M,N] = pa·pbᵀ, pa 形态 = M×K (激活侧), pb 形态 = N×K (权重侧)
   qkv_.resize(S * 3 * D);
 #ifdef GSV_AMX_GEMM
   if (prefill_amx_in_use_) {
@@ -892,11 +896,10 @@ void T2SEngine::block_prefill_impl(size_t l, float* x, size_t S, size_t pos,
       prefill_cap_ = S * D;
     }
     kern::f32_to_f16(x, prefill_xh_.data(), S * D);
-    kern::AmxPanel pa_act;  // 激活面板: [S][D] = pa 侧 (M=S)
-    pa_act.rows = S; pa_act.K = D;
-    kern::amx_pack_into(prefill_xh_.data(), S, D, pa_act.buf);
+    prefill_pa_act_.rows = S; prefill_pa_act_.K = D;
+    kern::amx_pack_into(prefill_xh_.data(), S, D, prefill_pa_act_.buf);
     // L.wqkv_pa 预打包为 [3D][D] = pb 侧 (N=3D)
-    kern::gemm_f16_amx_pp(pa_act, L.wqkv_pa, qkv_.data(), S, 3 * D);
+    kern::gemm_f16_amx_pp(prefill_pa_act_, L.wqkv_pa, qkv_.data(), S, 3 * D);
   } else
 #endif
   {
@@ -905,8 +908,10 @@ void T2SEngine::block_prefill_impl(size_t l, float* x, size_t S, size_t pos,
   for (size_t i = 0; i < S; ++i)
     for (size_t j = 0; j < 3 * D; ++j) qkv_[i * 3 * D + j] += L.bqkv[j];
 
-  // k/v 写 cache 第 pos..pos+S-1 槽(token-major 行主, 头内连续 —— 与 qkv 行布局一致,
-  // 直接按行拷贝 [token, D] 中 k 段/D 段)
+  const auto t_start_sdpa = std::chrono::steady_clock::now();
+  pf_wqkv_ms_ += std::chrono::duration<double, std::milli>(t_start_sdpa - t_start_wqkv).count();
+
+  // k/v 写 cache 第 pos..pos+S-1 槽
   for (size_t t = 0; t < S; ++t) {
     const float* krow = qkv_.data() + t * 3 * D + D;
     const float* vrow = qkv_.data() + t * 3 * D + 2 * D;
@@ -919,13 +924,6 @@ void T2SEngine::block_prefill_impl(size_t l, float* x, size_t S, size_t pos,
     }
   }
 
-  // SDPA: 掩码 allowed(q,k) = k<text_len || k<=q —— 文本块双向互见(text_len>0 时
-  // 对 q<text_len 自动覆盖全部文本 key), 音频行因果。text_len==0 ⇒ 纯因果。
-  // torch 侧为全行 softmax(-inf 掩蔽); 此处紧致遍历 allowed 集, 数学等价。
-  // E11-1: 标量 → NEON 4-lane 树形 (同 decode)
-  // E11-5: AMX 路径 —— 全 S×S 一次 GEMM (M=S, N=S, K=HD), 后 -inf 掩蔽 → softmax → P·V 全 GEMM
-  //   K=HD=32 薄 K 形状 AMX 吞吐打折 (微基准: S=200 时 1.5x, S=300 1.8x), 收益实事求是;
-  //   fp16 转换 + 归约序差可能影响 G1 软门 (实测 cos8≥0.9999 验证)。
   scores_.resize(S);
   probs_.resize(S);
   attn_.assign(S * D, 0.f);
@@ -973,21 +971,32 @@ void T2SEngine::block_prefill_impl(size_t l, float* x, size_t S, size_t pos,
     }
   }
 
+  const auto t_start_wout = std::chrono::steady_clock::now();
+  pf_sdpa_ms_ += std::chrono::duration<double, std::milli>(t_start_wout - t_start_sdpa).count();
+
   // out proj + 残差 + post-LN(norm1)
   tmp_.resize(S * D);
   L.wout.forward(attn_.data(), S, tmp_.data());
   for (size_t i = 0; i < S * D; ++i) x[i] += tmp_[i] + L.bout[i % D];
+
+  const auto t_start_ln1 = std::chrono::steady_clock::now();
+  pf_wout_ms_ += std::chrono::duration<double, std::milli>(t_start_ln1 - t_start_wout).count();
+
   for (size_t t = 0; t < S; ++t)
     gsv::kern::layernorm(x + t * D, L.n1g.data(), L.n1b.data(), x + t * D, D,
                          dims_.ln_eps);
 
+  const auto t_start_w1 = std::chrono::steady_clock::now();
+  pf_ln_ms_ += std::chrono::duration<double, std::milli>(t_start_w1 - t_start_ln1).count();
+
   // FFN(ReLU) + 残差 + post-LN(norm2)
   ff_.resize(S * FF);
-  // E11-2: W1 暂留 FMLAL —— ff_ 在 S~200 区间内 FMLAL ~ 1ms, AMX ~0.5ms 但漂移源多;
-  // 数值稳定性优先(避免与 QKV/W2 同时改归约序导致雪崩对漂移)
   L.w1.forward(x, S, ff_.data());
   for (size_t i = 0; i < S * FF; ++i) ff_[i] += L.b1[i % FF];
   gsv::kern::relu(ff_.data(), ff_.data(), S * FF);
+
+  const auto t_start_w2 = std::chrono::steady_clock::now();
+  pf_w1_ms_ += std::chrono::duration<double, std::milli>(t_start_w2 - t_start_w1).count();
 
   // E11-2: W2 走 AMX (FFN 下降 S×FF → S×D)
 #ifdef GSV_AMX_GEMM
@@ -997,20 +1006,26 @@ void T2SEngine::block_prefill_impl(size_t l, float* x, size_t S, size_t pos,
       prefill_cap_ = S * FF;
     }
     kern::f32_to_f16(ff_.data(), prefill_xh_.data(), S * FF);
-    kern::AmxPanel pa_act;  // 激活面板: [S][FF] = pa 侧 (M=S)
-    pa_act.rows = S; pa_act.K = dims_.ffn;
-    kern::amx_pack_into(prefill_xh_.data(), S, dims_.ffn, pa_act.buf);
+    prefill_pa_act_.rows = S; prefill_pa_act_.K = dims_.ffn;
+    kern::amx_pack_into(prefill_xh_.data(), S, dims_.ffn, prefill_pa_act_.buf);
     // L.w2_pa 预打包为 [D][FF] = pb 侧 (N=D)
-    kern::gemm_f16_amx_pp(pa_act, L.w2_pa, tmp_.data(), S, D);
+    kern::gemm_f16_amx_pp(prefill_pa_act_, L.w2_pa, tmp_.data(), S, D);
   } else
 #endif
   {
     L.w2.forward(ff_.data(), S, tmp_.data());
   }
   for (size_t i = 0; i < S * D; ++i) x[i] += tmp_[i] + L.b2[i % D];
+
+  const auto t_start_ln2 = std::chrono::steady_clock::now();
+  pf_w2_ms_ += std::chrono::duration<double, std::milli>(t_start_ln2 - t_start_w2).count();
+
   for (size_t t = 0; t < S; ++t)
     gsv::kern::layernorm(x + t * D, L.n2g.data(), L.n2b.data(), x + t * D, D,
                          dims_.ln_eps);
+
+  const auto t_end_layer = std::chrono::steady_clock::now();
+  pf_ln_ms_ += std::chrono::duration<double, std::milli>(t_end_layer - t_start_ln2).count();
 }  // block_prefill_impl<KV16>
 
 // ---- decode 单层: 与 T2SBlock.decode_next_token 同构 ----
@@ -1735,6 +1750,7 @@ GenResult T2SEngine::generate(const int64_t* phones, size_t T,
                               const int64_t* prompt, size_t P,
                               const float* bert1024, size_t max_steps,
                               GenDebug* dbg, const SamplingParams* sampling) {
+  const auto t_enter = std::chrono::steady_clock::now();
   const size_t D = dims_.d_model;
   if (T == 0 || P == 0) throw std::runtime_error("T/P 必须非零(golden 口径)");
   const size_t S = T + P;
@@ -1777,10 +1793,10 @@ GenResult T2SEngine::generate(const int64_t* phones, size_t T,
     pe_row(pe_.data(), t);
     for (size_t d = 0; d < D; ++d) xr[d] = erow[d] + alpha_audio_ * pe_[d];
   }
+  const auto t_prep_done = std::chrono::steady_clock::now();
 
   // ---- B1: prefill(24 层, 大矩阵乘固定 Accelerate sgemm) ----
   if (dbg) dbg->on_input(xy_.data(), S);
-  const auto t0 = std::chrono::steady_clock::now();
   bool hit = false;
   if (kv_reuse_ && prompt_snapshot_.valid &&
       prompt_snapshot_.is_fp16 == fp16_.kv &&
@@ -1799,17 +1815,19 @@ GenResult T2SEngine::generate(const int64_t* phones, size_t T,
       }
     }
   } else {
-    for (size_t l = 0; l < dims_.n_layers; ++l) {
-      if (fp16_.kv)
-        block_prefill_impl<true>(l, xy_.data(), S, /*pos=*/0, /*text_len=*/T,
-                                 nullptr, kc16_[l].data(), nullptr,
-                                 vc16_[l].data());
-      else
-        block_prefill_impl<false>(l, xy_.data(), S, /*pos=*/0, /*text_len=*/T,
-                                  kc_[l].data(), nullptr, vc_[l].data(),
-                                  nullptr);
-      if (dbg) dbg->on_layer(l, xy_.data(), S);
-    }
+  pf_wqkv_ms_ = 0; pf_sdpa_ms_ = 0; pf_wout_ms_ = 0;
+  pf_w1_ms_ = 0; pf_w2_ms_ = 0; pf_ln_ms_ = 0;
+  for (size_t l = 0; l < dims_.n_layers; ++l) {
+    if (fp16_.kv)
+      block_prefill_impl<true>(l, xy_.data(), S, /*pos=*/0, /*text_len=*/T,
+                               nullptr, kc16_[l].data(), nullptr,
+                               vc16_[l].data());
+    else
+      block_prefill_impl<false>(l, xy_.data(), S, /*pos=*/0, /*text_len=*/T,
+                                kc_[l].data(), nullptr, vc_[l].data(),
+                                nullptr);
+    if (dbg) dbg->on_layer(l, xy_.data(), S);
+  }
     if (kv_reuse_) {
       prompt_snapshot_.phones.assign(phones, phones + T);
       prompt_snapshot_.prompt.assign(prompt, prompt + P);
@@ -1835,7 +1853,6 @@ GenResult T2SEngine::generate(const int64_t* phones, size_t T,
       prompt_snapshot_.valid = true;
     }
   }
-  const auto t1 = std::chrono::steady_clock::now();
   last_prefill_hit_ = hit;
 
   // 首 logits 来自最后一个音频 prompt 位置(xy_dec[:, -1])
@@ -1845,6 +1862,7 @@ GenResult T2SEngine::generate(const int64_t* phones, size_t T,
   } else {
     predict_layer_fp(xy_.data() + (S - 1) * D, logits_.data());
   }
+  const auto t_prefill_done = std::chrono::steady_clock::now();
 
   // ---- B2: decode 循环(GEMV + KV cache fp32 + 贪心) ----
   // E4: 采样路径 —— sampling.mode=TopK 时走 topk_sample (复现 python 默认 15 采样, 根治复读)
@@ -1947,8 +1965,11 @@ GenResult T2SEngine::generate(const int64_t* phones, size_t T,
 
   r.steps = idx + 1;  // 含触发停止的当前步(hook 计数口径)
   r.logits_last.assign(logits_.data(), logits_.data() + dims_.vocab);
-  last_prefill_ms_ = std::chrono::duration<double, std::milli>(t1 - t0).count();
-  last_decode_ms_ = std::chrono::duration<double, std::milli>(t2 - t1).count();
+  r.prep_ms = std::chrono::duration<double, std::milli>(t_prep_done - t_enter).count();
+  r.prefill_ms = std::chrono::duration<double, std::milli>(t_prefill_done - t_prep_done).count();
+  r.decode_ms = std::chrono::duration<double, std::milli>(t2 - t_prefill_done).count();
+  last_prefill_ms_ = r.prefill_ms;
+  last_decode_ms_ = r.decode_ms;
   // E11-2/E18 GSV_AR_TIMING=1 探针
   if (std::getenv("GSV_AR_TIMING")) {
     const double ms_per_tok =
@@ -1961,9 +1982,10 @@ GenResult T2SEngine::generate(const int64_t* phones, size_t T,
     const double wall_s = last_decode_ms_ * 1e-3;
     const double avg_cores = wall_s > 0 ? (cpu_s / wall_s) : 0.0;
     std::fprintf(stderr,
-                 "[ar-timing] T=%zu P=%zu S=%zu steps=%zu prefill=%.2fms (hit=%d) "
+                 "[ar-timing] T=%zu P=%zu S=%zu steps=%zu prefill=%.2fms (wqkv=%.1f sdpa=%.1f wout=%.1f w1=%.1f w2=%.1f ln=%.1f) "
                  "decode=%.2fms (%.3f ms/tok, CPU=%.2fs/%.2fs wall, avg %.1f cores, splitk=%d)\n",
-                 T, P, S, r.steps, last_prefill_ms_, last_prefill_hit_ ? 1 : 0,
+                 T, P, S, r.steps, last_prefill_ms_, pf_wqkv_ms_, pf_sdpa_ms_, pf_wout_ms_,
+                 pf_w1_ms_, pf_w2_ms_, pf_ln_ms_,
                  last_decode_ms_, ms_per_tok, cpu_s, wall_s, avg_cores,
                  ar_splitk_ ? 1 : 0);
   }

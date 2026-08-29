@@ -32,6 +32,10 @@
 #include "textfront/chinese_g2p.h"
 #include "textfront/textfront.h"
 
+namespace gsv::runtime {
+struct SegTiming;
+}
+
 namespace gsv::rt::pipeline {
 
 struct PipelineOptions {
@@ -147,9 +151,11 @@ class Pipeline {
   // 阶段函数: 两模式调用完全相同 ⇒ 纯调度差异不触数值。
   // stageFeaturize 前端失败以异常上报(overlap 下经 envelope 顺序送达)。
   SegArIn stageFeaturize(const SegText& t) const;
-  SegSovIn stageAr(const SegArIn& in, const std::vector<int64_t>& promptSem);
+  SegSovIn stageAr(const SegArIn& in, const std::vector<int64_t>& promptSem,
+                   gsv::runtime::SegTiming* tm = nullptr, size_t segIdx = 0);
   void stageVoc(const SegSovIn& in, SegmentResult* seg,
-                const DecodeCondition& cond) const;
+                const DecodeCondition& cond, gsv::runtime::SegTiming* tm = nullptr,
+                size_t segIdx = 0) const;
 
   // RNG: 仅 stage2/串行主线程按段序触碰 (overlap 下 FIFO 单线程独占)
   std::mt19937_64 rng_{42};
@@ -157,6 +163,17 @@ class Pipeline {
 
   // SoVITS 输入快照 sink (--dump-sovits-in 时由两模式 stage3 后收集)
   std::vector<SegSovIn> sovInSink_;
+
+  // E21: SoVITS (stage3) 运行区间追踪, 用于精确画像 AR-SoVITS 重叠
+  struct VocSpan {
+    int64_t start_us = 0;
+    int64_t end_us = 0;
+    size_t seg_idx = 0;
+  };
+  mutable std::mutex voc_span_mtx_;
+  mutable std::vector<VocSpan> voc_spans_;
+  mutable std::atomic<int64_t> cur_voc_start_us_{0};
+  mutable std::atomic<bool> cur_voc_active_{false};
 
  public:
   // D2: 重叠模式下由 stage3 在"首段音频产出"时刻写入(生产侧口径,
